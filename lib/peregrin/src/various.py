@@ -251,3 +251,50 @@ class Values:
                 noticequeue.Report(Level.error, f"Error computing LUT map. No LUT applied.", f"LUT map error: {str(e)}.")
             return None, None
         
+
+
+class Kwargs:
+
+    @staticmethod
+    def get_kwarg(key: str, aliases: dict) -> str:
+        """
+        Get the canonical key for a given keyword argument.
+
+        Parameters
+        ----------
+        key : str
+            The keyword argument to check.
+        aliases : dict
+            A dictionary where keys are canonical names and values are lists of aliases.
+
+        Returns
+        -------
+        str
+            The canonical key if found, otherwise the original key.
+        """
+        for canonical, alias_list in aliases.items():
+            if key in alias_list:
+                return canonical
+        return key
+
+    @staticmethod
+    def get_aliases(kwargs: list, aliases: dict) -> dict:
+        """
+        Get a dictionary of canonical keys for the provided keyword arguments.
+
+        Parameters
+        ----------
+        kwargs : list
+            List of keyword arguments to check for aliases.
+        aliases : dict
+            A dictionary where keys are canonical names and values are lists of aliases.
+
+        Returns
+        -------
+        dict
+        A dictionary mapping each keyword argument to its canonical key.
+        """
+        return {key: Kwargs.get_kwarg(key, aliases) for key in kwargs}
+
+
+get_aliases = Kwargs.get_aliases

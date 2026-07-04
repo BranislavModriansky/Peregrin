@@ -7,8 +7,8 @@ import numpy as np
 import pandas as pd
 from typing import *
 
-from .._common import Categorizer, Painter
-from ..._general import is_empty
+from ..categorizer import Categorizer, Painter
+from ...various import is_empty
 from ...compute.stats import Stats
 
 

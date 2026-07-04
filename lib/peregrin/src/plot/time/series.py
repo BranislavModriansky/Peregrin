@@ -5,12 +5,10 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 
-from .._common import Categorizer, Painter
-from ..._general import is_empty
+from ..categorizer import Categorizer, Painter
+from ...various import is_empty
 from ...compute.stats import Stats
 
-
-_log = get_logger(__name__)
 
 
 class TSeries:

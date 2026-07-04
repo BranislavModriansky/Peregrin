@@ -10,7 +10,7 @@ from pandas.api.types import is_object_dtype
 from math import floor, ceil
 
 from .._pckg_exceptions._pckg_errors import FilteringError
-from .._general import clock, is_empty
+from ..various import clock, is_empty
 from .stats import Stats
 
 

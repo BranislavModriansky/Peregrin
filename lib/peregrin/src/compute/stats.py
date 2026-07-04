@@ -7,7 +7,8 @@ import pandas as pd
 from scipy import stats
 from typing import Any, Callable, Optional, Tuple, Dict, List, Union
 
-from .._general import Values
+from ..various import Values
+from ..settings import params
 from .._pckg_exceptions._pckg_errors import *
 from .._pckg_exceptions._pckg_warnings import *
 
@@ -59,10 +60,12 @@ class Stats:
     """
 
     # Input: pd.DataFrame = pd.DataFrame()
-    Spots: pd.DataFrame = pd.DataFrame()
-    Tracks: pd.DataFrame = pd.DataFrame()
-    Frames: pd.DataFrame = pd.DataFrame()
-    TimeIntervals: pd.DataFrame = pd.DataFrame()
+    Spots_df: pd.DataFrame = pd.DataFrame()
+    Tracks_df: pd.DataFrame = pd.DataFrame()
+    Frames_df: pd.DataFrame = pd.DataFrame()
+    TimeIntervals_df: pd.DataFrame = pd.DataFrame()
+
+    ignore_categories: bool = params.ignore_categories
 
     t_step: Optional[float] = None
     t_unit: str = 's'
@@ -160,8 +163,7 @@ class Stats:
 
     def get_all(
         self, df: pd.DataFrame,
-        *,
-        ignore_categories: Optional[bool] = False
+        **kwargs
     ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         """
         Compute trajectory data at all levels of aggregation 
@@ -178,12 +180,14 @@ class Stats:
             - `y_coordinate`
             - `time_point`
 
-        ignore_categories : bool, optional, default False
+        ignore_categories : bool, optional
             If True, the `condition` and `replicate` columns will be ignored in the computation, and all data will be treated as a single group.
+            If not specified, the default value is taken from the package settings. 
+            To change the default configuration and behavior throughout all computations, use `peregrin.settings(ignore_categories=...)`
 
         Returns
         -------
-        tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame] : `Stats.Spots`, `Stats.Tracks`, `Stats.Frames` and `Stats.TimeIntervals` DataFrames.
+        tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame] : `stats.Spots_df`, `stats.Tracks_df`, `stats.Frames_df` and `stats.TimeIntervals_df` DataFrames.
 
         See also
         --------
@@ -191,13 +195,13 @@ class Stats:
         computes per-trajectory-point statistics, both local (previous -> current position) and cumulative (start -> current position).
 
         `stats.tracks()`- 
-        computes per-whole-trajectory statistics from the Spots DataFrame.
+        computes per-whole-trajectory statistics from the Spots_df.
 
         `stats.frames()`- 
-        computes per-time-point statistics from the Spots DataFrame.
+        computes per-time-point statistics from the Spots_df.
 
         `stats.time_intervals()`- 
-        computes per-time-interval statistics from the Spots DataFrame.
+        computes per-time-interval statistics from the Spots_df.
 
         Documentation
         -------------
@@ -205,20 +209,22 @@ class Stats:
 
         """
 
-        # self.Input = df
-        self.spots(df)
-        self.tracks(self.Spots)
-        self.frames(self.Spots)
-        self.time_intervals(self.Spots)
+        if kwargs.get('ignore_categories', params.ignore_categories):
+            self.tier = []
 
-        return self.Spots, self.Tracks, self.Frames, self.TimeIntervals
+        # self.Input = df
+        self.spots(df, **kwargs)
+        self.tracks(self.Spots_df, **kwargs)
+        self.frames(self.Spots_df, **kwargs)
+        self.time_intervals(self.Spots_df, **kwargs)
+
+        return self.Spots_df, self.Tracks_df, self.Frames_df, self.TimeIntervals_df
 
 
     def spots(
         self, 
         df: pd.DataFrame,
-        *,
-        ignore_categories: Optional[bool] = False
+        **kwargs
     ) -> pd.DataFrame:
         """ Computes per-trajectory-point statistics, both local (previous -> current position) and cumulative (start -> current position).
 
@@ -233,8 +239,10 @@ class Stats:
             - `y_coordinate`
             - `time_point`
 
-        ignore_categories : bool, optional, default False
+        ignore_categories : bool, optional
             If True, the `condition` and `replicate` columns will be ignored in the computation, and all data will be treated as a single group.
+            If not specified, the default value is taken from the package settings. 
+            To change the default configuration and behavior throughout all computations, use `peregrin.settings(ignore_categories=...)`
 
         Returns
         -------
@@ -301,16 +309,16 @@ class Stats:
         See also
         --------
         `stats.get_all()` - 
-        computes and returnes all DataFrames (Spots, Tracks, Frames, TimeIntervals) from input spot data in one call.
+        computes and returnes all DataFrames (Spots_df, Tracks_df, Frames_df, TimeIntervals_df) from input spot data in one call.
 
         `stats.tracks()` - 
-        computes per-whole-trajectory statistics from the Spots DataFrame.
+        computes per-whole-trajectory statistics from the Spots_df.
 
         `stats.frames()` - 
-        computes per-time-point statistics from the Spots DataFrame.
+        computes per-time-point statistics from the Spots_df.
 
         `stats.time_intervals()` - 
-        computes per-time-interval statistics from the Spots DataFrame.
+        computes per-time-interval statistics from the Spots_df.
 
         Documentation
         -------------
@@ -320,6 +328,11 @@ class Stats:
         """
 
         # self.Input = df.copy()
+
+        df = df.copy()
+
+        if kwargs.get('ignore_categories', params.ignore_categories):
+            self.tier = []
 
         if df.empty:
             warnings.warn(message="Input DataFrame is empty. No computation performed.", 
@@ -355,11 +368,16 @@ class Stats:
         df.set_index(['track_uid'], drop=False, append=False, inplace=True, verify_integrity=False)
 
         # Assigns frame numbers within each data subset based on the order of time points; starts at 0 for the first point in each track.
-        df['frame'] = df.groupby(self.tier, sort=False)['time_point'].rank(method='dense').astype('Int64') - 1
+        if not kwargs.get('ignore_categories', params.ignore_categories):
+            df['frame'] = df.groupby(self.tier, sort=False)['time_point'].rank(method='dense').astype('Int64') - 1
+        else:
+            df['frame'] = df.groupby(['track_id'], sort=False)['time_point'].rank(method='dense').astype('Int64') - 1
 
         # Sanity guard, checking for multiple frames assigned to the same tier × time point combination
-        
-        bad = df.groupby(self.tier + ['time_point'], sort=False)['frame'].nunique(dropna=True).max()
+        if not kwargs.get('ignore_categories', params.ignore_categories):
+            bad = df.groupby(self.tier + ['time_point'], sort=False)['frame'].nunique(dropna=True).max()
+        else:
+            bad = df.groupby(['track_id', 'time_point'], sort=False)['frame'].nunique(dropna=True).max()
         if bad and bad > 1:
             raise TimePointError(f"Multiple frames assigned to the same {self.tier} × time_point combination. Multiplicates of time_point values within the data. Max frames per time point: {bad}.")
 
@@ -454,7 +472,7 @@ class Stats:
         if self.decimal_places:
             df = self.norm_decimals(df)
 
-        self.Spots = df.copy()
+        self.Spots_df = df.copy()
 
         return df
 
@@ -462,10 +480,9 @@ class Stats:
     def tracks(
         self, 
         df: pd.DataFrame,
-        *,
-        ignore_categories: Optional[bool] = False
+        **kwargs
     ) -> pd.DataFrame:
-        """ Computes a comprehensive DataFrame of track-level statistics for each trajectory of the input Spots DataFrame.
+        """ Computes a comprehensive DataFrame of track-level statistics for each trajectory of the input Spots_df.
 
         Parameters
         ----------
@@ -482,8 +499,10 @@ class Stats:
             - `cum_track_displacement`
             - `direction`
 
-        ignore_categories : bool, optional, default False
+        ignore_categories : bool, optional
             If True, the `condition` and `replicate` columns will be ignored in the computation, and all data will be treated as a single group.
+            If not specified, the default value is taken from the package settings. 
+            To change the default configuration and behavior throughout all computations, use `peregrin.settings(ignore_categories=...)`
 
         Returns
         -------
@@ -550,25 +569,22 @@ class Stats:
 
         See also
         --------
-        `Stats.get_all()`- 
-        computes all DataFrames (Spots, Tracks, Frames, TimeIntervals) from raw spot data in one call.
+        `stats.get_all()`- 
+        computes all DataFrames (Spots_df, Tracks_df, Frames_df, TimeIntervals_df) from raw spot data in one call.
 
-        `Stats.Tracks()`- 
-        computes per-whole-trajectory statistics from the Spots DataFrame.
+        `stats.frames()`- 
+        computes per-time-point statistics from the Spots_df.
 
-        `Stats.Frames()`- 
-        computes per-time-point statistics from the Spots DataFrame.
-
-        `Stats.TimeIntervals()`- 
-        computes per-time-interval statistics from the Spots DataFrame.
-
-        `(dataclass) BaseDataInventory`- 
-        serves as an inventory, storing the computed DataFrames computed via the `(class) Stats`.
+        `stats.time_intervals()`- 
+        computes per-time-interval statistics from the Spots_df.
 
         """
 
         # Work on a copy to avoid mutating the caller's DataFrame
         df = df.copy()
+
+        if kwargs.get('ignore_categories', params.ignore_categories):
+            self.tier = []
 
         if df.empty:
             return pd.DataFrame(columns=self.COLUMNS['TRACKS'])
@@ -591,10 +607,13 @@ class Stats:
         # Stash the categorical identifiers for merging them back into the aggregated result DataFrame
         stash = df[self.tier + ['track_id']].drop_duplicates()
 
-        df = df.set_index('track_uid', drop=True, verify_integrity=False)
-        uid = ['track_uid']
-
-        grp = df.groupby(level=uid, sort=False)
+        if not kwargs.get('ignore_categories', params.ignore_categories):
+            df = df.set_index('track_uid', drop=True, verify_integrity=False)
+            _id = ['track_uid']
+        else:
+            df = df.set_index('track_id', drop=True, verify_integrity=False)
+            _id = ['track_id']
+        grp = df.groupby(level=_id, sort=False)
 
         speed_agg_spec = {
             'speed_min':    lambda x: x.min() / t_step,
@@ -665,14 +684,16 @@ class Stats:
         df.drop_duplicates(inplace=True)
 
         # Insert track_uid as a column right after track_id
-        df.insert(df.columns.get_loc('track_id') + 1, 'track_uid', df.index)
+        if not kwargs.get('ignore_categories', params.ignore_categories):
+            df.insert(df.columns.get_loc('track_id') + 1, 'track_uid', df.index)
+        
         
         if self.significant_figures:
             df = self.signify(df)
         if self.decimal_places:
             df = self.norm_decimals(df)
         
-        self.Tracks = df.copy()
+        self.Tracks_df = df.copy()
 
         return df
     
@@ -680,20 +701,21 @@ class Stats:
     def frames(
         self, 
         df: pd.DataFrame,
-        *,
-        ignore_categories: Optional[bool] = False
+        **kwargs
     ) -> pd.DataFrame:
-        """ Computes time point statistics:
+        
+        """ 
+        Computes time point statistics for each category (group). Specifically for example:
 
-        - `{per replicate}`- aggregated across all tracks of the same `replicate`
-        - `{per condition}`- aggregated across all tracks of the same `condition`
+        - per replicate - across all trajectories of the same `replicate`
+        - per condition - across all trajectories of the same `condition`
 
         Parameters
         ----------
         df : pd.DataFrame
-            *This method expects the dataframe acquired by `Stats.Spots()`. **The input DataFrame must contain these columns:***
-            - `condition`
-            - `replicate`
+            This method expects the dataframe acquired by `stats.spots()`. The input DataFrame must contain these columns:
+            - *`condition`*
+            - *`replicate`*
             - `time_point`
             - `frame`
             - `distance`
@@ -704,60 +726,60 @@ class Stats:
             - `direction`
             - `cum_direction_mean`
 
-        ignore_categories : bool, optional, default False
+        ignore_categories : bool, optional
             If True, the `condition` and `replicate` columns will be ignored in the computation, and all data will be treated as a single group.
+            If not specified, the default value is taken from the package settings. 
+            To change the default configuration and behavior throughout all computations, use `peregrin.settings(ignore_categories=...)`
 
         Returns
         -------
         pd.DataFrame
-            *A DataFrame with one row per unique combination of `condition` × `replicate` × `time_point`, containing the following columns:*
+            A DataFrame with one row per unique combination of `condition` × `replicate` × `time_point` 
+            if `ignore_categories` is False, otherwise a single row for all data. It contains the following columns:
 
-            - **`condition`**
-            - **`replicate`**
-            - **`time_point`**
-            - **`frame`**
+            - *`condition`*
+            - *`replicate`*
+            - `time_point`
+            - `frame`
 
-            \n **`{per category}`*****`{metric}`***
-                - ***descriptive base statistics:***  **`min`**, **`max`**, **`mean`**, **`median`**, **`q25`**, **`q75`** (iqr) if `cat_descr` is set to `True` when initializing the Stats class
-                - ***descriptive error statistics:*** **`std`** if `descr_descr_err` is set to True when initializing the Stats class
-                - ***inferative error statistics:***  **`sem`**, if `descr_infer_err` is set to True when initializing the Stats class, 
-                ***`{CI_STATISTIC}`*****`ci`*****`{CONFIDENCE_LEVEL}`*****`low`** and ***`{CI_STATISTIC}`*****`ci`*****`{CONFIDENCE_LEVEL}`*****`high`** (confidence interval) if both `descr_infer_err` and `bootstrap_ci` are set to True
-                - ***circular statistics:*** **`mean`** (circular mean) and **`var`** (circular variance) calculated for each of `direction` and `Cumulative direction`.
+            \n`per_(category)_(metric)_`...
+                - ***descriptive base statistics:***  `min`, `max`, `mean`, `median`, `q25`, `q75` (iqr) if `cat_descr` is set `True` when initializing the `stats` class
+                - ***descriptive error statistics:*** `std` if `descr_descr_err` is set `True` when initializing the `stats` class
+                - ***inferative error statistics:***  `sem`, if `descr_infer_err` is set `True` when initializing the `stats` class, 
+                `(CI_STATISTIC)_ci(CONFIDENCE_LEVEL)_low` and `(CI_STATISTIC)_ci(CONFIDENCE_LEVEL)_high` (confidence interval) if both `descr_infer_err` and `bootstrap_ci` are set `True`
+                - ***circular statistics:*** `mean` (circular mean) and `var` (circular variance) calculated for each of `direction` and `cum_direction`.
             
             - for each of these metrics
-                - **`cum_track_length`**
-                - **`cum_track_displacement`**
-                - **`cum_straightness_ratio`**
-                - **`Instantaneous speed`**
-                - **`cum_speed_mean`**
-                - **`cum_mean_straight_line_speed`**
-                - **`cum_forward_progression_linearity`**
-                - **`Instantaneous direction`**
-                - **`Cumulative direction`**
-                - **`Cumulative sum directional change`**
-                - **`Cumulative mean directional change`**
+                - `cum_track_length`
+                - `cum_track_displacement`
+                - `cum_straightness_ratio`
+                - `instantaneous_speed`
+                - `cum_speed_mean`
+                - `cum_mean_straight_line_speed`
+                - `cum_forward_progression_linearity`
+                - `instantaneous_direction`
+                - `cum_direction`
+                - `cum_sum_directional_change`
+                - `cum_mean_directional_change`
 
         See also
         --------
         `Stats.get_all()`- 
-        computes all DataFrames (Spots, Tracks, Frames, TimeIntervals) from raw spot data in one call.
+        computes all DataFrames (Spots_df, Tracks_df, Frames_df, TimeIntervals_df) from raw spot data in one call.
 
-        `Stats.Tracks()`- 
-        computes per-whole-trajectory statistics from the Spots DataFrame.
+        `Stats.tracks()`- 
+        computes per-whole-trajectory statistics from the Spots_df.
 
-        `Stats.Frames()`- 
-        computes per-time-point statistics from the Spots DataFrame.
-
-        `Stats.TimeIntervals()`- 
-        computes per-time-interval statistics from the Spots DataFrame.
-
-        `(dataclass) BaseDataInventory`- 
-        serves as an inventory, storing the computed DataFrames computed via the `(class) Stats`.
+        `Stats.time_intervals()`- 
+        computes per-time-interval statistics from the Spots_df.
 
         """
 
         # Work on a copy to avoid mutating the caller's DataFrame
         df = df.copy()
+
+        if kwargs.get('ignore_categories', params.ignore_categories):
+            self.tier = []
 
         # Stash color columns if present, to carry them over to the output
         _color_cols = [c for c in ('replicate_color', 'condition_color') if c in df.columns]
@@ -768,7 +790,8 @@ class Stats:
             _color_stash = df[_stash_keys + _color_cols].drop_duplicates(subset=_stash_keys)
 
         rep_group_cols  =  self.tier + ['time_point', 'frame']
-        cond_group_cols = ['condition', 'time_point', 'frame']
+        if not kwargs.get('ignore_categories', params.ignore_categories):
+            cond_group_cols = ['condition', 'time_point', 'frame']
 
         # Expected metrics to compute stats for (their input df labels)
         metrics = [
@@ -815,7 +838,7 @@ class Stats:
             return cols
 
         if df is None or df.empty:
-            prefixes = ['per_replicate', 'per_condition']
+            prefixes = ['per_replicate', 'per_condition'] 
             cols = self.COLUMNS['FRAMES'] + _build_expected_cols(prefixes)
             return pd.DataFrame(columns=cols)
 
@@ -898,7 +921,7 @@ class Stats:
         if self.decimal_places:
             df = self.norm_decimals(df)
 
-        self.Frames = df.copy()
+        self.Frames_df = df.copy()
 
         return df
     
@@ -906,8 +929,7 @@ class Stats:
     def time_intervals(
         self, 
         df: pd.DataFrame,
-        *,
-        ignore_categories: Optional[bool] = False
+        **kwargs
     ) -> pd.DataFrame:
         """ 
         Computes per-time-interval statistics.
@@ -969,8 +991,10 @@ class Stats:
             - `x_coordinate`
             - `y_coordinate`
 
-        ignore_categories : bool, optional, default False
+        ignore_categories : bool, optional
             If True, the `condition` and `replicate` columns will be ignored in the computation, and all data will be treated as a single group.
+            If not specified, the default value is taken from the package settings. 
+            To change the default configuration and behavior throughout all computations, use `peregrin.settings(ignore_categories=...)`
 
         Returns
         -------
@@ -1002,28 +1026,27 @@ class Stats:
 
         See also
         --------
-        `Stats.get_all()`- 
-        computes all DataFrames (Spots, Tracks, Frames, TimeIntervals) from raw spot data in one call.
+        `stats.get_all()`- 
+        computes all DataFrames (Spots_df, Tracks_df, Frames_df, TimeIntervals_df) from raw spot data in one call.
 
-        `Stats.Spots()`- 
+        `stats.spots()`- 
         computes per-trajectory-point statistics, both local (previous -> current position) and cumulative (start -> current position).
 
-        `Stats.Tracks()`- 
-        computes per-whole-trajectory statistics from the Spots DataFrame.
+        `stats.tracks()`- 
+        computes per-whole-trajectory statistics from the Spots_df.
 
-        `Stats.Frames()`- 
-        computes per-time-point statistics from the Spots DataFrame.
-
-        `(dataclass) BaseDataInventory`- 
-        serves as an inventory, storing the computed DataFrames computed via the `(class) Stats`.
+        `stats.frames()`- 
+        computes per-time-point statistics from the Spots_df.
 
         """
 
+        df = df.copy()
+
+        if kwargs.get('ignore_categories', params.ignore_categories):
+            self.tier = []
+
         if df.empty: 
             return pd.DataFrame(columns=self.COLUMNS['TIMEINTERVALS'])
-
-        # Work on a copy to avoid mutating the caller's DataFrame
-        df = df.copy()
 
         # Stash color columns if present, to carry them over to the output
         _color_cols = [c for c in ('replicate_color', 'condition_color') if c in df.columns]
@@ -1317,7 +1340,7 @@ class Stats:
         if self.decimal_places:
             df = self.norm_decimals(df)
 
-        self.TimeIntervals = df.copy()
+        self.TimeIntervals_df = df.copy()
 
         return df
 

@@ -18,7 +18,7 @@ colnames = {'id': "TRACK_ID", 't': "POSITION_T", 'x': "POSITION_X", 'y': "POSITI
 
 
 
-_b_naive = load_data(
+_naive_b = load_data(
     files=[
         [
             str(DATA_DIR / "naive_ctr_BC39.csv"),
@@ -56,4 +56,5 @@ class PeregrinDataFrame(pd.DataFrame):
         return self
 
 
-b_naive = PeregrinDataFrame(_b_naive).build_subsets()
+naive_b = PeregrinDataFrame(_naive_b).build_subsets()
+

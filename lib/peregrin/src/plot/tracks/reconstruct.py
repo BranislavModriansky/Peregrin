@@ -1,73 +1,65 @@
-from PIL import Image
+from inspect import Arguments
+
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from matplotlib.collections import LineCollection
 from matplotlib.ticker import MultipleLocator, FormatStrFormatter
-from .._common import Painter, Categorizer
-from ..._general import Values
+from PIL import Image
+
+import warnings
+from ...settings import params
+from ..._pckg_exceptions._pckg_errors import *
+from ..._pckg_exceptions._pckg_warnings import *
+
+from ..categorizer import categorize
+from ..painter import retrieve_palette, retrieve_lut
+
+from ...various import Values, get_aliases
 from io import BytesIO
 from ..._infra._selections import Metrics
 from ...compute.stats import Stats
 
 class ReconstructTracks:
 
-    KEY_COLS = ['Condition', 'Replicate', 'Track ID']
-    
-    def __init__(self, Spots_df: pd.DataFrame, Tracks_df: pd.DataFrame, *args,
-                 conditions: list, replicates: list,
-                 c_mode: str, only_one_color: str,
-                 use_stock_palette: None | bool, stock_palette: None | str,
-                 lut_scaling_stat: str, auto_lut_scaling: bool,
-                 lut_vmin: None | float, lut_vmax: None | float,
-                 smoothing_index: int, lw: float,
-                 mark_heads: bool, marker: dict, marker_size: float,
-                 background: str, grid: bool,
-                 title: None | str, **kwargs):
+    ALIASES = {
+        "smoothing_index": ["smoothing_index", "smooth_index", "smooth_window", "smooth_window_size"],
+    }
 
+    KEY_COLS = ['condition', 'replicate', 'track_id']
+    
+    def __init__(self): ...
+
+    def reconstruct(
+        self, 
+        Spots_df: pd.DataFrame, 
+        Tracks_df: pd.DataFrame = None, 
+        *,
+        conditions: list = [],
+        replicates: list = [],
+        align_origin: bool = False,
+        **kwargs
+    ) -> plt.Figure:
+        
         self.Spots_df = Spots_df
         self.Tracks_df = Tracks_df
         self.conditions = conditions
         self.replicates = replicates
-        self.c_mode = c_mode
+        self.align_origin = align_origin
+        self.kwargs = get_aliases(kwargs, self.ALIASES)
 
-        if lut_scaling_stat == 'Speed instantaneous':
-            self.lut_scaling_stat = 'Distance'
+        self._arrange_data()
+
+        if not align_origin:
+            return self.realistic()
         else:
-            self.lut_scaling_stat = lut_scaling_stat
+            return self.anchored()
 
-        self.only_one_color = only_one_color
-        self.stock_palette = stock_palette if use_stock_palette else None
-        self.lut_vmin = lut_vmin if not auto_lut_scaling else None
-        self.lut_vmax = lut_vmax if not auto_lut_scaling else None
-        self.smoothing_index = smoothing_index
-        self.lw = lw
-        self.mark_heads = mark_heads
-        self.marker = marker
-        self.marker_size = marker_size
-        self.background = background
-        self.grid = grid
-        self.title = title
-        self.text_color = kwargs.get('text_color', 'black')
-        self.gridstyle = kwargs.get('gridstyle', 'dartboard-1')
-        self.annotate_r = kwargs.get('annotate_r', True)
-        self.annotate_theta = kwargs.get('annotate_theta', True)
-        self.strip_backdrop = kwargs.get('strip_backdrop', True)
-
-        self.noticequeue = kwargs.get('noticequeue', None)
-        
-        self.painter = Painter(noticequeue=self.noticequeue)
-        
-        self.Spots, self.Tracks = None, None
-        self.segments, self.segment_colors = [], []
-        self.grid_color, self.face_color, self.grid_alpha, self.grid_ls = None, None, None, None
-
-
-    def Realistic(self) -> plt.Figure:
+    def realistic(self) -> plt.Figure:
 
         self._arrange_data()    
-        if self.smoothing_index is not None and self.smoothing_index > 0:
+        if self.kwargs.get('smoothing_index', None) is not None and self.kwargs.get('smoothing_index', None) > 0:
             self._smooth()
         self._assign_colors()
         self._color_tracks(polar=False)
@@ -114,7 +106,7 @@ class ReconstructTracks:
     def Normalized(self, all_data: pd.DataFrame) -> plt.Figure:
 
         self._arrange_data()
-        if self.smoothing_index is not None and self.smoothing_index > 0:
+        if self.kwargs.get('smoothing_index', None) is not None and self.kwargs.get('smoothing_index', None) > 0:
             self._smooth()
         self._assign_colors()
         self._convert_polar()
@@ -164,7 +156,7 @@ class ReconstructTracks:
         - optional head markers per frame.
         """
         self._arrange_data()
-        if self.smoothing_index is not None and self.smoothing_index > 0:
+        if self.kwargs.get('smoothing_index', None) is not None and self.kwargs.get('smoothing_index', None) > 0:
             self._smooth()
         self._assign_colors()
 
@@ -434,21 +426,15 @@ class ReconstructTracks:
         
 
     def _arrange_data(self):
-        Spots =  Categorizer(
-            data=self.Spots_df,
-            conditions=self.conditions,
-            replicates=self.replicates,
-            noticequeue=self.noticequeue
-        )()
-        Tracks = Categorizer(
-            data=self.Tracks_df,
-            conditions=self.conditions,
-            replicates=self.replicates,
-            noticequeue=self.noticequeue
-        )()
+        Spots =  categorize(self.Spots_df, self.conditions, self.replicates)
+        Tracks = categorize(self.Tracks_df, self.conditions, self.replicates)
 
-        self.Spots = Spots.sort_values(['Condition', 'Replicate', 'Track ID', 'Time point'])
-        self.Tracks = Tracks.sort_values(['Condition', 'Replicate', 'Track ID'])
+        if not params.ignore_categories:
+            self.Spots = Spots.sort_values(['condition', 'replicate', 'track_id', 'time_point'])
+            self.Tracks = Tracks.sort_values(['condition', 'replicate', 'track_id'])
+        else:
+            self.Spots = Spots.sort_values(['track_uid', 'time_point'])
+            self.Tracks = Tracks.sort_values(['track_uid'])
 
 
         if list(Spots.index.names) != self.KEY_COLS:
@@ -827,3 +813,4 @@ class ReconstructTracks:
 
 
 
+reconstruct = ReconstructTracks().reconstruct

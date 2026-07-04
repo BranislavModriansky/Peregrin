@@ -24,7 +24,7 @@
 
 @font-face {
     font-family: 'Inter';
-    src: url('../fonts/InterVar.ttf') format('truetype');
+    src: url('../_fonts/InterVar.ttf') format('truetype');
     font-style: normal;
     font-weight: 100 900;
     font-display: block;
@@ -32,7 +32,23 @@
 
 @font-face {
     font-family: 'Inter';
-    src: url('../fonts/InterItalicVar.ttf') format('truetype');
+    src: url('../_fonts/InterItalicVar.ttf') format('truetype');
+    font-style: italic;
+    font-weight: 100 900;
+    font-display: block;
+}
+
+@font-face {
+    font-family: 'JetBrains';
+    src: url('../_fonts/JetBrainsMonoVar.ttf') format('truetype');
+    font-style: normal;
+    font-weight: 100 900;
+    font-display: block;
+}
+
+@font-face {
+    font-family: 'JetBrains';
+    src: url('../_fonts/JetBrainsMonoItalicVar.ttf') format('truetype');
     font-style: italic;
     font-weight: 100 900;
     font-display: block;
@@ -135,6 +151,13 @@ body {
     font-weight: 400;
     color: var(--white);
     font-size: 1rem;
+}
+
+
+#pypi-icon {
+    width: 1.5rem;
+    height: auto;
+    vertical-align: middle;
 }
 
 #github-icon {
@@ -423,6 +446,7 @@ footer.site-footer {
 
 .page-sidebar h2 {
     margin: 0 0 1rem;
+    margin-left: 2rem;
     font-size: 1.2rem;
     font-weight: 700;
     color: var(--black);
@@ -431,6 +455,7 @@ footer.site-footer {
 .sidebar-nav ul {
     list-style: none;
     margin: 0;
+    margin-left: 3rem;
     padding: 0;
 }
 
@@ -513,4 +538,9 @@ footer.site-footer {
 .nav-dropdown-menu a:hover {
     background: var(--platinum);
     color: var(--french);
+}
+
+.code {
+    font-family: 'JetBrains', monospace;
+    font-size: 0.95rem;
 }

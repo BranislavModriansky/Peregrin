@@ -6,9 +6,9 @@ from matplotlib.colors import Normalize
 from typing import Any
 from scipy import stats
 
-from .._common import Painter, Categorizer
+from ..categorizer import Painter, Categorizer
 from ...compute.stats import Stats
-from ..._general import Values
+from ...various import Values
 
 
 _log = get_logger(__name__)

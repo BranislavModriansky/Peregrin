@@ -1,4 +1,4 @@
-from ._reader import b_naive
+from ._reader import naive_b
 
 
-__all__ = ["b_naive"]
+__all__ = ["naive_b"]
