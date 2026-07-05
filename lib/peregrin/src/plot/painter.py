@@ -600,7 +600,7 @@ class Painter:
         def __init__(self): ...
 
 
-        def random_color(self, *, code: str = "hex", a: float = 1.0) -> str:
+        def random_color(self, *, code: str = "hex", a: float = 1.0, **kwargs) -> str:
             """ 
             Random color generator. 
             
@@ -616,14 +616,15 @@ class Painter:
             str
                 The generated color in the specified format.
             """
+            rng = np.random.default_rng(kwargs.get('seed', 42))  # Default seed for reproducibility
 
-            r = np.random.randint(0, 255)   # Red intensity
-            g = np.random.randint(0, 255)   # Green intensity
-            b = np.random.randint(0, 255)   # Blue intensity
+            r = rng.integers(0, 255)   # Red intensity
+            g = rng.integers(0, 255)   # Green intensity
+            b = rng.integers(0, 255)   # Blue intensity
             return self._color_value(vals={'r': r, 'g': g, 'b': b, 'a': a}, code=code)
 
 
-        def random_grey(self, *, code: str = "hex", a: float = 1.0) -> str:
+        def random_grey(self, *, code: str = "hex", a: float = 1.0, **kwargs) -> str:
             """ 
             Random grey shade generator. 
             
@@ -639,12 +640,13 @@ class Painter:
             str
                 The generated grey shade in the specified format.
             """
+            rng = np.random.default_rng(kwargs.get('seed', 42))  # Default seed for reproducibility
 
-            n = np.random.randint(0, 240)   # All intensities - equal for grey shades
+            n = rng.integers(0, 240)   # All intensities - equal for grey shades
             return self._color_value(vals={'r': n, 'g': n, 'b': n, 'a': a}, code=code)
         
 
-        def _color_value(self, vals: dict = {'r': 0, 'g': 0, 'b': 0, 'a': 1.0}, *, code: str = "hex"):
+        def _color_value(self, vals: dict = {'r': 0, 'g': 0, 'b': 0, 'a': 1.0}, *, code: str = "hex") -> str:
 
             r = vals.get("r", 0)
             g = vals.get("g", 0)
@@ -882,3 +884,5 @@ class Painter:
 painter = Painter()
 retrieve_palette = painter.QualPaletteGenerator().retrieve_palette
 retrieve_lut = painter.LUT().retrieve_lut
+random_color = painter.ColorGenerator().random_color
+random_grey = painter.ColorGenerator().random_grey

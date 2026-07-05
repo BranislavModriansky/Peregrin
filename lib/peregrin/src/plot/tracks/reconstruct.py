@@ -14,7 +14,7 @@ from ..._pckg_exceptions._pckg_errors import *
 from ..._pckg_exceptions._pckg_warnings import *
 
 from ..categorizer import categorize
-from ..painter import retrieve_palette, retrieve_lut
+from ..painter import retrieve_palette, retrieve_lut, random_color, random_grey
 
 from ...various import Values, get_aliases
 from io import BytesIO
@@ -25,6 +25,8 @@ class ReconstructTracks:
 
     ALIASES = {
         "smoothing_index": ["smoothing_index", "smooth_index", "smooth_window", "smooth_window_size"],
+        "seed": ["seed", "random_seed", "rng_seed", "random_state"],
+        "color": ["color", "colour", "c"],
     }
 
     KEY_COLS = ['condition', 'replicate', 'track_id']
@@ -531,11 +533,13 @@ class ReconstructTracks:
         correction = (original_start - smoothed_start) * (1 - t) + (original_end - smoothed_end) * t
         return smoothed + correction
 
-    def _assign_colors(self):
-        rng = np.random.default_rng(42)
+    def _color(self):
         track_index = self.Tracks.index.unique()
 
-        if self.c_mode == 'single color':
+        match self.kwargs.get('color', None):
+            case x if x in blah:
+
+        if self.c_mode == 'single_color':
             self.Tracks['Track color'] = self._coerce_color(self.only_one_color)
 
         elif self.c_mode in ['random colors', 'random greys']:
