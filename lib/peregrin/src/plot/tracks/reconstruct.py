@@ -559,7 +559,7 @@ class ReconstructTracks:
                     raise PlottingError(f"Error applying quantitative colormap: '{c}' to data: {e}")
                 
             case c if c in ['random_color', 'rand_color', 'ranodom_colors', 'rand_colors']:
-                colors = [random_color() for _ in range(len(self.Tracks))]
+                self.tracks['trackcolor'] = random_color(n=self.tracks.shape[0], code='hex', a=1.0)
 
 
         if self.c_mode == 'single_color':

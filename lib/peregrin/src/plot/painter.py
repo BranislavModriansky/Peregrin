@@ -621,12 +621,14 @@ class Painter:
             self,
             n: Optional[int] = 1,
             *,
-            code: str = "rgba",
+            code: str = "hex",
             a: float = 1.0,
             **kwargs,
         ) -> np.ndarray:
             
-            n = 1 if n is None else n
+            if not isinstance(n, int) or n < 1:
+                raise ColorGeneratorError("n must be a positive integer.")
+            
             rng = np.random.default_rng(kwargs.get("seed", 42))
 
             rgb = rng.integers(0, 256, size=(n, 3), dtype=np.uint8)
@@ -636,12 +638,14 @@ class Painter:
             self,
             n: Optional[int] = 1,
             *,
-            code: str = "rgba",
+            code: str = "hex",
             a: float = 1.0,
             **kwargs,
         ) -> np.ndarray:
             
-            n = 1 if n is None else n
+            if not isinstance(n, int) or n < 1:
+                raise ColorGeneratorError("n must be a positive integer.")
+            
             rng = np.random.default_rng(kwargs.get("seed", 42))
 
             grey = rng.integers(0, 240, size=(n, 1), dtype=np.uint8)
@@ -652,7 +656,7 @@ class Painter:
             self,
             rgb: np.ndarray,
             *,
-            code: str = "rgba",
+            code: str = "hex",
             a: float = 1.0,
         ) -> np.ndarray:
             
