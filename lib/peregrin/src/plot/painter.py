@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Optional, Tuple
+
 import seaborn as sns
 import numpy as np
 import pandas as pd
@@ -18,7 +21,7 @@ class Painter:
     def __init__(self): ...
 
 
-
+    @dataclass
     class Dyes:
         """
         Class holding color options for the UI.
@@ -32,79 +35,82 @@ class Painter:
             "differentiate replicates"
         ]
 
-        QuantitativeCModes = [
-            'gist_grey LUT',
-            'gist_yarg LUT',
-            'viridis LUT',
-            'cividis LUT',
-            'plasma LUT',
-            'inferno LUT',
-            'magma LUT',
-            'gist_heat LUT',
-            'hot LUT',
-            'afmhot LUT',
-            'copper LUT',
-            'Wistia LUT',
-            'pink LUT',
-            'bone LUT',
-            'spring LUT',
-            'summer LUT',
-            'autumn LUT',
-            'winter LUT',
-            'cool LUT',
-            'ocean LUT',
-            'gist_earth LUT',
-            'terrain LUT',
-            'cubehelix LUT',
-            'CMRmap LUT',
-            'gnuplot2 LUT',
-            'gnuplot LUT',
-            'gist_stern LUT',
-            'nipy_spectral LUT',
-            'gist_ncar LUT',
-            'brg LUT',
-            'jet LUT',
-            'turbo LUT',
-            'rainbow LUT',
-            'gist_rainbow LUT',
-            'twilight LUT',
-            'twilight_shifted LUT',
-            'hsv LUT',
-            'Purples LUT',
-            'Blues LUT',
-            'Greens LUT',
-            'Oranges LUT',
-            'Reds LUT',
-            'YlOrBr LUT',
-            'YlOrRd LUT',
-            'OrRd LUT',
-            'PuRd LUT',
-            'RdPu LUT',
-            'BuPu LUT',
-            'GnBu LUT',
-            'PuBu LUT',
-            'YlGnBu LUT',
-            'PuBuGn LUT',
-            'BuGn LUT',
-            'YlGn LUT',
-            'PiYG LUT',
-            'PRGn LUT',
-            'BrBG LUT',
-            'PuOr LUT',
-            'RdGy LUT',
-            'RdBu LUT',
-            'RdYlBu LUT',
-            'RdYlGn LUT',
-            'Spectral LUT',
-            'coolwarm LUT',
-            'bwr LUT',
-            'seismic LUT',
-            'berlin LUT',
-            'managua LUT',
-            'vanimo LUT',
+        _base_quantitative_cmaps = [
+            'gist_grey',
+            'gist_yarg',
+            'viridis',
+            'cividis',
+            'plasma',
+            'inferno',
+            'magma',
+            'gist_heat',
+            'hot',
+            'afmhot',
+            'copper',
+            'Wistia',
+            'pink',
+            'bone',
+            'spring',
+            'summer',
+            'autumn',
+            'winter',
+            'cool',
+            'ocean',
+            'gist_earth',
+            'terrain',
+            'cubehelix',
+            'CMRmap',
+            'gnuplot2',
+            'gnuplot',
+            'gist_stern',
+            'nipy_spectral',
+            'gist_ncar',
+            'brg',
+            'jet',
+            'turbo',
+            'rainbow',
+            'gist_rainbow',
+            'twilight',
+            'twilight_shifted',
+            'hsv',
+            'Purples',
+            'Blues',
+            'Greens',
+            'Oranges',
+            'Reds',
+            'YlOrBr',
+            'YlOrRd',
+            'OrRd',
+            'PuRd',
+            'RdPu',
+            'BuPu',
+            'GnBu',
+            'PuBu',
+            'YlGnBu',
+            'PuBuGn',
+            'BuGn',
+            'YlGn',
+            'PiYG',
+            'PRGn',
+            'BrBG',
+            'PuOr',
+            'RdGy',
+            'RdBu',
+            'RdYlBu',
+            'RdYlGn',
+            'Spectral',
+            'coolwarm',
+            'bwr',
+            'seismic',
+            'berlin',
+            'managua',
+            'vanimo',
         ]
 
-        CModes = BaseCModes + QuantitativeCModes
+        quantitative_cmaps = []
+
+
+
 
         PaletteQualitativeMatplotlib = [
             "Set1",
@@ -593,81 +599,98 @@ class Painter:
             "dashdot",
         ]
 
+        def __post_init__(self):
+
+            for _cmap in _base_quantitative_cmaps:
+                self.quantitative_cmaps.append(_cmap)
+
+                if f"{_cmap}_r" in mpl.colormaps:
+                    self.quantitative_cmaps.append(f"{_cmap}_r")
+
+            del _cmap, _base_quantitative_cmaps
+
 
 
     class ColorGenerator:
 
+        _HEX = np.array([f"{i:02x}" for i in range(256)], dtype="<U2")
+
         def __init__(self): ...
 
-
-        def random_color(self, *, code: str = "hex", a: float = 1.0, **kwargs) -> str:
-            """ 
-            Random color generator. 
+        def random_color(
+            self,
+            n: Optional[int] = 1,
+            *,
+            code: str = "rgba",
+            a: float = 1.0,
+            **kwargs,
+        ) -> np.ndarray:
             
-            Parameters
-            ----------
-            code : str, optional
-                The color code format. Supported values are 'hex', 'rgb', and 'rgba'. Default is 'hex'.
-            a : float, optional
-                The alpha (transparency) value for the color. Default is 1.0 (fully opaque).
+            n = 1 if n is None else n
+            rng = np.random.default_rng(kwargs.get("seed", 42))
+
+            rgb = rng.integers(0, 256, size=(n, 3), dtype=np.uint8)
+            return self._color_value(rgb, code=code, a=a)
+
+        def random_grey(
+            self,
+            n: Optional[int] = 1,
+            *,
+            code: str = "rgba",
+            a: float = 1.0,
+            **kwargs,
+        ) -> np.ndarray:
             
-            Returns
-            -------
-            str
-                The generated color in the specified format.
-            """
-            rng = np.random.default_rng(kwargs.get('seed', 42))  # Default seed for reproducibility
+            n = 1 if n is None else n
+            rng = np.random.default_rng(kwargs.get("seed", 42))
 
-            r = rng.integers(0, 255)   # Red intensity
-            g = rng.integers(0, 255)   # Green intensity
-            b = rng.integers(0, 255)   # Blue intensity
-            return self._color_value(vals={'r': r, 'g': g, 'b': b, 'a': a}, code=code)
+            grey = rng.integers(0, 240, size=(n, 1), dtype=np.uint8)
+            rgb = np.repeat(grey, 3, axis=1)
+            return self._color_value(rgb, code=code, a=a)
 
-
-        def random_grey(self, *, code: str = "hex", a: float = 1.0, **kwargs) -> str:
-            """ 
-            Random grey shade generator. 
+        def _color_value(
+            self,
+            rgb: np.ndarray,
+            *,
+            code: str = "rgba",
+            a: float = 1.0,
+        ) -> np.ndarray:
             
-            Parameters
-            ----------
-            code : str, optional
-                The color code format. Supported values are 'hex', 'rgb', and 'rgba'. Default is 'hex'.
-            a : float, optional
-                The alpha (transparency) value for the color. Default is 1.0 (fully opaque).
-            
-            Returns
-            -------
-            str
-                The generated grey shade in the specified format.
-            """
-            rng = np.random.default_rng(kwargs.get('seed', 42))  # Default seed for reproducibility
+            rgb = np.asarray(rgb, dtype=np.uint8)
 
-            n = rng.integers(0, 240)   # All intensities - equal for grey shades
-            return self._color_value(vals={'r': n, 'g': n, 'b': n, 'a': a}, code=code)
-        
+            if rgb.ndim == 1:
+                rgb = rgb.reshape(1, -1)
 
-        def _color_value(self, vals: dict = {'r': 0, 'g': 0, 'b': 0, 'a': 1.0}, *, code: str = "hex") -> str:
-
-            r = vals.get("r", 0)
-            g = vals.get("g", 0)
-            b = vals.get("b", 0)
-            a = vals.get("a", 1.0)
+            alpha = float(np.clip(a, 0.0, 1.0))
 
             match code:
                 case "hex":
-                    return f'#{r:02x}{g:02x}{b:02x}{int(a * 255):02x}'
+                    alpha_hex = np.full((rgb.shape[0], 1), round(alpha * 255), dtype=np.uint8)
+                    rgba = np.hstack((rgb, alpha_hex))
+                    parts = self._HEX[rgba]
+
+                    out = np.char.add("#", parts[:, 0])
+                    out = np.char.add(out, parts[:, 1])
+                    out = np.char.add(out, parts[:, 2])
+                    out = np.char.add(out, parts[:, 3])
+                    return out
+
                 case "rgb":
-                    return f'rgb({r}, {g}, {b})'
+                    return np.array(
+                        [f"rgb({r}, {g}, {b})" for r, g, b in rgb],
+                        dtype=object,
+                    )
+
                 case "rgba":
-                    return f'rgba({r}, {g}, {b}, {a})'
+                    return np.array(
+                        [f"rgba({r}, {g}, {b}, {alpha})" for r, g, b in rgb],
+                        dtype=object,
+                    )
+
                 case _:
-                    warnings.warn(message=f"Unexpected color code '{code}' provided. Supported codes are 'hex', 'rgb', and 'rgba'. Defaulting to 'hex' format.",
-                                  category=ColorGeneratorWarning,
-                                  stacklevel=2)
-                    
-                    return f'#{r:02x}{g:02x}{b:02x}{int(a * 255):02x}'
-
-
+                    raise ValueError(
+                        "Unsupported color code. Use one of: 'hex', 'rgb', 'rgba'."
+                    )
     class QualPaletteGenerator:
 
         def __init__(self): ...
@@ -793,32 +816,29 @@ class Painter:
             return elements
     
 
-    class LUT:
+    class Cmaps:
 
         def __init__(self): ...
 
 
-        def retrieve_lut(self, c_mode: str) -> mcolors.Colormap:
+        def retrieve_cmap(self, qnt_cmap: str) -> mcolors.Colormap:
             """
-            Retrieve a lookup table (LUT).
+            Retrieve a quantitative colormap.
             """
 
             try:
-                if c_mode.lower().endswith('lut'):
-                    c_mode = c_mode[:-4]
-                    return mpl.colormaps[c_mode]
-                else:
-                    return mpl.colormaps[c_mode]
+                return mpl.colormaps[qnt_cmap]
 
             except Exception as e:
-                warnings.warn(message=f"An error occurred while retrieving the colormap for '{c_mode}': {str(e)}. Defaulting to 'jet' colormap.",
-                            category=PainterWarning,
-                            stacklevel=2)
-                return plt.cm.jet
+                warnings.warn(message=f"An error occurred while retrieving the colormap for '{qnt_cmap}': {str(e)}. Available colormaps are: {', '.join(Painter.Dyes.quantitative_cmaps)}. Defaulting to 'jet' colormap.",
+                              category=PainterWarning,
+                              stacklevel=2)
+                
+                return mpl.colormaps['jet']
             
 
-        def scale_lut(self, min_val: float, max_val: float, cmap: str, **kwargs):
-            """ Initialize the LUT scale with min and max values and a colormap. """
+        def scale_cmap(self, min_val: float, max_val: float, cmap: str, **kwargs):
+            """ Initialize the colormap scale with min and max values and a colormap. """
 
             self.min_val = min_val
             self.max_val = max_val
@@ -883,6 +903,7 @@ class Painter:
 
 painter = Painter()
 retrieve_palette = painter.QualPaletteGenerator().retrieve_palette
-retrieve_lut = painter.LUT().retrieve_lut
+retrieve_cmap = painter.Cmaps().retrieve_cmap
 random_color = painter.ColorGenerator().random_color
 random_grey = painter.ColorGenerator().random_grey
+dyes = painter.Dyes()

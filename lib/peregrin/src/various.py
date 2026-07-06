@@ -1,10 +1,14 @@
 import math
 import time
+import warnings
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from typing import *
 from itertools import zip_longest
+
+from ._pckg_exceptions._pckg_warnings import *
+from ._pckg_exceptions._pckg_errors import *
 
 
 class CheckData:
@@ -207,49 +211,39 @@ class Values:
     
 
     @staticmethod
-    def LutMapper(data: pd.DataFrame, stat: str, *args, min: float = None, max: float = None, **kwargs) -> Tuple[Any, Any]:
-
-        noticequeue = kwargs.get('noticequeue', None) if 'noticequeue' in kwargs else None
+    def lut_mapper(data: pd.Series, *args, min: float = None, max: float = None, **kwargs) -> Tuple[Any, Any]:
 
         try:
-            if min is None: 
-                min = float(data[stat].min())
-
-            if max is None: 
-                max = float(data[stat].max())
+            if not isinstance(min, (int, float)):
+                min = float(data.min())
+            if not isinstance(max, (int, float)):
+                max = float(data.max())
 
             if not (np.isfinite(max) or np.isfinite(min)):
-                if noticequeue:
-                    noticequeue.Report(
-                        Level.warning, 
-                        f"Invalid LUT range. Minimum and maximum values must be finite numbers. Removing infinite values.", 
-                        f"min is finite: {np.isfinite(min)}; max is finite: {np.isfinite(max)}. \
-                        min: {min} {'-> 0.0' if not np.isfinite(min) else ''}; max: {max} {'-> 100.0' if not np.isfinite(max) else ''}."
-                    )
+                warnings.warn(message=f"Invalid LUT range. Max and min values are not finite. Using default range (0.0, 100.0).", 
+                              category=LUTWarning, 
+                              stacklevel=2)
+
                 if not np.isfinite(min):
                     min = 0.0
                 if not np.isfinite(max):
                     max = 100.0
                     
             if max <= min:
-                if noticequeue:
-                    noticequeue.Report(
-                        Level.warning, 
-                        f"Invalid LUT range. Max value must be greater than min value. Using default range (0.0, 100.0).", 
-                        f"Provided min: {min}; max: {max}."
-                )
+                warnings.warn(message=f"Invalid LUT range. Max value must be greater than min value. Using default range (0.0, 100.0).", 
+                              category=LUTWarning, 
+                              stacklevel=2)
+                
                 min = 0.0
                 max = 100.0
             
             norm = plt.Normalize(min, max)
-            vals = data[stat].to_numpy()
+            vals = data.to_numpy()
 
             return norm, vals
         
         except Exception as e:
-            if noticequeue:
-                noticequeue.Report(Level.error, f"Error computing LUT map. No LUT applied.", f"LUT map error: {str(e)}.")
-            return None, None
+            raise LUTError(f"Error while computing LUT map: {str(e)}")
         
 
 

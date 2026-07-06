@@ -14,7 +14,7 @@ from ..._pckg_exceptions._pckg_errors import *
 from ..._pckg_exceptions._pckg_warnings import *
 
 from ..categorizer import categorize
-from ..painter import retrieve_palette, retrieve_lut, random_color, random_grey
+from ..painter import retrieve_palette, retrieve_cmap, random_color, random_grey, dyes
 
 from ...various import Values, get_aliases
 from io import BytesIO
@@ -24,19 +24,21 @@ from ...compute.stats import Stats
 class ReconstructTracks:
 
     ALIASES = {
+        "mapping": ["mapping", "map", "map_to", "mapping_metric", "map_metric", "metric", "mapping_value", "map_value", "mapping_val", "map_val"],
         "smoothing_index": ["smoothing_index", "smooth_index", "smooth_window", "smooth_window_size"],
         "seed": ["seed", "random_seed", "rng_seed", "random_state"],
         "color": ["color", "colour", "c"],
+
     }
 
     KEY_COLS = ['condition', 'replicate', 'track_id']
+    REQUIRED_COLS = ['condition', 'replicate', 'track_id', 'time_point', 'x_coordinate', 'y_coordinate']
     
     def __init__(self): ...
 
     def reconstruct(
         self, 
-        Spots_df: pd.DataFrame, 
-        Tracks_df: pd.DataFrame = None, 
+        spot_data: pd.DataFrame,
         *,
         conditions: list = [],
         replicates: list = [],
@@ -44,13 +46,13 @@ class ReconstructTracks:
         **kwargs
     ) -> plt.Figure:
         
-        self.Spots_df = Spots_df
-        self.Tracks_df = Tracks_df
+        self.spot_data = spot_data
         self.conditions = conditions
         self.replicates = replicates
         self.align_origin = align_origin
         self.kwargs = get_aliases(kwargs, self.ALIASES)
 
+        self._prep_data()
         self._arrange_data()
 
         if not align_origin:
@@ -63,7 +65,7 @@ class ReconstructTracks:
         self._arrange_data()    
         if self.kwargs.get('smoothing_index', None) is not None and self.kwargs.get('smoothing_index', None) > 0:
             self._smooth()
-        self._assign_colors()
+        self._color()
         self._color_tracks(polar=False)
 
         fig, ax = plt.subplots(figsize=(13, 10))
@@ -110,7 +112,7 @@ class ReconstructTracks:
         self._arrange_data()
         if self.kwargs.get('smoothing_index', None) is not None and self.kwargs.get('smoothing_index', None) > 0:
             self._smooth()
-        self._assign_colors()
+        self._color()
         self._convert_polar()
         self._get_radius(all_data)
         self._color_tracks(polar=True)
@@ -425,6 +427,16 @@ class ReconstructTracks:
         if fps <= 0:
             raise ValueError("Frame rate must be positive.")
         return 1000.0 / fps
+    
+
+    def _prep_data(self):
+        missing_columns = [col for col in self.REQUIRED_COLS if col not in self.spot_data.columns]
+        if missing_columns:
+            raise MissingDataError(f"Missing required columns in spot_data: {missing_columns}")
+        
+        self.spot_data = self.spot_data[self.REQUIRED_COLS].copy()
+        self.tracks = self.spot_data.groupby('track_uid')
+
         
 
     def _arrange_data(self):
@@ -534,10 +546,21 @@ class ReconstructTracks:
         return smoothed + correction
 
     def _color(self):
-        track_index = self.Tracks.index.unique()
 
         match self.kwargs.get('color', None):
-            case x if x in blah:
+            case c if c in dyes.quantitative_cmaps:
+                cmap = self._resolve_cmap(c)
+                norm, vals = Values.lut_mapper(..., min=self.kwargs.get('lut_vmin', None), max=self.kwargs.get('lut_vmax', None))
+
+                try:
+                    rgba = cmap(norm(np.asarray(vals, dtype=float)))
+                    self.spot_data['trackcolor'] = list(rgba)
+                except Exception as e:
+                    raise PlottingError(f"Error applying quantitative colormap: '{c}' to data: {e}")
+                
+            case c if c in ['random_color', 'rand_color', 'ranodom_colors', 'rand_colors']:
+                colors = [random_color() for _ in range(len(self.Tracks))]
+
 
         if self.c_mode == 'single_color':
             self.Tracks['Track color'] = self._coerce_color(self.only_one_color)
@@ -786,23 +809,11 @@ class ReconstructTracks:
         lc = LineCollection(self.segments, colors=self.segment_colors, linewidths=self.lw, zorder=10)
         ax.add_collection(lc)
 
-    def _resolve_cmap(self, cmap_like):
-        if isinstance(cmap_like, mcolors.Colormap):
-            return cmap_like
-        name = str(cmap_like).strip()
-        if name.lower().endswith('lut'):
-            name = name[:-3].strip()
-        try:
-            cmap = self.painter.GetCmap(name)
-            if isinstance(cmap, mcolors.Colormap):
-                return cmap
-        except Exception:
-            pass
-        try:
-            return plt.get_cmap(name)
-        except Exception:
-            return plt.get_cmap('viridis')
-
+    def _resolve_cmap(self, cmap) -> mcolors.Colormap:
+        if isinstance(cmap, mcolors.Colormap):
+            return cmap
+        return retrieve_cmap(cmap)
+        
     def _coerce_color(self, value, fallback: str = '#000000') -> str:
         try:
             if pd.isna(value):
