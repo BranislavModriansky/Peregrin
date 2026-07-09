@@ -1,6 +1,7 @@
 from inspect import Arguments
 
 import pandas as pd
+from pandas.api.types import is_numeric_dtype, is_categorical_dtype
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
@@ -14,71 +15,97 @@ from ..._pckg_exceptions._pckg_errors import *
 from ..._pckg_exceptions._pckg_warnings import *
 
 from ..categorizer import categorize
-from ..painter import retrieve_palette, retrieve_cmap, random_color, random_grey, dyes
+from ..painter import retrieve_palette, retrieve_cmap, random_color, random_grey, cmap_lut, dyes, is_color_code
 
-from ...various import Values, get_aliases
+from ...various import Values, get_aliases, is_empty, clock
 from io import BytesIO
 from ..._infra._selections import Metrics
 from ...compute.stats import Stats
 
+import matplotlib
+
 class ReconstructTracks:
 
     ALIASES = {
-        "mapping": ["mapping", "map", "map_to", "mapping_metric", "map_metric", "metric", "mapping_value", "map_value", "mapping_val", "map_val"],
-        "smoothing_index": ["smoothing_index", "smooth_index", "smooth_window", "smooth_window_size"],
-        "seed": ["seed", "random_seed", "rng_seed", "random_state"],
+        "smoothing_index": ["smoothing", "smoothing_index", "smooth_window_size"],
+        "seed": ["seed", "random_seed", "rng_seed"],
+        "c_mode": ["color_mode", "colour_mode", "c_mode"],
+        "cmap": ["cmap", "colormap", "colourmap"],
+        "palette": ["palette", "color_palette", "colour_palette"],
+        "color_by": ["color_by", "colour_by"],
+        "lw": ["lw", "linewidth", "line_width"],
+        "marker_fill": ["marker_fill", "head_fill", "fill"],
         "color": ["color", "colour", "c"],
 
     }
 
+    _C_MODES = ['None', 'random', 'random_greys', 'categorical', 'numeric']
+    _DYE_COLOR_SET = frozenset(dyes.colors.values())
+
     KEY_COLS = ['condition', 'replicate', 'track_id']
-    REQUIRED_COLS = ['condition', 'replicate', 'track_id', 'time_point', 'x_coordinate', 'y_coordinate']
+    REQUIRED_COLS = ['condition', 'replicate', 'track_id', 'track_uid' , 'time_point', 'x_coordinate', 'y_coordinate']
     
     def __init__(self): ...
 
+    @clock
     def reconstruct(
         self, 
         spot_data: pd.DataFrame,
+        track_data: pd.DataFrame = None,
         *,
         conditions: list = [],
         replicates: list = [],
-        align_origin: bool = False,
+        common_start: bool = False,
+        ignore_categories: bool = False,
         **kwargs
     ) -> plt.Figure:
         
         self.spot_data = spot_data
+        self.track_data = track_data
         self.conditions = conditions
         self.replicates = replicates
-        self.align_origin = align_origin
+        self.common_start = common_start
         self.kwargs = get_aliases(kwargs, self.ALIASES)
 
-        self._prep_data()
+        if params.ignore_categories or ignore_categories:
+            self.REQUIRED_COLS.remove('condition', ' replicate')
+        if ignore_categories and not params.ignore_categories:
+            warnings.warn(message=f"ignore_categories is set to True for this function call, but the global setting is False. This function call will not ignore categories. To change the global setting, use `peregrin.settings(ignore_categories=True)`.", 
+                          category=UserWarning, 
+                          stacklevel=2)
+
         self._arrange_data()
+        self._assign_color()
 
-        if not align_origin:
-            return self.realistic()
-        else:
-            return self.anchored()
-
-    def realistic(self) -> plt.Figure:
-
-        self._arrange_data()    
         if self.kwargs.get('smoothing_index', None) is not None and self.kwargs.get('smoothing_index', None) > 0:
             self._smooth()
-        self._color()
-        self._color_tracks(polar=False)
+
+        if not common_start:
+            return self.cartesian()
+        else:
+            return self.polar()
+
+
+
+
+    def cartesian(self) -> plt.Figure:
 
         fig, ax = plt.subplots(figsize=(13, 10))
-        if len(self.Spots):
-            x = self.Spots['X coordinate'].to_numpy()
-            y = self.Spots['Y coordinate'].to_numpy()
+
+        ax = self._build_tracks(ax)
+
+        
+        if len(self.spot_data):
+            x = self.spot_data.x_coordinate.to_numpy()
+            y = self.spot_data.y_coordinate.to_numpy()
             ax.set_xlim(np.nanmin(x), np.nanmax(x))
             ax.set_ylim(np.nanmin(y), np.nanmax(y))
 
         ax.set_aspect('equal', adjustable='box')
-        ax.set_xlabel('X coordinate [µm]', color=self.text_color)
-        ax.set_ylabel('Y coordinate [µm]', color=self.text_color)
-        ax.set_title(self.title, fontsize=12, color=self.text_color)
+        text_color = self.kwargs.get('text_color', 'black')
+        ax.set_xlabel('x_coordinate [µm]', color=text_color)
+        ax.set_ylabel('y_coordinate [µm]', color=text_color)
+        ax.set_title(self.kwargs.get('title', ''), fontsize=12, color=text_color)
         self._background_color(); ax.set_facecolor(self.face_color)
 
         # Ticks
@@ -88,57 +115,59 @@ class ReconstructTracks:
         ax.yaxis.set_minor_locator(MultipleLocator(50))
         ax.xaxis.set_major_formatter(FormatStrFormatter('%.0f'))
         ax.yaxis.set_major_formatter(FormatStrFormatter('%.0f'))
-        ax.tick_params(axis='both', which='major', labelsize=8, colors=self.text_color)
+        ax.tick_params(axis='both', which='major', labelsize=8, colors=text_color)
 
-        if self.grid:
-            self._grid_color(coord_system='cartesian')
-            self._grid_style(coord_system='cartesian', ax=ax)
-        else:
-            ax.grid(False)
-        
-        self._color_segments(ax)
-        
-        if self.mark_heads:
-            self._head_markers(ax, polar=False)
+        # if self.grid:
+        #     self._grid_color(coord_system='cartesian')
+        #     self._grid_style(coord_system='cartesian', ax=ax)
+        # else:
+        #     ax.grid(False)
 
-        if self.strip_backdrop:
+        ax.grid(False)
+        
+        if self.kwargs.get('show_heads', True):
+            ax = self._head_markers(ax, polar=False)
+
+        if self.kwargs.get('hide_backdrop', False):
             fig.set_facecolor('none')
 
         return plt.gcf()
     
 
-    def Normalized(self, all_data: pd.DataFrame) -> plt.Figure:
-
-        self._arrange_data()
-        if self.kwargs.get('smoothing_index', None) is not None and self.kwargs.get('smoothing_index', None) > 0:
-            self._smooth()
-        self._color()
-        self._convert_polar()
-        self._get_radius(all_data)
-        self._color_tracks(polar=True)
+    def polar(self) -> plt.Figure:
 
         fig, ax = plt.subplots(figsize=(12.5, 9.5), subplot_kw={'projection': 'polar'})
-        ax.set_title(self.title, fontsize=12, color=self.text_color)
+
+        self._get_radius()
+        self._convert_polar()
+
+        text_color = self.kwargs.get('text_color', 'black')
+        ax.set_title(self.kwargs.get('title', ''), fontsize=12, color=text_color)
         ax.set_ylim(0, self.y_max_global)        # <- global, consistent across subsets
         
         ax.spines['polar'].set_visible(False)
 
+        ax = self._build_tracks(ax)
+
         self._background_color(); ax.set_facecolor(self.face_color)
-        if self.grid:
-            self._grid_color(coord_system='polar')
-            self._grid_style(coord_system='polar', ax=ax)
-        else:
-            ax.grid(False)
+        
+        ax.grid(False)
+
+        # if self.kwargs.get('grid', True):
+        #     self._grid_color(coord_system='polar')
+        #     self._grid_style(coord_system='polar', ax=ax)
+        # else:
+        #     ax.grid(False)
 
         self._annotate_r_axis(ax)
         self._annotate_theta_axis(ax)
 
-        self._color_segments(ax)
+        # self._color_segments(ax)
 
-        if self.mark_heads:
+        if self.kwargs.get('show_heads', True):
             self._head_markers(ax, polar=True)
 
-        if self.strip_backdrop:
+        if self.kwargs.get('hide_backdrop', False):
             fig.set_facecolor('none')
 
         return plt.gcf()
@@ -429,44 +458,55 @@ class ReconstructTracks:
         return 1000.0 / fps
     
 
-    def _prep_data(self):
-        missing_columns = [col for col in self.REQUIRED_COLS if col not in self.spot_data.columns]
-        if missing_columns:
-            raise MissingDataError(f"Missing required columns in spot_data: {missing_columns}")
+    # def _guard(self):
+    #     missing_columns = [col for col in self.REQUIRED_COLS if col not in self.spot_data.columns]
+    #     if missing_columns:
+    #         raise MissingDataError(f"Missing required columns in spot_data: {missing_columns}")
         
-        self.spot_data = self.spot_data[self.REQUIRED_COLS].copy()
-        self.tracks = self.spot_data.groupby('track_uid')
+    #     c_mode = self.kwargs.get('c_mode', None)
 
+    #     if c_mode in ['categorical', 'quantitative']:
+    #         color_by = self.kwargs.get('color_by', None)
+    #         if color_by is None:
+    #             raise ValueError("Missing 'color_by' parameter. Must be specified when c_mode is 'categorical' or 'quantitative'.")
+    #         if color_by not in self.spot_data.columns:
+    #             if is_empty(self.track_data):
+    #                 raise MissingDataError(f"Failed to find: '{color_by}' data -> '{color_by}' data not found in spot_data columns -> parameter 'track_data' is empty or missing.")
+    #             if color_by not in self.track_data.columns:
+    #                 raise MissingDataError(f"Failed to find: '{color_by}' data -> '{color_by}' data not found in spot_data or track_data columns.")
         
 
     def _arrange_data(self):
-        Spots =  categorize(self.Spots_df, self.conditions, self.replicates)
-        Tracks = categorize(self.Tracks_df, self.conditions, self.replicates)
+        self.spot_data = categorize(self.spot_data, self.conditions, self.replicates, **self.kwargs)
 
         if not params.ignore_categories:
-            self.Spots = Spots.sort_values(['condition', 'replicate', 'track_id', 'time_point'])
-            self.Tracks = Tracks.sort_values(['condition', 'replicate', 'track_id'])
+            self.spot_data = self.spot_data.sort_values(['condition', 'replicate', 'track_id', 'time_point'])
+            if not is_empty(self.track_data):
+                self.track_data = categorize(self.track_data, self.conditions, self.replicates, **self.kwargs)
+                self.track_data = self.track_data.sort_values(['condition', 'replicate', 'track_id'])
         else:
-            self.Spots = Spots.sort_values(['track_uid', 'time_point'])
-            self.Tracks = Tracks.sort_values(['track_uid'])
+            self.spot_data = self.spot_data.sort_values(['track_uid', 'time_point'])
+            if not is_empty(self.track_data):
+                self.track_data = self.track_data.sort_values(['track_uid'])
 
 
-        if list(Spots.index.names) != self.KEY_COLS:
-            Spots = Spots.set_index(self.KEY_COLS)
-        if list(Tracks.index.names) != self.KEY_COLS:
-            Tracks = Tracks.set_index(self.KEY_COLS)
-
-        self.Spots = Spots
-        self.Tracks = Tracks
+        if list(self.spot_data.index.names) != self.KEY_COLS:
+            self.spot_data = self.spot_data.set_index(self.KEY_COLS)
+            self.spot_data = self.spot_data
+        if not is_empty(self.track_data) and list(self.track_data.index.names) != self.KEY_COLS:
+            self.track_data = self.track_data.set_index(self.KEY_COLS)
+            self.track_data = self.track_data
+        
 
     def _convert_polar(self):
-        self.Spots['X coordinate'] = self.Spots['X coordinate'] - self.Spots.groupby(level=self.KEY_COLS)['X coordinate'].transform('first')
-        self.Spots['Y coordinate'] = self.Spots['Y coordinate'] - self.Spots.groupby(level=self.KEY_COLS)['Y coordinate'].transform('first')
+        self.spot_data.x_coordinate = self.spot_data.x_coordinate - self.spot_data.groupby(level=self.KEY_COLS).x_coordinate.transform('first')
+        self.spot_data.y_coordinate = self.spot_data.y_coordinate - self.spot_data.groupby(level=self.KEY_COLS).y_coordinate.transform('first')
 
-        self.Spots['r'] = np.sqrt(self.Spots['X coordinate']**2 + self.Spots['Y coordinate']**2)
-        self.Spots['theta'] = np.arctan2(self.Spots['Y coordinate'], self.Spots['X coordinate'])
+        self.spot_data['r'] = np.sqrt(self.spot_data.x_coordinate**2 + self.spot_data.y_coordinate**2)
+        self.spot_data['theta'] = np.arctan2(self.spot_data.y_coordinate, self.spot_data.x_coordinate)
 
-    def _get_radius(self, alldata: pd.DataFrame):
+
+    def _get_radius(self):
         """
         Compute global maximum radius from (X, Y) positions.
 
@@ -474,63 +514,64 @@ class ReconstructTracks:
         - MultiIndex with levels ['Condition', 'Replicate', 'Track ID']
         - Regular Index with those columns present.
         """
-        if alldata.empty:
+        if is_empty(self.spot_data):
             self.y_max_global = 100.0
             self.y_max_label_global = "100 μm"
             return
 
         # Choose grouping mode based on index type
-        if isinstance(alldata.index, pd.MultiIndex) and list(alldata.index.names) == self.KEY_COLS:
-            group = alldata.groupby(level=self.KEY_COLS)
+        if isinstance(self.spot_data.index, pd.MultiIndex) and list(self.spot_data.index.names) == self.KEY_COLS:
+            group = self.spot_data.groupby(level=self.KEY_COLS)
         else:
             # Fall back to grouping by columns
-            missing = [c for c in self.KEY_COLS if c not in alldata.columns]
+            missing = [c for c in self.KEY_COLS if c not in self.spot_data.columns]
             if missing:
-                Reporter(Level.error, f"Cannot compute radius for polar plot. -> Missing required grouping columns: {missing}.", noticequeue=self.noticequeue)
+                # Reporter(Level.error, f"Cannot compute radius for polar plot. -> Missing required grouping columns: {missing}.", noticequeue=self.noticequeue)
 
                 self.y_max_global = 100.0
                 self.y_max_label_global = "100 μm"
                 return
-            group = alldata.groupby(self.KEY_COLS)
+            group = self.spot_data.groupby(self.KEY_COLS)
 
-        x = alldata['X coordinate']
-        y = alldata['Y coordinate']
-        x0 = group['X coordinate'].transform('first')
-        y0 = group['Y coordinate'].transform('first')
+        x = self.spot_data.x_coordinate
+        y = self.spot_data.y_coordinate
+        x0 = group.x_coordinate.transform('first')
+        y0 = group.y_coordinate.transform('first')
         r = np.sqrt((x - x0) ** 2 + (y - y0) ** 2)
 
         self.y_max_global = r.max() + 10.0
         self.y_max_label_global = f"{round(r.max()) + 10} μm"
 
-        if not np.isfinite(self.y_max_global):
-            Reporter(Level.warning, f"Invalid maximum radius computed for polar plot. Setting to default '100 μm'.", details=f"Maximum radius was not finite: {self.y_max_global}.", noticequeue=self.noticequeue)
-            self.y_max_global = 100.0
-        if not (self.y_max_global > 0):
-            Reporter(Level.warning, 'Negative maximum radius. Setting to default "100 μm".', details=f"Maximum radius was a negative value: {self.y_max_global}.", noticequeue=self.noticequeue)
-            self.y_max_global = 100.0
-            self.y_max_label_global = "100 μm"
+        # if not np.isfinite(self.y_max_global):
+        #     Reporter(Level.warning, f"Invalid maximum radius computed for polar plot. Setting to default '100 μm'.", details=f"Maximum radius was not finite: {self.y_max_global}.", noticequeue=self.noticequeue)
+        #     self.y_max_global = 100.0
+        # if not (self.y_max_global > 0):
+        #     Reporter(Level.warning, 'Negative maximum radius. Setting to default "100 μm".', details=f"Maximum radius was a negative value: {self.y_max_global}.", noticequeue=self.noticequeue)
+        #     self.y_max_global = 100.0
+        #     self.y_max_label_global = "100 μm"
         
     def _smooth(self):
-        if (isinstance(self.smoothing_index, (int, float))) and self.smoothing_index >= 1:
+        if (isinstance(self.smoothing_index, (int))) and self.smoothing_index >= 1:
             _smoothing_window = self.smoothing_index
             if isinstance(_smoothing_window, float):
                 _smoothing_window = round(self.smoothing_index)
                 
-                Reporter(Level.info, f"Smoothing index rounded to nearest integer: {_smoothing_window}.", f"Invalid smoothing index type: float ({self.smoothing_index}).", noticequeue=self.noticequeue)
-            
             for col in ['X coordinate', 'Y coordinate']:
                 self.Spots[col] = (
                     self.Spots.groupby(
                         level=self.KEY_COLS
                     )[col].transform(
-                        lambda s: self._smooth_preserve_endpoints(s, _smoothing_window)
+                        lambda s: self.smooth_preserve_endpoints(s, _smoothing_window)
                     )
                 )
         else:
-            Reporter(Level.warning, f"Invalid smoothing index. No smoothing applied.", f"Smoothing index must be an integer type and must be greater than 1. {type(self.smoothing_index)}: {self.smoothing_index}.", noticequeue=self.noticequeue)
+            warnings.warn(message=f"Invalid 'smoothing_index': {self.smoothing_index} -> Must be a positive integer -> No smoothing applied.", 
+                          category=UserWarning, 
+                          stacklevel=2)
+                          
 
     @staticmethod
-    def _smooth_preserve_endpoints(s: pd.Series, window: int) -> pd.Series:
+    def smooth_preserve_endpoints(s: pd.Series, window: int) -> pd.Series:
         """Smooth a series with rolling mean, then linearly correct so endpoints are preserved."""
         if len(s) < 2:
             return s
@@ -545,123 +586,146 @@ class ReconstructTracks:
         correction = (original_start - smoothed_start) * (1 - t) + (original_end - smoothed_end) * t
         return smoothed + correction
 
-    def _color(self):
 
-        match self.kwargs.get('color', None):
-            case c if c in dyes.quantitative_cmaps:
-                cmap = self._resolve_cmap(c)
-                norm, vals = Values.lut_mapper(..., min=self.kwargs.get('lut_vmin', None), max=self.kwargs.get('lut_vmax', None))
+    def _assign_color(self):
+
+        if self.kwargs.get('color_by', None) is not None:
+            color_by = self.kwargs.get('color_by', None)
+            if self.kwargs.get('color', None) is not None:
+                warnings.warn(message=f"Both 'color' and 'color_by' parameters are provided -> Parameter 'color' will be ignored -> Using 'color_by' for color assignment.",
+                              category=ConflictingParametersWarning, 
+                              stacklevel=2)
+
+            datatype = None
+            if isinstance(color_by, tuple) and len(color_by) == 2:
+                color_by, datatype = color_by
+                if datatype not in ['categorical', 'numeric']:
+                    raise ValueError(f"Invalid datatype parameter '{datatype}' for color_by. Must be one of ['categorical', 'numeric'].")
+            
+            if datatype == 'categorical' or is_categorical_dtype(self.spot_data[color_by]):
+                palette = self.kwargs.get('palette', None)
+
+                if isinstance(palette, str):
+                    categories = self.spot_data[color_by].dropna().unique().tolist()
+                    palette = retrieve_palette(categories, palette)
+                elif isinstance(palette, list):
+                    categories = self.spot_data[color_by].dropna().unique().tolist()
+                    palette = retrieve_palette(categories, palette)
+                elif isinstance(palette, dict):
+                    pass  # expected {category: color}, use as-is
+                else:
+                    raise PlottingError(f"Invalid palette type: {type(palette)}. Must be str, list, or dict.")
+
+                self.spot_data['trackcolor'] = self.spot_data[color_by].map(palette).fillna("#000000FF")
+
+            elif datatype == 'numeric' or is_numeric_dtype(self.spot_data[color_by]):
+                cmap = retrieve_cmap(self.kwargs.get('cmap', None))
+                norm, vals = cmap_lut(
+                    self.spot_data[color_by],
+                    min=self.kwargs.get('lut_vmin', None),
+                    max=self.kwargs.get('lut_vmax', None),
+                )
 
                 try:
                     rgba = cmap(norm(np.asarray(vals, dtype=float)))
                     self.spot_data['trackcolor'] = list(rgba)
                 except Exception as e:
-                    raise PlottingError(f"Error applying quantitative colormap: '{c}' to data: {e}")
-                
-            case c if c in ['random_color', 'rand_color', 'ranodom_colors', 'rand_colors']:
-                self.tracks['trackcolor'] = random_color(n=self.tracks.shape[0], code='hex', a=1.0)
-
-
-        if self.c_mode == 'single_color':
-            self.Tracks['Track color'] = self._coerce_color(self.only_one_color)
-
-        elif self.c_mode in ['random colors', 'random greys']:
-            if self.c_mode == 'random colors':
-                cols = [mcolors.to_hex(rng.random(3)) for _ in range(len(track_index))]
+                    raise PlottingError(f"Error applying quantitative colormap: '{cmap}' to data: {e}")
+            
             else:
-                cols = [mcolors.to_hex((float(g), float(g), float(g))) for g in rng.random(len(track_index))]
-            lut = dict(zip(track_index, cols))
-            self.Tracks['Track color'] = [self._coerce_color(lut.get(idx)) for idx in self.Tracks.index]
-
-        elif self.c_mode in ['differentiate conditions', 'differentiate replicates']:
-            category = 'Replicate' if self.c_mode == 'differentiate replicates' else 'Condition'
-            df = self.Tracks.reset_index()
-            categories = df[category].dropna().unique().tolist()
-
-            if self.stock_palette is None:
-                mp = self.painter.BuildQualPalette(data=df, tag=category, which=categories)
-            else:
-                mp = self.painter.StockQualPalette(
-                    data=df,
-                    tag=category,
-                    palette=self.stock_palette,
-                    which=categories
-                )
-                if not isinstance(mp, dict) or not mp:
-                    mp = self.painter.BuildQualPalette(data=df, tag=category, which=categories)
-
-            df['Track color'] = df[category].map(mp).apply(self._coerce_color)
-            self.Tracks = df.set_index(['Condition', 'Replicate', 'Track ID'])
+                raise InvalidParameterValueError(f"Invalid color_by value: '{color_by}'. Must be a column name in spot_data with categorical or numeric data or a tuple where the data type is specified (column_name, 'categorical'|'numeric').")
 
         else:
-            cmap = self._resolve_cmap(self.c_mode)
-            norm, vals = Values.LutMapper(
-                self.Tracks if self.lut_scaling_stat in self.Tracks.columns else self.Spots,
-                self.lut_scaling_stat,
-                min=self.lut_vmin,
-                max=self.lut_vmax,
-                noticequeue=self.noticequeue
-            )
+            c = self.kwargs.get('color', 'black')
+            match c:
+                case c if c in self._DYE_COLOR_SET or is_color_code(c):
+                    self.spot_data['trackcolor'] = c
+            
+                case 'random_greys':
+                    track_ids = self.spot_data['track_uid'].unique()
+                    colors = random_grey(n=len(track_ids), code='hex', a=1.0)
+                    color_map = dict(zip(track_ids, colors))
+                    self.spot_data['trackcolor'] = self.spot_data['track_uid'].map(color_map)
 
-            if not (norm is None or vals is None):
-                if self.lut_scaling_stat in self.Tracks.columns:
-                    self.Tracks['Track color'] = [self._coerce_color(mcolors.to_hex(cmap(norm(v)))) for v in vals]
-                if self.lut_scaling_stat in self.Spots.columns:
-                    self.Spots['Spot color'] = [self._coerce_color(mcolors.to_hex(cmap(norm(v)))) for v in vals]
-            else:
-                self.Tracks['Track color'] = mcolors.to_hex('black')
+                case c if c in ['random', 'random_colors', 'random_colours']:
+                    track_ids = self.spot_data['track_uid'].unique()
+                    colors = random_color(n=len(track_ids), code='hex', a=1.0)
+                    color_map = dict(zip(track_ids, colors))
+                    self.spot_data['trackcolor'] = self.spot_data['track_uid'].map(color_map)
 
-        if 'Track color' in self.Tracks.columns and 'Track color' not in self.Spots.columns:
-            self.Spots = self.Spots.join(self.Tracks[['Track color']], how='left')
-            self.Spots['Track color'] = self.Spots['Track color'].apply(self._coerce_color)
+                case _:
+                    raise InvalidParameterValueError(f"Invalid color parameter: {self.kwargs.get('color')}. Must be a valid color name, hex code, or one of ['random', 'random_greys'].")
 
-    def _build_segments(self, spots: pd.DataFrame, polar: bool = False):
+
+    def _build_tracks(
+        self, 
+        ax: plt.Axes | None = None, 
+        *, 
+        polar: bool = False
+    ) -> plt.Axes | None:
         """
-        Build segments and colors from a Spots-like dataframe.
+        Build and optionally plot track segments from self.spot_data efficiently.
 
-        Returns
-        -------
-        segments : list of (N_i, 2) float arrays
-        colors   : list of hex strings, one per segment
+        Tracks are rendered as one LineCollection instead of one line per track.
+        This avoids Python-level plotting loops and is much faster for many tracks.
         """
-        coord_cols = ('theta', 'r') if polar else ('X coordinate', 'Y coordinate')
 
-        segments: list[np.ndarray] = []
-        seg_colors: list[str] = []
+        if is_empty(self.spot_data):
+            raise MissingDataError("No spot data available to build tracks.")
 
-        if 'Spot color' in spots.columns:
-            # Per-spot coloring (e.g. instantaneous LUTs)
-            for _, g in spots.groupby(level=self.KEY_COLS, sort=False):
-                coords = g[list(coord_cols)].to_numpy(dtype=float, copy=False)
-                cols = g['Spot color'].to_numpy()
-                n = coords.shape[0]
-                if n >= 2:
-                    for i in range(1, n):
-                        segments.append(coords[i - 1:i + 1])
-                        seg_colors.append(self._coerce_color(cols[i]))
-        elif 'Track color' in spots.columns:
-            # Per-track coloring
-            for _, g in spots.groupby(level=self.KEY_COLS, sort=False):
-                coords = g[list(coord_cols)].to_numpy(dtype=float, copy=False)
-                if coords.shape[0] >= 2:
-                    segments.append(coords)
-                    seg_colors.append(self._coerce_color(g['Track color'].iloc[0]))
+        tuid = self.spot_data['track_uid'].to_numpy()
+        if not np.all(tuid[1:] >= 0) or not (np.diff(pd.factorize(tuid)[0]) >= -0).all():
+            self.spot_data = self.spot_data.sort_values(['track_uid', 'time_point'])
+
+        if len(self.spot_data) < 2:
+            self.segments = np.empty((0, 2, 2), dtype=float)
+            self.segment_colors = np.empty((0,), dtype=object)
+            return None
+
+        group_codes = pd.factorize(self.spot_data['track_uid'], sort=False)[0]
+        
+        x = self.spot_data.x_coordinate.to_numpy(dtype=float, copy=False)
+        y = self.spot_data.y_coordinate.to_numpy(dtype=float, copy=False)
+
+        if polar:
+            grouped = self.spot_data.groupby('track_uid', sort=False, observed=True)
+            x0 = grouped.x_coordinate.transform("first").to_numpy(dtype=float, copy=False)
+            y0 = grouped.y_coordinate.transform("first").to_numpy(dtype=float, copy=False)
+
+            dx = x - x0
+            dy = y - y0
+
+            plot_x = np.arctan2(dy, dx)
+            plot_y = np.sqrt(dx * dx + dy * dy)
         else:
-            # Fallback: black
-            default_col = mcolors.to_hex('black')
-            for _, g in spots.groupby(level=self.KEY_COLS, sort=False):
-                coords = g[list(coord_cols)].to_numpy(dtype=float, copy=False)
-                if coords.shape[0] >= 2:
-                    segments.append(coords)
-                    seg_colors.append(default_col)
+            plot_x = x
+            plot_y = y
 
-        return segments, seg_colors
+        points = np.column_stack((plot_x, plot_y))
 
-    def _color_tracks(self, polar: bool = False):
-        """
-        Populate self.segments and self.segment_colors from self.Spots/self.Tracks.
-        """
-        self.segments, self.segment_colors = self._build_segments(self.Spots, polar=polar)
+        valid = (
+            (group_codes[1:] == group_codes[:-1])
+            & (group_codes[1:] >= 0)
+            & np.isfinite(points[:-1]).all(axis=1)
+            & np.isfinite(points[1:]).all(axis=1)
+        )
+
+        self.segments = np.stack(
+            (points[:-1][valid], points[1:][valid]),
+            axis=1,
+        )
+
+        self.segment_colors = self.spot_data.trackcolor.to_numpy(dtype=object, copy=False)[:-1][valid]
+
+        lc = LineCollection(
+            self.segments,
+            colors=self.segment_colors,
+            linewidths=self.kwargs.get("lw", 1.0),
+            zorder=10,
+        )
+        ax.add_collection(lc)
+
+        return ax
 
     def _background_color(self):
         mapping = {
@@ -671,7 +735,7 @@ class ReconstructTracks:
             'dark': 'dimgrey',
             'black': 'black',
         }
-        self.face_color = mapping.get(self.background, 'white')
+        self.face_color = mapping.get(self.kwargs.get('background', 'white'), 'white')
 
     def _grid_color(self, coord_system: str = 'cartesian'):
         mapping = {
@@ -692,10 +756,10 @@ class ReconstructTracks:
         }
 
         if coord_system == 'cartesian':
-            self.grid_color, self.grid_alpha = mapping['cartesian'].get(self.background, ('gainsboro', 0.5))
+            self.grid_color, self.grid_alpha = mapping['cartesian'].get(self.kwargs.get('background', 'white'), ('gainsboro', 0.5))
 
         elif coord_system == 'polar':
-            self.grid_color, self.grid_a_alpha, self.grid_alpha = mapping['polar'].get(self.background, ('lightgrey', 0.7, 0.8))
+            self.grid_color, self.grid_a_alpha, self.grid_alpha = mapping['polar'].get(self.kwargs.get('background', 'white'), ('lightgrey', 0.7, 0.8))
 
     def _grid_style(self, ax: plt.Axes, coord_system: str = 'cartesian'):
 
@@ -742,7 +806,7 @@ class ReconstructTracks:
 
 
     def _annotate_r_axis(self, ax: plt.Axes):
-        match self.annotate_r:
+        match self.kwargs.get('r_axis', 'none'):
             case 'minimal':
                 ax.set_yticklabels([])
 
@@ -760,14 +824,19 @@ class ReconstructTracks:
 
     
     def _annotate_theta_axis(self, ax: plt.Axes):
-        if self.annotate_theta:
+        if self.kwargs.get('theta_axis', 'none') == 'detailed':
             tlabels = ax.get_xticklabels()
             ax.set_xticklabels(tlabels, fontsize=10, color=self.text_color)
         else:
             ax.set_xticklabels([])
 
 
-    def _head_markers(self, ax, polar: bool = False, spots: pd.DataFrame | None = None):
+    def _head_markers(
+        self,
+        ax: plt.Axes,
+        *,
+        polar: bool = False
+    ) -> plt.Axes:
         """
         Draw markers at track ends.
 
@@ -776,32 +845,23 @@ class ReconstructTracks:
 
         If `spots` is provided, use that subset; otherwise use self.Spots.
         """
-        spots_df = self.Spots if spots is None else spots
+        x_coord, y_coord = ('theta', 'r') if polar else ('x_coordinate', 'y_coordinate')
 
-        x_coord, y_coord = ('theta', 'r') if polar else ('X coordinate', 'Y coordinate')
+        grouped = self.spot_data.groupby('track_uid', sort=False, observed=True)
+        last_points = grouped.tail(1)
 
-        ends = spots_df.groupby(level=self.KEY_COLS, sort=False).tail(1)
-        if len(ends):
-            xe = ends[x_coord].to_numpy(dtype=float, copy=False)
-            ye = ends[y_coord].to_numpy(dtype=float, copy=False)
+        ax.scatter(
+            last_points[x_coord],
+            last_points[y_coord],
+            marker=self.kwargs.get("head_shape", "o"),
+            s=self.kwargs.get("head_size", 10),
+            edgecolor=last_points.trackcolor if self.kwargs.get("outline_head", True) else "none",
+            facecolor=last_points.trackcolor if self.kwargs.get("fill_head", False) else "none",
+            linewidths=self.kwargs.get("head_outline_width", 1.0),
+            zorder=12
+        )
 
-            cols = np.array([mcolors.to_hex('black')] * len(ends), dtype=object)
-            if 'Spot color' in ends.columns:
-                cols = np.array([self._coerce_color(c) for c in ends['Spot color'].to_numpy()], dtype=object)
-            elif 'Track color' in ends.columns:
-                cols = np.array([self._coerce_color(c) for c in ends['Track color'].to_numpy()], dtype=object)
-
-            m = np.isfinite(xe) & np.isfinite(ye)
-            if m.any():
-                ax.scatter(
-                    xe[m], ye[m],
-                    marker=self.marker["symbol"],
-                    s=self.marker_size,
-                    edgecolor=cols[m],
-                    facecolor=cols[m] if self.marker["fill"] else "none",
-                    linewidths=self.lw,
-                    zorder=12,
-                )
+        return ax
 
     def _color_segments(self, ax):
         if not self.segments:
@@ -809,10 +869,6 @@ class ReconstructTracks:
         lc = LineCollection(self.segments, colors=self.segment_colors, linewidths=self.lw, zorder=10)
         ax.add_collection(lc)
 
-    def _resolve_cmap(self, cmap) -> mcolors.Colormap:
-        if isinstance(cmap, mcolors.Colormap):
-            return cmap
-        return retrieve_cmap(cmap)
         
     def _coerce_color(self, value, fallback: str = '#000000') -> str:
         try:

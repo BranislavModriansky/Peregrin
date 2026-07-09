@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+import re
+from typing import Any, Optional, Tuple
 
 import seaborn as sns
 import numpy as np
@@ -109,6 +110,14 @@ class Painter:
 
         quantitative_cmaps = []
 
+        for _cmap in _base_quantitative_cmaps:
+            quantitative_cmaps.append(_cmap)
+
+            if f"{_cmap}_r" in mpl.colormaps:
+                quantitative_cmaps.append(f"{_cmap}_r")
+
+        del _base_quantitative_cmaps
+
 
 
 
@@ -134,7 +143,7 @@ class Painter:
             "hsl"
         ]
 
-        Colors = {
+        colors = {
             "#000000": "black",
             "#0f0f0f": "onyx",
             "#070d0d": "deep ocean",
@@ -599,15 +608,15 @@ class Painter:
             "dashdot",
         ]
 
-        def __post_init__(self):
+        # def __post_init__(self):
 
-            for _cmap in _base_quantitative_cmaps:
-                self.quantitative_cmaps.append(_cmap)
+        #     for _cmap in self._base_quantitative_cmaps:
+        #         self.quantitative_cmaps.append(_cmap)
 
-                if f"{_cmap}_r" in mpl.colormaps:
-                    self.quantitative_cmaps.append(f"{_cmap}_r")
+        #         if f"{_cmap}_r" in mpl.colormaps:
+        #             self.quantitative_cmaps.append(f"{_cmap}_r")
 
-            del _cmap, _base_quantitative_cmaps
+        #     del _cmap, self._base_quantitative_cmaps
 
 
 
@@ -695,6 +704,80 @@ class Painter:
                     raise ValueError(
                         "Unsupported color code. Use one of: 'hex', 'rgb', 'rgba'."
                     )
+                
+        @staticmethod
+        def is_color_code(value, raise_on_out_of_range=True):
+            """
+            Return True if value is a valid color code.
+
+            Supports:
+            - Matplotlib color codes, including #RGB, #RGBA, #RRGGBB, #RRGGBBAA
+            - CSS-like rgb(...) and rgba(...)
+            """
+            if not isinstance(value, str):
+                return False
+
+            s = value.strip()
+
+            # Matplotlib already handles hex colors including #RRGGBBAA.
+            if mcolors.is_color_like(s):
+                return True
+
+            rgb_pattern = re.compile(
+                r"^rgb\(\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)%?)\s*,"
+                r"\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)%?)\s*,"
+                r"\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)%?)\s*\)$",
+                re.IGNORECASE,
+            )
+            rgba_pattern = re.compile(
+                r"^rgba\(\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)%?)\s*,"
+                r"\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)%?)\s*,"
+                r"\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)%?)\s*,"
+                r"\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)%?)\s*\)$",
+                re.IGNORECASE,
+            )
+
+            def _channel_in_range(channel: str) -> bool:
+                if channel.endswith("%"):
+                    n = float(channel[:-1])
+                    return 0.0 <= n <= 100.0
+                n = float(channel)
+                return 0.0 <= n <= 255.0
+
+            def _alpha_in_range(alpha: str) -> bool:
+                if alpha.endswith("%"):
+                    n = float(alpha[:-1])
+                    return 0.0 <= n <= 100.0
+                n = float(alpha)
+                return 0.0 <= n <= 1.0
+
+            match = rgb_pattern.match(s)
+            if match:
+                if all(_channel_in_range(channel) for channel in match.groups()):
+                    return True
+                if raise_on_out_of_range:
+                    raise InvalidColorRangeError(
+                        f"'{s}' has the shape of an rgb() color but values are out of range "
+                        f"(expected 0-255 or 0%-100% per channel)."
+                    )
+                return False
+
+            match = rgba_pattern.match(s)
+            if match:
+                *channels, alpha = match.groups()
+                if all(_channel_in_range(channel) for channel in channels) and _alpha_in_range(alpha):
+                    return True
+                if raise_on_out_of_range:
+                    raise InvalidColorRangeError(
+                        f"'{s}' has the shape of an rgba() color but values are out of range "
+                        f"(channels 0-255 or 0%-100%, alpha 0-1 or 0%-100%)."
+                    )
+                return False
+
+            return False
+
+
+
     class QualPaletteGenerator:
 
         def __init__(self): ...
@@ -702,133 +785,41 @@ class Painter:
         
         def retrieve_palette(
             self,
-            data: pd.DataFrame,
-            tag: str,
-            palette: str = None,
-            *,
-            which: list[str] = None,
+            categories: list,
+            palette: Optional[str | list] = "tab10",
         ) -> dict:
-            """
-            Retrieve a qualitative colormap for a given tag in the DataFrame, either using a specified palette or generating a custom palette based on assigned colors.
+            
+            if isinstance(palette, list):
+                if len(palette) < len(categories):
+                    raise PaletteBuilderError(f"More categories ({len(categories)}) than colors ({len(palette)}). Please provide a palette with at least as many colors as there are categories.")
+                return {cat: color for cat, color in zip(categories, palette)}
 
-            Parameters
-            ----------
-            data : pd.DataFrame
-                Input DataFrame containing the data.
-            tag : str
-                The column name in the DataFrame with values for which the colormap is generated.
-            palette : str, optional
-                The name of the native palette to be used (matplotlib or seaborn). 
-                If None, a custom palette based on assigned colors will be generated.
-            which : list[str], optional
-                A list of specific, unique values (elements) for which colors are going to be retrieved. 
-                The order of the list will determine the order of the colors in the returned dictionary.
-                If None, colors will be retrieved for all unique values in the column.
-            
-            Returns
-            -------
-            dict
-                A dictionary mapping each unique value in the specified tag to its corresponding color in the colormap.
-            """
-            
-            self.data = data
-            self.tag = tag
-            self.palette = palette
-            self.which = which
-
-            elements = self._get_elements()
-            
-            if palette is None:
-                return self._custom_palette(elements)
             else:
-                return self._native_palette(elements)
-        
-
-        def _native_palette(
-            self, 
-            elements: list
-        ) -> dict:
-            """ Generates a qualitative colormap for a given list of elements, using the specified native palette from matplotlib or seaborn. """
-
-            if f'{self.tag}_color' in self.data.columns:
-                warnings.warn(message=f"Found assigned colors to {self.tag} ('{self.tag}_color'). <- To use assigned colors, unselect the palette parameter.",
-                              category=PaletteBuilderWarning,
-                              stacklevel=2)
-                
-
-            try:
-                cmap = plt.get_cmap(self.palette)
-            except ValueError:
-                cmap = sns.color_palette(self.palette, n_colors=len(elements))
-            except Exception as e:
-                warnings.warn(message=f"An error occurred while retrieving the colormap '{self.palette}': {str(e)}. <- Defaulting to 'tab10' colormap. Supported palettes include: {', '.join(sorted(mpl.colormaps.keys()))} for matplotlib and {', '.join(sorted(sns.palettes.SEABORN_PALETTES.keys()))} for seaborn.",
+                try:
+                    palette = plt.get_cmap(palette)
+                except ValueError:
+                    palette = sns.color_palette(palette)
+                except Exception as e:
+                    warnings.warn(message=f"An error occurred while retrieving the palette '{palette}': {str(e)}. <- Defaulting to 'tab10' colormap. Supported palettes include: {', '.join(sorted(mpl.colormaps.keys()))} for matplotlib; {', '.join(sorted(sns.palettes.SEABORN_PALETTES.keys()))} for seaborn or a list of colors.",
                                 category=PaletteBuilderWarning,
                                 stacklevel=2)
-                
-                cmap = plt.get_cmap('tab10')
-                    
-                # colors = [mcolors.to_hex(cmap(i / n)) for i in range(n)]
-                colors = {elem: mcolors.to_hex(cmap(i / len(elements))) for i, elem in enumerate(elements)}
+                    cmap = plt.get_cmap('tab10')
+                        
+                cat_count = len(categories)
+                return {cat: mcolors.to_hex(cmap(i / cat_count)) for i, cat in enumerate(categories)}
 
-                return colors
-        
-            
-            
-        def _custom_palette(
-            self, 
-            elements: list
-        ) -> dict:
-            """ Generates a custom qualitative colormap based on assigned colors in the DataFrame. """
 
-            colors = {}
-            if f'{self.tag}_color' in self.data.columns:
-                colors = (self.data[[self.tag, f'{self.tag}_color']]
-                      .dropna()
-                      .drop_duplicates(self.tag))
-                
-                colors = colors.set_index(self.tag)[f'{self.tag}_color'].to_dict()
-            
-            missing = [e for e in elements if e not in colors]
-
-            if missing:
-                warnings.warn(message=f"The following {self.tag} values are missing color assignments: {', '.join(missing)}. <- Assigning random colors.",
-                              category=ColorGeneratorWarning,
-                              stacklevel=2)
-
-                for t in missing:
-                    colors[t] = Painter.ColorGenerator.random_color()
-
-            return colors
-        
-
-        def _get_elements(self) -> list:
-            """ Retrieve unique elements from the DataFrame based on the specified tag and optional filtering. """
-
-            if self.which is not None:
-                elements = []
-                for e in self.which:
-                    if e in self.data[self.tag].unique():
-                        elements.append(e)
-                    else:
-                        raise PaletteBuilderError(f"Value '{e}' not found in the '{self.tag}' column of the DataFrame. Cannot generate a palette. Available tag values are: {', '.join(self.data[self.tag].unique().tolist())}.")
-            else:
-                elements = self.data[self.tag].unique().tolist()
-
-            if len(elements) == 0:
-                raise PaletteBuilderError(f"No values found for tag '{self.tag}' in the provided DataFrame. Cannot generate a palette.")
-
-            return elements
-    
-
-    class Cmaps:
+    class Cmap:
 
         def __init__(self): ...
 
-
-        def retrieve_cmap(self, qnt_cmap: str) -> mcolors.Colormap:
+        @staticmethod
+        def retrieve_cmap(qnt_cmap: str | mcolors.Colormap) -> mcolors.Colormap:
             """
             Retrieve a quantitative colormap.
             """
+            if isinstance(qnt_cmap, mcolors.Colormap):
+                return qnt_cmap
 
             try:
                 return mpl.colormaps[qnt_cmap]
@@ -840,16 +831,43 @@ class Painter:
                 
                 return mpl.colormaps['jet']
             
+        @staticmethod
+        def cmap_lut(data: pd.Series, *, min: float = None, max: float = None) -> Tuple[Any, Any]:
+            try:
+                if not isinstance(min, (int, float)):
+                    min = float(data.min())
+                if not isinstance(max, (int, float)):
+                    max = float(data.max())
 
-        def scale_cmap(self, min_val: float, max_val: float, cmap: str, **kwargs):
-            """ Initialize the colormap scale with min and max values and a colormap. """
+                if not (np.isfinite(max) or np.isfinite(min)):
+                    warnings.warn(message=f"Invalid LUT range. Max and min values are not finite. Using default range (0.0, 100.0).", 
+                                category=LUTWarning, 
+                                stacklevel=2)
 
-            self.min_val = min_val
-            self.max_val = max_val
-            self.cmap = cmap
+                    if not np.isfinite(min):
+                        min = 0.0
+                    if not np.isfinite(max):
+                        max = 100.0
+                        
+                if max <= min:
+                    warnings.warn(message=f"Invalid LUT range. Max value must be greater than min value. Swapping values.", 
+                                category=LUTWarning, 
+                                stacklevel=2)
+                    
+                    min, max = max, min
+                
+                norm = plt.Normalize(min, max)
+                vals = data.to_numpy()
+
+                return norm, vals
+            
+            except Exception as e:
+                raise LUTError(f"Error while computing LUT for {data.name if hasattr(data, 'name') else 'unknown data'}: {str(e)}")
+            
 
 
-    def ShowcaseGradients(self, *, cmaps: list[str] = Dyes.QuantitativeCModes, **kwargs) -> plt.Figure:
+
+    def ShowcaseGradients(self, *, cmaps: list[str] = Dyes.quantitative_cmaps, **kwargs) -> plt.Figure:
         """
         ### *Showcase qualitative colormaps.*
         
@@ -907,7 +925,9 @@ class Painter:
 
 painter = Painter()
 retrieve_palette = painter.QualPaletteGenerator().retrieve_palette
-retrieve_cmap = painter.Cmaps().retrieve_cmap
+retrieve_cmap = painter.Cmap().retrieve_cmap
+cmap_lut = painter.Cmap().cmap_lut
 random_color = painter.ColorGenerator().random_color
 random_grey = painter.ColorGenerator().random_grey
+is_color_code = painter.ColorGenerator().is_color_code
 dyes = painter.Dyes()

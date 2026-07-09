@@ -68,7 +68,7 @@ class Categorizer:
         self.aggby = aggby if aggby is not None else []
         self.aggdict = aggdict if aggdict is not None else {}
 
-        if not params.ignore_categories:
+        if not params.ignore_categories or not kwargs.get('ignore_categories', False):
             self._checkcats()
             self._filter()
 

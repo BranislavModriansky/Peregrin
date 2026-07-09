@@ -6,6 +6,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from typing import *
 from itertools import zip_longest
+from functools import wraps
 
 from ._pckg_exceptions._pckg_warnings import *
 from ._pckg_exceptions._pckg_errors import *
@@ -130,6 +131,7 @@ is_empty = CheckData().is_empty
 
 
 def clock(f):
+    @wraps(f)
     def wrap(*args, **kwargs):
         start = time.time()
         result = f(*args, **kwargs)
@@ -211,7 +213,7 @@ class Values:
     
 
     @staticmethod
-    def lut_mapper(data: pd.Series, *args, min: float = None, max: float = None, **kwargs) -> Tuple[Any, Any]:
+    def cmap_lut(data: pd.Series, *args, min: float = None, max: float = None, **kwargs) -> Tuple[Any, Any]:
 
         try:
             if not isinstance(min, (int, float)):
@@ -272,23 +274,39 @@ class Kwargs:
         return key
 
     @staticmethod
-    def get_aliases(kwargs: list, aliases: dict) -> dict:
+    def get_aliases(kwargs, aliases):
         """
-        Get a dictionary of canonical keys for the provided keyword arguments.
+        Resolves aliased kwargs to their canonical parameter names.
 
         Parameters
         ----------
-        kwargs : list
-            List of keyword arguments to check for aliases.
+        kwargs : dict
+            The keyword arguments as passed by the user, e.g. {'colour': 'black', 'line_width': 1}
         aliases : dict
-            A dictionary where keys are canonical names and values are lists of aliases.
+            Maps canonical name -> list of accepted alias names (including the
+            canonical name itself), e.g. {'color': ['color', 'colour', 'c'], ...}
 
         Returns
         -------
         dict
-        A dictionary mapping each keyword argument to its canonical key.
+            kwargs with all recognized aliases rewritten to their canonical key.
+            Keys not found in `aliases` are passed through unchanged, with a warning.
         """
-        return {key: Kwargs.get_kwarg(key, aliases) for key in kwargs}
+        # Build a reverse lookup: alias -> canonical name
+        alias_to_canonical = {
+            alias: canonical
+            for canonical, alias_list in aliases.items()
+            for alias in alias_list
+        }
+
+        resolved = {}
+
+        for key, value in kwargs.items():
+            canonical = alias_to_canonical.get(key, key)
+            resolved[canonical] = value
+
+        return resolved
 
 
 get_aliases = Kwargs.get_aliases
+is_empty = CheckData().is_empty
