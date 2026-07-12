@@ -6,6 +6,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
 from matplotlib.ticker import MultipleLocator, FormatStrFormatter
+from matplotlib.animation import FuncAnimation
 from PIL import Image
 
 import warnings
@@ -22,6 +23,160 @@ from ..painter import (
 )
 from ...various import Values, get_aliases, is_empty, clock
 from ...compute.stats import Stats
+
+
+class TracksResult:
+    """
+    Container returned by :func:`reconstruct`.
+
+    Holds the static figure plus all the cached plotting arrays needed to
+    (re)build the tracks, so that :meth:`animate` can grow the trajectories
+    over time without recomputing anything.
+    """
+
+    def __init__(self, builder, figure):
+        # Keep a reference to the builder so we reuse its cached geometry/colors.
+        self._builder = builder
+        self.figure = figure
+        self.polar = builder.common_start
+
+    # Convenience passthroughs -------------------------------------------------
+    @property
+    def fig(self) -> plt.Figure:
+        return self.figure
+
+    @property
+    def segments(self) -> np.ndarray:
+        return self._builder.segments
+
+    def show(self):
+        plt.show()
+
+    def save(self, path, **kwargs):
+        self.figure.savefig(path, **kwargs)
+
+    # Animation ---------------------------------------------------------------
+    def animate(
+        self,
+        *,
+        loop: bool = True,
+        speed: float = 1.0,
+        interval: float = 40.0,
+        frames: int = None,
+        blit: bool = False,
+        show_heads: bool = True,
+        repeat_delay: float = 0.0,
+        on_new_figure: bool = True,
+    ) -> FuncAnimation:
+        """
+        Vectorized growing-trajectory animation.
+
+        Segments are precomputed once. Each frame only reveals more of the
+        already-computed segments by mutating a single LineCollection — no image
+        encoding, so it stays a live vector animation.
+
+        Parameters
+        ----------
+        on_new_figure : bool
+            Render onto a fresh figure so the static reconstruction figure is
+            left untouched (and re-running does not stack tracks).
+        """
+        b = self._builder
+
+        # --- fresh, cleansed axes so nothing stacks on re-run --------------
+        if on_new_figure:
+            fig, ax = b._new_axes(polar=self.polar)
+        else:
+            fig = self.figure
+            ax = fig.axes[0]
+            # Cleanse any previously drawn animation artists.
+            for coll in list(ax.collections):
+                coll.remove()
+
+        plot_x, plot_y = b._plot_coords(polar=self.polar)
+        starts = b._track_starts
+        run_lengths = b._run_lengths
+
+        if run_lengths.size == 0:
+            return FuncAnimation(fig, lambda _f: (), frames=1, blit=False)
+
+        max_len = int(run_lengths.max())
+        n_frames = frames if frames is not None else max(2, int(max_len / max(speed, 1e-6)))
+        reveal_grid = np.linspace(1, max_len, n_frames).astype(np.intp)
+
+        # --- fully vectorized reveal schedule ------------------------------
+        # For each within-track segment, the reveal index at which it appears
+        # = its within-track position + 1. Compare against the frame's reveal.
+        seg_lens = b._within_track_seg_lengths                 # (n_tracks,)
+        # local index (0..L-2) of every within-track segment, concatenated
+        seg_local_idx = np.concatenate(
+            [np.arange(c) for c in seg_lens]) if seg_lens.sum() else np.empty(0, np.intp)
+        seg_appear = seg_local_idx + 1                         # reveal needed
+
+        # Precompute colors ONCE for the full segment set (RGBA), so per-frame
+        # we only pass a boolean-cropped view — no recompute, no color glitches.
+        full_colors = b._segment_colors_for_mask(np.ones(seg_appear.size, dtype=bool))
+
+        base_lc = LineCollection(
+            np.empty((0, 2, 2)),
+            linewidths=b.kwargs.get('lw', 1),
+            zorder=11,
+        )
+        ax.add_collection(base_lc)
+
+        head_scatter = None
+        if show_heads:
+            head_scatter = ax.scatter(
+                [], [],
+                marker=b.kwargs.get('head_shape', 'o'),
+                s=b.kwargs.get('head_size', 10),
+                zorder=13,
+            )
+
+        segments_all = b.segments
+
+        def _frame(reveal):
+            mask = seg_appear <= reveal                        # vectorized crop
+            base_lc.set_segments(segments_all[mask])
+            if not isinstance(full_colors, str):
+                base_lc.set_color(np.asarray(full_colors)[mask])
+            else:
+                base_lc.set_color(full_colors)
+
+            artists = [base_lc]
+            if head_scatter is not None:
+                visible = np.minimum(reveal, run_lengths)
+                has_pt = visible > 0
+                head_idx = starts + np.maximum(visible - 1, 0)
+                if has_pt.any():
+                    head_scatter.set_offsets(
+                        np.column_stack((plot_x[head_idx][has_pt],
+                                         plot_y[head_idx][has_pt])))
+                else:
+                    head_scatter.set_offsets(np.empty((0, 2)))
+                artists.append(head_scatter)
+            return artists
+
+        def _init():
+            base_lc.set_segments(np.empty((0, 2, 2)))
+            arts = [base_lc]
+            if head_scatter is not None:
+                head_scatter.set_offsets(np.empty((0, 2)))
+                arts.append(head_scatter)
+            return arts
+
+        anim = FuncAnimation(
+            fig,
+            lambda i: _frame(int(reveal_grid[i])),
+            init_func=_init,
+            frames=n_frames,
+            interval=interval,
+            blit=blit,
+            repeat=loop,
+            repeat_delay=repeat_delay,
+        )
+        self._anim = anim
+        return anim
 
 
 class ReconstructTracks:
@@ -75,7 +230,7 @@ class ReconstructTracks:
         common_start: bool = False,
         ignore_categories: bool = False,
         **kwargs
-    ) -> plt.Figure:
+    ) -> TracksResult:
 
         self.spot_data = spot_data
         self.track_data = track_data
@@ -111,7 +266,8 @@ class ReconstructTracks:
         # Colors are cheap and often the only thing that changes; recompute every call.
         self._assign_color()
 
-        return self.polar() if common_start else self.cartesian()
+        figure = self.polar() if common_start else self.cartesian()
+        return TracksResult(self, figure)
 
     # ------------------------------------------------------------------ #
     # Figure builders
@@ -231,6 +387,7 @@ class ReconstructTracks:
             self._track_ends = np.empty(0, dtype=np.intp)
             self._run_lengths = np.empty(0, dtype=np.intp)
             self._track_uids = np.empty(0, dtype=object)
+            self._within_track_seg_lengths = np.empty(0, dtype=np.intp)
             return
 
         uids = self.spot_data['track_uid'].to_numpy()
@@ -247,6 +404,8 @@ class ReconstructTracks:
         self._run_lengths = np.diff(np.append(self._track_starts, n))
         # One uid per track (at each start) for fast color mapping.
         self._track_uids = uids[self._track_starts]
+        # Number of within-track segments per track (L - 1), for animation reveal.
+        self._within_track_seg_lengths = np.maximum(self._run_lengths - 1, 0)
 
     @clock
     def _get_radius(self):
@@ -389,6 +548,17 @@ class ReconstructTracks:
     # Segment / track drawing
     # ------------------------------------------------------------------ #
 
+    def _plot_coords(self, *, polar: bool = False):
+        """Return per-spot plotting coordinates (polar-transformed if requested)."""
+        x, y = self._x, self._y
+        if not polar:
+            return x, y
+        starts = self._track_starts
+        x0 = np.repeat(x[starts], self._run_lengths)
+        y0 = np.repeat(y[starts], self._run_lengths)
+        dx, dy = x - x0, y - y0
+        return np.arctan2(dy, dx), np.hypot(dx, dy)
+
     @clock
     def _build_tracks(self, ax: plt.Axes, *, polar: bool = False):
         """Build and plot track segments as one LineCollection from cached arrays."""
@@ -397,16 +567,10 @@ class ReconstructTracks:
 
         if x.size < 2:
             self.segments = np.empty((0, 2, 2), dtype=float)
+            self._seg_mask = np.empty(0, dtype=bool)
             return
 
-        if polar:
-            starts = self._track_starts
-            x0 = np.repeat(x[starts], self._run_lengths)
-            y0 = np.repeat(y[starts], self._run_lengths)
-            dx, dy = x - x0, y - y0
-            plot_x, plot_y = np.arctan2(dy, dx), np.hypot(dx, dy)
-        else:
-            plot_x, plot_y = x, y
+        plot_x, plot_y = self._plot_coords(polar=polar)
 
         # Stack consecutive points into segments in one shot, then drop the
         # cross-track segments via the boolean mask.
@@ -415,6 +579,9 @@ class ReconstructTracks:
              np.column_stack((plot_x[1:], plot_y[1:]))),
             axis=1,
         )
+        # Store both the masked (drawn) segments and the mask itself so the
+        # animator can index colors consistently.
+        self._seg_mask = same
         self.segments = segs[same]
 
         color_arg = self._segment_color_arg(same)
@@ -426,6 +593,28 @@ class ReconstructTracks:
                 linewidths=self.kwargs.get('lw', 1),
             )
         )
+
+    def _live_line_collection(self, ax: plt.Axes) -> LineCollection:
+        """Create an empty LineCollection used as the growing-track artist."""
+        lc = LineCollection(
+            np.empty((0, 2, 2)),
+            colors=self._segment_color_arg(self._seg_mask),
+            linewidths=self.kwargs.get('lw', 1),
+            zorder=11,
+        )
+        ax.add_collection(lc)
+        return lc
+
+    def _segment_colors_for_mask(self, mask: np.ndarray):
+        """Colors for the within-track segments selected by `mask` (animation)."""
+        if self._single_color is not None:
+            return self._single_color
+        if self._colors is None:
+            return 'black'
+        # self.segments already correspond to within-track segments; index the
+        # per-segment colors (color of the segment's starting spot) with `mask`.
+        seg_colors_all = self._colors[:-1][self._seg_mask]
+        return seg_colors_all[mask]
 
     def _segment_color_arg(self, same: np.ndarray):
         """Resolve the `colors=` argument for the LineCollection."""
@@ -564,6 +753,31 @@ class ReconstructTracks:
         if fps <= 0:
             raise ValueError("Frame rate must be positive.")
         return 1000.0 / fps
+
+    def _new_axes(self, *, polar: bool = False):
+        """Create a fresh figure/axes matching the static plot's framing."""
+        self._background_color()
+        if polar:
+            fig, ax = plt.subplots(figsize=(12.5, 9.5),
+                                   subplot_kw={'projection': 'polar'})
+            self._get_radius()
+            ax.set_ylim(0, self.y_max_global)
+            ax.spines['polar'].set_visible(False)
+            self._annotate_r_axis(ax)
+            self._annotate_theta_axis(ax)
+        else:
+            fig, ax = plt.subplots(figsize=(13, 10))
+            if self._x.size:
+                ax.set_xlim(self._x.min(), self._x.max())
+                ax.set_ylim(self._y.min(), self._y.max())
+            ax.set_aspect('equal', adjustable='box')
+            tc = self.kwargs.get('text_color', 'black')
+            ax.set_xlabel('x_coordinate [µm]', color=tc)
+            ax.set_ylabel('y_coordinate [µm]', color=tc)
+            self._apply_cartesian_ticks(ax, tc)
+        ax.set_facecolor(self.face_color)
+        ax.grid(False)
+        return fig, ax
 
 
 reconstruct = ReconstructTracks().reconstruct

@@ -41,6 +41,28 @@ _b_naive = load_data(
     rep_lbls=[['1', '2', '3'], ['1', '2', '3'], ['1', '2', '3']]
 )
 
+_b_memory = load_data(
+    files=[
+        [
+            str(DATA_DIR / "memory_ctr_BC39.csv"),
+            str(DATA_DIR / "memory_ctr_BC42.csv"),
+            str(DATA_DIR / "memory_ctr_BC43.csv")
+        ],
+        [
+            str(DATA_DIR / "memory_cxcl12_BC39.csv"),
+            str(DATA_DIR / "memory_cxcl12_BC42.csv"),
+            str(DATA_DIR / "memory_cxcl12_BC43.csv")
+        ],
+        [
+            str(DATA_DIR / "memory_mu_BC39.csv"),
+            str(DATA_DIR / "memory_mu_BC42.csv"),
+            str(DATA_DIR / "memory_mu_BC43.csv")
+        ],
+    ],
+    colnames=colnames,
+    cond_lbls=["ctr", "cxcl12", "mu"],
+    rep_lbls=[['1', '2', '3'], ['1', '2', '3'], ['1', '2', '3']]
+)
 
 class PeregrinDataFrame(pd.DataFrame):
     _metadata = ["ctr", "cxcl12", "mu"]
@@ -57,4 +79,7 @@ class PeregrinDataFrame(pd.DataFrame):
 
 
 b_naive = PeregrinDataFrame(_b_naive).build_subsets()
+b_memory = PeregrinDataFrame(_b_memory).build_subsets()
+
+
 
