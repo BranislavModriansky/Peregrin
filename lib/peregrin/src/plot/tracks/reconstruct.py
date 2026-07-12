@@ -7,10 +7,9 @@ import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
 from matplotlib.ticker import MultipleLocator, FormatStrFormatter
 from matplotlib.animation import FuncAnimation
-from PIL import Image
+from matplotlib.widgets import Button, Slider
 
 import warnings
-from io import BytesIO
 
 from ...settings import params
 from ..._pckg_exceptions._pckg_errors import *
@@ -35,7 +34,6 @@ class TracksResult:
     """
 
     def __init__(self, builder, figure):
-        # Keep a reference to the builder so we reuse its cached geometry/colors.
         self._builder = builder
         self.figure = figure
         self.polar = builder.common_start
@@ -50,12 +48,23 @@ class TracksResult:
         return self._builder.segments
 
     def show(self):
+        # In ipympl the figure that is the cell's display object is what renders;
+        # prefer the animation figure if one exists.
+        fig = getattr(self, '_anim_fig', None) or self.figure
+        try:
+            fig.canvas.draw_idle()
+        except Exception:
+            pass
         plt.show()
+        return fig
 
     def save(self, path, **kwargs):
         self.figure.savefig(path, **kwargs)
 
     # Animation ---------------------------------------------------------------
+    # ------------------------------------------------------------------ #
+    # Animation
+    # ------------------------------------------------------------------ #
     def animate(
         self,
         *,
@@ -63,211 +72,223 @@ class TracksResult:
         speed: float = 1.0,
         interval: float = 40.0,
         frames: int = None,
-        blit: bool = False,
         show_heads: bool = True,
         repeat_delay: float = 0.0,
-        on_new_figure: bool = True,
-    ) -> FuncAnimation:
+        controls: bool = True,
+        blit: bool = True,
+        mode: str = "auto",       # 'auto' | 'live' | 'jshtml' | 'video'
+        bake_every: int = None,   # frames between background re-bakes (live mode)
+    ):
         """
-        Vectorized growing-trajectory animation.
+        Growing-trajectory animation.
 
-        Segments are precomputed once. Each frame only reveals more of the
-        already-computed segments by mutating a single LineCollection — no image
-        encoding, so it stays a live vector animation.
+        Two rendering strategies, because they solve two different problems:
 
-        Parameters
-        ----------
-        on_new_figure : bool
-            Render onto a fresh figure so the static reconstruction figure is
-            left untouched (and re-running does not stack tracks).
+        * mode='live'   -> real matplotlib blitting with a cached background.
+                            Instead of re-rendering ALL revealed segments every
+                            frame (the classic slowdown once you have many
+                            tracks), previously revealed segments are baked
+                            into a snapshot bitmap every `bake_every` frames.
+                            Each frame then only draws the *new* segments +
+                            the head markers on top of that snapshot. Needs a
+                            persistent-canvas backend (%matplotlib widget,
+                            Qt, Tk) to actually pay off.
+
+        * mode='jshtml' -> frames are computed once, encoded, and handed to
+                            the browser as a JS player (or html5 video for
+                            mode='video'). This is the right choice for the
+                            default inline Jupyter backend, where live
+                            blitting can't help because there's no
+                            persistent canvas: rendering is decoupled from
+                            playback entirely, so it's smooth regardless of
+                            per-frame Python cost.
+
+        * mode='auto'   -> picks 'jshtml' unless an interactive backend is
+                            already active (detected via the canvas class).
         """
         b = self._builder
 
-        # --- fresh, cleansed axes so nothing stacks on re-run --------------
-        if on_new_figure:
-            fig, ax = b._new_axes(polar=self.polar)
-        else:
-            fig = self.figure
-            ax = fig.axes[0]
-            # Cleanse any previously drawn animation artists.
-            for coll in list(ax.collections):
-                coll.remove()
+        fig, ax = b._new_axes(polar=self.polar)
+        if controls:
+            fig.subplots_adjust(right=0.80)
 
         plot_x, plot_y = b._plot_coords(polar=self.polar)
         starts = b._track_starts
         run_lengths = b._run_lengths
 
         if run_lengths.size == 0:
+            self._anim_fig = fig
+            plt.close(fig)
             return FuncAnimation(fig, lambda _f: (), frames=1, blit=False)
 
+        # --- precompute reveal schedule -----------------------------------
         max_len = int(run_lengths.max())
         n_frames = frames if frames is not None else max(2, int(max_len / max(speed, 1e-6)))
         reveal_grid = np.linspace(1, max_len, n_frames).astype(np.intp)
 
-        # --- fully vectorized reveal schedule ------------------------------
-        # For each within-track segment, the reveal index at which it appears
-        # = its within-track position + 1. Compare against the frame's reveal.
-        seg_lens = b._within_track_seg_lengths                 # (n_tracks,)
-        # local index (0..L-2) of every within-track segment, concatenated
-        seg_local_idx = np.concatenate(
-            [np.arange(c) for c in seg_lens]) if seg_lens.sum() else np.empty(0, np.intp)
-        seg_appear = seg_local_idx + 1                         # reveal needed
-
-        # Precompute colors ONCE for the full segment set (RGBA), so per-frame
-        # we only pass a boolean-cropped view — no recompute, no color glitches.
-        full_colors = b._segment_colors_for_mask(np.ones(seg_appear.size, dtype=bool))
-
-        base_lc = LineCollection(
-            np.empty((0, 2, 2)),
-            linewidths=b.kwargs.get('lw', 1),
-            zorder=11,
-        )
-        ax.add_collection(base_lc)
-
-        head_scatter = None
-        if show_heads:
-            head_scatter = ax.scatter(
-                [], [],
-                marker=b.kwargs.get('head_shape', 'o'),
-                s=b.kwargs.get('head_size', 10),
-                zorder=13,
-            )
+        seg_lens = b._within_track_seg_lengths
+        if seg_lens.sum():
+            seg_local_idx = np.concatenate([np.arange(c) for c in seg_lens])
+        else:
+            seg_local_idx = np.empty(0, np.intp)
+        seg_appear = seg_local_idx + 1
 
         segments_all = b.segments
+        full_colors = b._segment_colors_for_mask(np.ones(seg_appear.size, dtype=bool))
+        uniform_color = isinstance(full_colors, str)
 
-        def _frame(reveal):
-            mask = seg_appear <= reveal                        # vectorized crop
-            base_lc.set_segments(segments_all[mask])
-            if not isinstance(full_colors, str):
-                base_lc.set_color(np.asarray(full_colors)[mask])
-            else:
+        order = np.argsort(seg_appear, kind='stable')
+        seg_sorted = segments_all[order]
+        seg_appear_sorted = seg_appear[order]
+        colors_sorted = None if uniform_color else np.asarray(full_colors)[order]
+        seg_count = np.searchsorted(seg_appear_sorted, reveal_grid, side='right')
+
+        head_xy = None
+        if show_heads:
+            has_pt = run_lengths > 0
+            last_idx = np.minimum(reveal_grid[:, None], (run_lengths - 1)[None, :])
+            head_idx = starts[None, :] + np.maximum(last_idx, 0)
+            hx = plot_x[head_idx][:, has_pt]
+            hy = plot_y[head_idx][:, has_pt]
+            head_xy = np.stack((hx, hy), axis=-1)
+
+        lw = b.kwargs.get('lw', 1)
+
+        # Decide rendering strategy -----------------------------------------
+        if mode == "auto":
+            backend_cls = type(fig.canvas).__name__
+            mode = "live" if backend_cls not in ("FigureCanvasAgg",) else "jshtml"
+
+        if mode == "live":
+            anim = self._animate_live(
+                fig, ax, seg_sorted, seg_count, colors_sorted, uniform_color,
+                full_colors, head_xy, head_scatter_kwargs=dict(
+                    marker=b.kwargs.get('head_shape', 'o'),
+                    s=b.kwargs.get('head_size', 10)) if show_heads else None,
+                lw=lw, n_frames=n_frames, interval=interval, blit=blit,
+                loop=loop, repeat_delay=repeat_delay, bake_every=bake_every,
+            )
+        else:
+            # Simple create-once/mutate-in-place loop; blit is irrelevant
+            # here since matplotlib's Agg canvas has no persistent state
+            # between frames anyway -- correctness matters, not blitting.
+            base_lc = LineCollection(np.empty((0, 2, 2)), linewidths=lw, zorder=11)
+            if uniform_color:
                 base_lc.set_color(full_colors)
+            ax.add_collection(base_lc)
 
-            artists = [base_lc]
-            if head_scatter is not None:
-                visible = np.minimum(reveal, run_lengths)
-                has_pt = visible > 0
-                head_idx = starts + np.maximum(visible - 1, 0)
-                if has_pt.any():
-                    head_scatter.set_offsets(
-                        np.column_stack((plot_x[head_idx][has_pt],
-                                         plot_y[head_idx][has_pt])))
-                else:
-                    head_scatter.set_offsets(np.empty((0, 2)))
-                artists.append(head_scatter)
-            return artists
+            head_scatter = None
+            if show_heads:
+                head_scatter = ax.scatter(
+                    [], [], marker=b.kwargs.get('head_shape', 'o'),
+                    s=b.kwargs.get('head_size', 10), zorder=13)
 
-        def _init():
-            base_lc.set_segments(np.empty((0, 2, 2)))
-            arts = [base_lc]
+            def _draw_frame(i):
+                k = int(seg_count[i])
+                base_lc.set_segments(seg_sorted[:k])
+                if not uniform_color:
+                    base_lc.set_color(colors_sorted[:k])
+                arts = [base_lc]
+                if head_scatter is not None:
+                    head_scatter.set_offsets(head_xy[i])
+                    arts.append(head_scatter)
+                return arts
+
+            anim = FuncAnimation(
+                fig, _draw_frame, frames=n_frames, interval=interval,
+                blit=False, repeat=loop, repeat_delay=repeat_delay,
+            )
+
+        self._anim = anim
+        self._anim_fig = fig
+
+        # Prevent matplotlib from also emitting a static duplicate of the
+        # figure as a separate cell output in Jupyter.
+        plt.close(fig)
+
+        if controls and mode == "live":
+            self._attach_controls(fig, anim, n_frames,
+                                   lambda idx: anim._draw_frame_public(int(idx)))
+
+        if mode in ("jshtml", "video"):
+            from matplotlib.animation import HTMLWriter  # noqa: F401
+            from IPython.display import HTML
+            html = anim.to_jshtml() if mode == "jshtml" else anim.to_html5_video()
+            self._html = HTML(html)
+            return self._html
+
+        return anim
+
+    def _animate_live(self, fig, ax, seg_sorted, seg_count, colors_sorted,
+                       uniform_color, full_colors, head_xy, head_scatter_kwargs,
+                       lw, n_frames, interval, blit, loop, repeat_delay, bake_every):
+        """
+        Manual background-caching blit: previously revealed segments are
+        baked into a snapshot bitmap periodically; each frame only draws the
+        delta segments + head markers, so per-frame cost stays proportional
+        to what's *new*, not to how much has accumulated so far.
+        """
+        frozen_lc = LineCollection(np.empty((0, 2, 2)), linewidths=lw, zorder=11)
+        if uniform_color:
+            frozen_lc.set_color(full_colors)
+        ax.add_collection(frozen_lc)
+
+        delta_lc = LineCollection(np.empty((0, 2, 2)), linewidths=lw, zorder=11)
+        if uniform_color:
+            delta_lc.set_color(full_colors)
+        ax.add_collection(delta_lc)
+
+        head_scatter = None
+        if head_scatter_kwargs is not None:
+            head_scatter = ax.scatter([], [], zorder=13, **head_scatter_kwargs)
+
+        bake_every = bake_every or max(1, n_frames // 20)
+        state = {"baked_k": 0, "background": None}
+
+        def _bake(k):
+            frozen_lc.set_segments(seg_sorted[:k])
+            if not uniform_color:
+                frozen_lc.set_color(colors_sorted[:k])
+            delta_lc.set_segments(np.empty((0, 2, 2)))
             if head_scatter is not None:
                 head_scatter.set_offsets(np.empty((0, 2)))
+            fig.canvas.draw()
+            state["background"] = fig.canvas.copy_from_bbox(ax.bbox)
+            state["baked_k"] = k
+
+        def _init():
+            _bake(0)
+            return [frozen_lc, delta_lc] + ([head_scatter] if head_scatter else [])
+
+        def _draw_frame(i):
+            k = int(seg_count[i])
+            if state["background"] is None:
+                _bake(0)
+            fig.canvas.restore_region(state["background"])
+
+            delta_lc.set_segments(seg_sorted[state["baked_k"]:k])
+            if not uniform_color:
+                delta_lc.set_color(colors_sorted[state["baked_k"]:k])
+            ax.draw_artist(delta_lc)
+
+            arts = [delta_lc]
+            if head_scatter is not None:
+                head_scatter.set_offsets(head_xy[i])
+                ax.draw_artist(head_scatter)
                 arts.append(head_scatter)
+
+            fig.canvas.blit(ax.bbox)
+
+            if (i + 1) % bake_every == 0 or i == n_frames - 1:
+                _bake(k)
             return arts
 
         anim = FuncAnimation(
-            fig,
-            lambda i: _frame(int(reveal_grid[i])),
-            init_func=_init,
-            frames=n_frames,
-            interval=interval,
-            blit=blit,
-            repeat=loop,
-            repeat_delay=repeat_delay,
+            fig, _draw_frame, init_func=_init, frames=n_frames,
+            interval=interval, blit=blit, repeat=loop, repeat_delay=repeat_delay,
         )
-        self._anim = anim
+        anim._draw_frame_public = _draw_frame  # expose for the manual slider/controls
         return anim
-
-
-class ReconstructTracks:
-
-    ALIASES = {
-        "smoothing_index": ["smoothing", "smoothing_index", "smooth_window_size"],
-        "seed": ["seed", "random_seed", "rng_seed"],
-        "c_mode": ["color_mode", "colour_mode", "c_mode"],
-        "cmap": ["cmap", "colormap", "colourmap"],
-        "palette": ["palette", "color_palette", "colour_palette"],
-        "color_by": ["color_by", "colour_by"],
-        "lw": ["lw", "linewidth", "line_width"],
-        "marker_fill": ["marker_fill", "head_fill", "fill"],
-        "color": ["color", "colour", "c"],
-    }
-
-    _C_MODES = ('None', 'random', 'random_greys', 'categorical', 'numeric')
-    _DYE_COLOR_SET = frozenset(dyes.colors.values())
-
-    KEY_COLS = ['condition', 'replicate', 'track_id']
-    REQUIRED_COLS = ['condition', 'replicate', 'track_id', 'track_uid',
-                     'time_point', 'x_coordinate', 'y_coordinate']
-
-    # Background -> face color, cartesian grid, polar grid lookups (built once).
-    _BG_FACE = {
-        'white': 'white', 'light': 'lightgrey', 'mid': 'darkgrey',
-        'dark': 'dimgrey', 'black': 'black',
-    }
-    _BG_GRID_CART = {
-        'white': ('gainsboro', 0.5), 'light': ('silver', 0.5),
-        'mid': ('silver', 0.5), 'dark': ('grey', 0.5), 'black': ('dimgrey', 0.5),
-    }
-    _BG_GRID_POLAR = {
-        'white': ('lightgrey', 0.7, 0.8), 'light': ('darkgrey', 0.7, 0.6),
-        'mid': ('dimgrey', 0.7, 0.5), 'dark': ('grey', 0.7, 0.6),
-        'black': ('dimgrey', 0.5, 0.4),
-    }
-
-    def __init__(self):
-        # Cache the last input so we can skip re-sorting / re-arranging identical data.
-        self._cache_key = None
-
-    @clock
-    def reconstruct(
-        self,
-        spot_data: pd.DataFrame,
-        track_data: pd.DataFrame = None,
-        *,
-        conditions: list = None,
-        replicates: list = None,
-        common_start: bool = False,
-        ignore_categories: bool = False,
-        **kwargs
-    ) -> TracksResult:
-
-        self.spot_data = spot_data
-        self.track_data = track_data
-        self.conditions = conditions or []
-        self.replicates = replicates or []
-        self.common_start = common_start
-        self.kwargs = get_aliases(kwargs, self.ALIASES)
-
-        ignore = params.ignore_categories or ignore_categories
-        if ignore:
-            self.REQUIRED_COLS = ['track_uid', 'time_point',
-                                  'x_coordinate', 'y_coordinate']
-        if ignore_categories and not params.ignore_categories:
-            warnings.warn(
-                "ignore_categories is set to True for this function call, but the global "
-                "setting is False. This function call will not ignore categories. To change "
-                "the global setting, use `peregrin.settings(ignore_categories=True)`.",
-                category=UserWarning, stacklevel=2)
-
-        # Skip the whole sort/index/cache pipeline if the identical DataFrame +
-        # relevant filters were already processed. id() + shape is a cheap,
-        # safe fingerprint for the reactive-app "same data, new color" case.
-        smoothing = self.kwargs.get('smoothing_index')
-        cache_key = (id(spot_data), spot_data.shape, tuple(self.conditions),
-                     tuple(self.replicates), ignore, smoothing)
-        if cache_key != self._cache_key:
-            self._arrange_data(ignore)
-            if smoothing is not None and smoothing > 0:
-                self._smooth(smoothing)
-                self._cache_arrays(ignore)  # smoothing mutated coords
-            self._cache_key = cache_key
-
-        # Colors are cheap and often the only thing that changes; recompute every call.
-        self._assign_color()
-
-        figure = self.polar() if common_start else self.cartesian()
-        return TracksResult(self, figure)
 
     # ------------------------------------------------------------------ #
     # Figure builders
@@ -345,8 +366,10 @@ class ReconstructTracks:
     def _arrange_data(self, ignore: bool = False):
         # When categories are ignored, categorize() is pure overhead: skip it.
         if not ignore:
-            self.spot_data = categorize(
-                self.spot_data, self.conditions, self.replicates, **self.kwargs)
+            self.spot_data = categorize(self.spot_data, 
+                                        {'condition': self.conditions, 
+                                         'replicate': self.replicates},
+                                        **self.kwargs)
 
         sort_cols = (['track_uid', 'time_point'] if ignore
                      else ['condition', 'replicate', 'track_id', 'time_point'])
@@ -359,8 +382,11 @@ class ReconstructTracks:
 
         if not is_empty(self.track_data):
             if not ignore:
-                self.track_data = categorize(
-                    self.track_data, self.conditions, self.replicates, **self.kwargs)
+                self.track_data = categorize(self.track_data, 
+                                             {'condition': self.conditions, 
+                                              'replicate': self.replicates},
+                                             **self.kwargs)
+                
             self.track_data = self.track_data.sort_values(sort_cols[:-1], kind='stable')
 
         # Only set the MultiIndex when we actually need category-based grouping
@@ -594,16 +620,8 @@ class ReconstructTracks:
             )
         )
 
-    def _live_line_collection(self, ax: plt.Axes) -> LineCollection:
-        """Create an empty LineCollection used as the growing-track artist."""
-        lc = LineCollection(
-            np.empty((0, 2, 2)),
-            colors=self._segment_color_arg(self._seg_mask),
-            linewidths=self.kwargs.get('lw', 1),
-            zorder=11,
-        )
-        ax.add_collection(lc)
-        return lc
+    # NOTE: _live_line_collection removed — the animator builds its own
+    # LineCollection directly (create-once, mutate-in-place recipe).
 
     def _segment_colors_for_mask(self, mask: np.ndarray):
         """Colors for the within-track segments selected by `mask` (animation)."""

@@ -26,8 +26,7 @@ class Categorizer:
     def categorize(
         self,
         data: pd.DataFrame,
-        conditions: list | None = None,
-        replicates: list | None = None,
+        sets: dict[str, Any] | None = None,
         *,
         aggby: list | None = None,
         aggdict: dict | None = None,
@@ -41,13 +40,8 @@ class Categorizer:
         data : pd.DataFrame
             The input DataFrame to be categorized and aggregated
 
-        conditions : list, optional
-            A list of conditions to be included in the categorized DataFrame.
-            If `ignore_categories` is set to True, this parameter will be ignored.
-
-        replicates : list, optional
-            A list of replicates to be included in the categorized DataFrame.
-            If `ignore_categories` is set to True, this parameter will be ignored.
+        sets : dict[str, Any], optional
+            A dictionary containing the sets (categories) `{'column name': list}` to be included in the categorized DataFrame.
 
         aggby : list, optional
             A list of columns to group by for aggregation. Default is an empty list.
@@ -63,8 +57,7 @@ class Categorizer:
         """
 
         self.data = data
-        self.conditions = conditions if conditions is not None else []
-        self.replicates = replicates if replicates is not None else []
+        self.sets = sets if sets is not None else {}
         self.aggby = aggby if aggby is not None else []
         self.aggdict = aggdict if aggdict is not None else {}
 
@@ -81,42 +74,20 @@ class Categorizer:
     def _checkcats(self) -> bool:
         """ Check for errors in the provided categories and replicates. """
 
-        if self.conditions == []:
-            warnings.warn(message="Conditions not specified. <- Returning all conditions.", 
-                          category=CategorizerWarning,
-                          stacklevel=2)
-            self.conditions = self.data['condition'].unique().tolist()
-
-        if self.replicates == []:
-            warnings.warn(message="Replicates not specified. <- Returning all replicates.", 
-                          category=CategorizerWarning,
-                          stacklevel=2)
-            self.replicates = self.data['replicate'].unique().tolist()
-        
-        conds_not_found = [cond for cond in self.conditions if cond not in self.data['condition'].values]
-        reps_not_found = [rep for rep in self.replicates if rep not in self.data['replicate'].values]
-        if conds_not_found:
-            warnings.warn(message=f"Couldn't find conditions: {', '.join(conds_not_found)}. <- Returning empty DataFrame.", 
-                          category=CategorizerWarning,
-                          stacklevel=2)
-            return pd.DataFrame()
-        if reps_not_found:
-            warnings.warn(message=f"Couldn't find replicates: {', '.join(reps_not_found)}. <- Returning empty DataFrame.", 
-                          category=CategorizerWarning,
-                          stacklevel=2)
-            return pd.DataFrame()
+        for cat in self.sets.keys():
+            if cat not in self.data.columns:
+                raise CategorizerError(f"Column '{cat}' not found in DataFrame.")
+            
+            for val in self.sets[cat]:
+                if val not in self.data[cat].unique():
+                    raise CategorizerError(f"Value '{val}' not found in column '{cat}'.")
         
 
     def _filter(self) -> pd.DataFrame:
         """ Filter DataFrame categories. """
 
-        if self.replicates:
-            self.data = self.data[
-                (self.data['condition'].isin(self.conditions)) &
-                (self.data['replicate'].isin(self.replicates))
-            ]
-        else:
-            self.data = self.data[self.data['condition'].isin(self.conditions)]
+        for cat in self.sets.keys():
+            self.data = self.data[self.data[cat].isin(self.sets[cat])]
 
     def _aggregate(self) -> pd.DataFrame:
         """ Aggregate the filtered DataFrame. """
