@@ -837,11 +837,4 @@ class ReconstructTracks:
         return fig, ax
 
 
-# reconstruct = ReconstructTracks().reconstruct
-
-def reconstruct(spot_data: pd.DataFrame, **kwargs) -> "ReconstructTracks":
-    """Reconstruct tracks and return a ReconstructTracks container.
-
-    The returned object exposes .figure, .show(), .save(...) and .animate(...).
-    """
-    return ReconstructTracks().reconstruct(spot_data, **kwargs)
+reconstruct = ReconstructTracks().reconstruct
