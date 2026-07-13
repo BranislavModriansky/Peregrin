@@ -164,6 +164,7 @@ class ReconstructTracks:
         seg_count = np.searchsorted(seg_appear_sorted, reveal_grid, side='right')
 
         head_xy = None
+        head_colors = None
         if show_heads:
             has_pt = run_lengths > 0
             last_idx = np.minimum(reveal_grid[:, None], (run_lengths - 1)[None, :])
@@ -171,6 +172,7 @@ class ReconstructTracks:
             hx = plot_x[head_idx][:, has_pt]
             hy = plot_y[head_idx][:, has_pt]
             head_xy = np.stack((hx, hy), axis=-1)
+            head_colors = b._head_colors(has_pt)
 
         lw = b.kwargs.get('lw', 1)
 
@@ -180,11 +182,16 @@ class ReconstructTracks:
             mode = "live" if backend_cls not in ("FigureCanvasAgg",) else "jshtml"
 
         if mode == "live":
+            outline = b.kwargs.get('outline_head', True)
+            fill = b.kwargs.get('fill_head', False)
             anim = self._animate_live(
                 fig, ax, seg_sorted, seg_count, colors_sorted, uniform_color,
                 full_colors, head_xy, head_scatter_kwargs=dict(
                     marker=b.kwargs.get('head_shape', 'o'),
-                    s=b.kwargs.get('head_size', 10)) if show_heads else None,
+                    s=b.kwargs.get('head_size', 10),
+                    linewidths=b.kwargs.get('head_outline_width', 1.0),
+                ) if show_heads else None,
+                head_colors=head_colors, head_outline=outline, head_fill=fill,
                 lw=lw, n_frames=n_frames, interval=interval, blit=blit,
                 loop=loop, repeat_delay=repeat_delay, bake_every=bake_every,
             )
@@ -199,9 +206,15 @@ class ReconstructTracks:
 
             head_scatter = None
             if show_heads:
+                outline = b.kwargs.get('outline_head', True)
+                fill = b.kwargs.get('fill_head', False)
                 head_scatter = ax.scatter(
                     [], [], marker=b.kwargs.get('head_shape', 'o'),
-                    s=b.kwargs.get('head_size', 10), zorder=13)
+                    s=b.kwargs.get('head_size', 10),
+                    linewidths=b.kwargs.get('head_outline_width', 1.0),
+                    zorder=13)
+                head_fc = head_colors if fill else 'none'
+                head_ec = head_colors if outline else 'none'
 
             def _draw_frame(i):
                 k = int(seg_count[i])
@@ -211,6 +224,9 @@ class ReconstructTracks:
                 arts = [base_lc]
                 if head_scatter is not None:
                     head_scatter.set_offsets(head_xy[i])
+                    if head_colors is not None:
+                        head_scatter.set_facecolor(head_fc)
+                        head_scatter.set_edgecolor(head_ec)
                     arts.append(head_scatter)
                 return arts
 
@@ -241,7 +257,8 @@ class ReconstructTracks:
 
     def _animate_live(self, fig, ax, seg_sorted, seg_count, colors_sorted,
                        uniform_color, full_colors, head_xy, head_scatter_kwargs,
-                       lw, n_frames, interval, blit, loop, repeat_delay, bake_every):
+                       lw, n_frames, interval, blit, loop, repeat_delay, bake_every,
+                       head_colors=None, head_outline=True, head_fill=False):
         """
         Manual background-caching blit: previously revealed segments are
         baked into a snapshot bitmap periodically; each frame only draws the
@@ -259,8 +276,12 @@ class ReconstructTracks:
         ax.add_collection(delta_lc)
 
         head_scatter = None
+        head_fc = head_ec = 'none'
         if head_scatter_kwargs is not None:
             head_scatter = ax.scatter([], [], zorder=13, **head_scatter_kwargs)
+            if head_colors is not None:
+                head_fc = head_colors if head_fill else 'none'
+                head_ec = head_colors if head_outline else 'none'
 
         bake_every = bake_every or max(1, n_frames // 20)
         state = {"baked_k": 0, "background": None}
@@ -294,9 +315,11 @@ class ReconstructTracks:
             arts = [delta_lc]
             if head_scatter is not None:
                 head_scatter.set_offsets(head_xy[i])
+                if head_colors is not None:
+                    head_scatter.set_facecolor(head_fc)
+                    head_scatter.set_edgecolor(head_ec)
                 ax.draw_artist(head_scatter)
                 arts.append(head_scatter)
-
             fig.canvas.blit(ax.bbox)
 
             if (i + 1) % bake_every == 0 or i == n_frames - 1:
@@ -572,14 +595,14 @@ class ReconstructTracks:
 
         # n_tracks = self._track_uids.size
         n_tracks = self.spot_data['track_uid'].nunique()
-        if c == 'random_greys':
+        if c == 'random greys':
             colors = random_grey(n=n_tracks, code='hex', a=1.0)
-        elif c in ('random', 'random_colors', 'random_colours'):
+        elif c in ('random', 'random colors', 'random colours'):
             colors = random_color(n=n_tracks, code='hex', a=1.0)
         else:
             raise InvalidParameterValueError(
                 f"Invalid color parameter: {c}. Must be a valid color name, hex "
-                "code, or one of ['random', 'random_greys'].")
+                "code, or one of ['random', 'random greys'].")
 
         # Map one color per track onto every spot via run-length repeat.
         self._colors = np.repeat(np.asarray(colors, dtype=object), self._run_lengths)
@@ -721,6 +744,21 @@ class ReconstructTracks:
             linewidths=self.kwargs.get('head_outline_width', 1.0),
             zorder=12,
         )
+
+
+    def _head_colors(self, has_pt: np.ndarray):
+        """Per-track head colors, aligned to the tracks kept by `has_pt`.
+
+        Returns either a scalar color (uniform) or an array in the same track
+        order used to build `head_xy`.
+        """
+        if self._single_color is not None:
+            return self._single_color
+        ends = getattr(self, '_track_ends', None)
+        if self._colors is None or ends is None or ends.size == 0:
+            return 'black'
+        colors = np.asarray(self._colors)[ends]
+        return colors[has_pt]
 
 
     def _background(self, ax: plt.Axes, fig: plt.Figure):
