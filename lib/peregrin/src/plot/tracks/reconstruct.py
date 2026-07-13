@@ -24,7 +24,7 @@ from ...various import Values, get_aliases, is_empty, clock
 from ...compute.stats import Stats
 
 
-class TracksResult:
+class ReconstructTracks:
     """
     Container returned by :func:`reconstruct`.
 
@@ -32,6 +32,10 @@ class TracksResult:
     (re)build the tracks, so that :meth:`animate` can grow the trajectories
     over time without recomputing anything.
     """
+
+    ALIASES = {
+        'grid_lw': ['grid_linewidth', 'grid_line_width', 'grid_lw'],
+    }
 
     def __init__(self, builder, figure):
         self._builder = builder
@@ -61,10 +65,7 @@ class TracksResult:
     def save(self, path, **kwargs):
         self.figure.savefig(path, **kwargs)
 
-    # Animation ---------------------------------------------------------------
-    # ------------------------------------------------------------------ #
-    # Animation
-    # ------------------------------------------------------------------ #
+
     def animate(
         self,
         *,
@@ -290,11 +291,10 @@ class TracksResult:
         anim._draw_frame_public = _draw_frame  # expose for the manual slider/controls
         return anim
 
-    # ------------------------------------------------------------------ #
-    # Figure builders
-    # ------------------------------------------------------------------ #
 
-    @clock
+
+
+
     def cartesian(self) -> plt.Figure:
         fig, ax = plt.subplots(figsize=(13, 10))
         self._build_tracks(ax)
@@ -358,11 +358,7 @@ class TracksResult:
         ax.yaxis.set_major_formatter(FormatStrFormatter('%.0f'))
         ax.tick_params(axis='both', which='major', labelsize=8, colors=text_color)
 
-    # ------------------------------------------------------------------ #
-    # Data arrangement / caching
-    # ------------------------------------------------------------------ #
 
-    @clock
     def _arrange_data(self, ignore: bool = False):
         # When categories are ignored, categorize() is pure overhead: skip it.
         if not ignore:
@@ -433,7 +429,6 @@ class TracksResult:
         # Number of within-track segments per track (L - 1), for animation reveal.
         self._within_track_seg_lengths = np.maximum(self._run_lengths - 1, 0)
 
-    @clock
     def _get_radius(self):
         """Global maximum radius, computed from cached numpy arrays (no groupby)."""
         if self._x.size == 0:
@@ -449,7 +444,6 @@ class TracksResult:
         self.y_max_global = r_max + 10.0
         self.y_max_label_global = f"{round(r_max) + 10} μm"
 
-    @clock
     def _smooth(self, window: int):
         if not (isinstance(window, int) and window >= 1):
             warnings.warn(
@@ -486,11 +480,7 @@ class TracksResult:
             out[s:e + 1] = smoothed + correction
         return out
 
-    # ------------------------------------------------------------------ #
-    # Color assignment
-    # ------------------------------------------------------------------ #
 
-    @clock
     def _assign_color(self):
         color_by = self.kwargs.get('color_by')
 
@@ -570,9 +560,6 @@ class TracksResult:
             raise PlottingError(
                 f"Error applying quantitative colormap: '{cmap}' to data: {e}")
 
-    # ------------------------------------------------------------------ #
-    # Segment / track drawing
-    # ------------------------------------------------------------------ #
 
     def _plot_coords(self, *, polar: bool = False):
         """Return per-spot plotting coordinates (polar-transformed if requested)."""
@@ -585,7 +572,6 @@ class TracksResult:
         dx, dy = x - x0, y - y0
         return np.arctan2(dy, dx), np.hypot(dx, dy)
 
-    @clock
     def _build_tracks(self, ax: plt.Axes, *, polar: bool = False):
         """Build and plot track segments as one LineCollection from cached arrays."""
         x, y = self._x, self._y
@@ -620,8 +606,6 @@ class TracksResult:
             )
         )
 
-    # NOTE: _live_line_collection removed — the animator builds its own
-    # LineCollection directly (create-once, mutate-in-place recipe).
 
     def _segment_colors_for_mask(self, mask: np.ndarray):
         """Colors for the within-track segments selected by `mask` (animation)."""
@@ -656,7 +640,6 @@ class TracksResult:
         # Object array (e.g. RGBA tuples/arrays): compare per element safely.
         return all(np.array_equal(c, first) for c in colors)
 
-    @clock
     def _head_markers(self, ax: plt.Axes, *, polar: bool = False):
         """Draw markers at the last spot of each track."""
         ends = getattr(self, '_track_ends', None)
@@ -690,58 +673,65 @@ class TracksResult:
             zorder=12,
         )
 
-    # ------------------------------------------------------------------ #
-    # Styling helpers (dict lookups, no per-call dict construction)
-    # ------------------------------------------------------------------ #
 
-    def _background_color(self):
-        self.face_color = self._BG_FACE.get(self.kwargs.get('background', 'white'), 'white')
+    def _background(self, ax: plt.Axes, fig: plt.Figure):
+        """Set the background color of the figure and axes."""
+        ax.set_facecolor(self.kwargs.get('face_color', 'white'))
+        fig.set_facecolor(self.kwargs.get('face_color', 'white'))
 
-    def _grid_color(self, coord_system: str = 'cartesian'):
-        bg = self.kwargs.get('background', 'white')
+
+    def _style_grid(self, ax: plt.Axes, coord_system: str = 'cartesian'):
+
+        grid_color = self.kwargs.get('grid_color', 'gainsboro')
+        grid_lw    = self.kwargs.get('grid_lw', 0.75)
+        grid_ls    = self.kwargs.get('grid_ls', '-')
+
+        # Cartesian grid
         if coord_system == 'cartesian':
-            self.grid_color, self.grid_alpha = \
-                self._BG_GRID_CART.get(bg, ('gainsboro', 0.5))
+            ax.grid(
+                True, 
+                which='both', 
+                axis='both', 
+                color=grid_color,
+                linestyle=grid_ls, 
+                linewidth=grid_lw,
+            )
+        
+        # Polar grid
         else:
-            self.grid_color, self.grid_a_alpha, self.grid_alpha = \
-                self._BG_GRID_POLAR.get(bg, ('lightgrey', 0.7, 0.8))
+            ax.grid(
+                True, 
+                lw=grid_lw,
+                color=grid_color
+            )
 
-    def _grid_style(self, ax: plt.Axes, coord_system: str = 'cartesian'):
-        if coord_system == 'cartesian':
-            ax.grid(True, which='both', axis='both', color=self.grid_color,
-                    linestyle='-.', linewidth=1, alpha=self.grid_alpha)
-            return
+            grid_attributes = {
+                'grid_ls_cardinal': grid_ls,
+                'grid_color_cardinal': grid_color,
+                'grid_ls_diagonal': grid_ls,
+                'grid_color_diagonal': grid_color,
+                'grid_ls_radial': grid_ls,
+                'grid_color_radial': grid_color,
+            }
 
-        style = self.gridstyle
-        gc, ga = self.grid_color, self.grid_a_alpha
-        match style:
-            case 'simple-1' | 'simple-2':
-                ax.xaxis.grid(True, color=gc, linestyle='-', linewidth=1, alpha=ga)
-                ax.yaxis.grid(False)
-                parity = 1 if style == 'simple-1' else 0
-                for i, line in enumerate(ax.get_xgridlines()):
-                    if i % 2 == parity:
-                        line.set_color('none')
-            case 'dartboard-1' | 'dartboard-2':
-                ax.grid(True, lw=0.75, color=gc, alpha=ga)
-                parity = 0 if style == 'dartboard-1' else 1
-                for i, line in enumerate(ax.get_xgridlines()):
-                    if i % 2 == parity:
-                        line.set_linestyle('-.')
-                        line.set_color(gc)
-                        line.set_linewidth(0.75)
-                        line.set_alpha(ga)
-                for line in ax.get_ygridlines():
-                    line.set_linestyle('--')
-                    line.set_color(gc)
-                    line.set_linewidth(0.75)
-                    line.set_alpha(ga)
-            case 'spindle':
-                ax.xaxis.grid(True, color=gc, linestyle='-', linewidth=1, alpha=ga)
-                ax.yaxis.grid(False)
-            case 'radial':
-                ax.xaxis.grid(False)
-                ax.yaxis.grid(True, color=gc, linestyle='-', linewidth=1, alpha=ga)
+            for attr in list(grid_attributes.keys()):
+                if self.kwargs.get(attr) is not None:
+                    grid_attributes[attr] = self.kwargs.get(attr)
+                else: 
+                    grid_attributes[attr] = self.kwargs.get(attr, grid_attributes[attr])
+
+            for i, line in enumerate(ax.get_xgridlines()):
+                if i % 2 == 0:
+                    line.set_linestyle(grid_attributes['grid_ls_cardinal'])
+                    line.set_color(grid_attributes['grid_color_cardinal'])
+                else:
+                    line.set_linestyle(grid_attributes['grid_ls_diagonal'])
+                    line.set_color(grid_attributes['grid_color_diagonal'])
+
+            for line in ax.get_ygridlines():
+                line.set_linestyle(grid_attributes['grid_ls_radial'])
+                line.set_color(grid_attributes['grid_color_radial'])
+
 
     def _annotate_r_axis(self, ax: plt.Axes):
         match self.kwargs.get('r_axis', 'none'):
