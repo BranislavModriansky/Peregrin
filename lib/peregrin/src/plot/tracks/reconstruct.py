@@ -1,4 +1,5 @@
 from inspect import Arguments
+from typing import Any, Optional
 
 import pandas as pd
 from pandas.api.types import is_numeric_dtype, is_categorical_dtype
@@ -37,19 +38,37 @@ class ReconstructTracks:
         'grid_lw': ['grid_linewidth', 'grid_line_width', 'grid_lw'],
     }
 
-    def __init__(self, builder, figure):
+    def __init__(self, builder=None, figure=None):
         self._builder = builder
         self.figure = figure
-        self.polar = builder.common_start
+        self._use_polar = False
+        self._segments = None
 
     # Convenience passthroughs -------------------------------------------------
     @property
     def fig(self) -> plt.Figure:
         return self.figure
 
+    def _repr_html_(self):
+        # Let Jupyter render the static figure when the container is displayed.
+        try:
+            from io import BytesIO
+            import base64
+            buf = BytesIO()
+            self.figure.savefig(buf, format='png', bbox_inches='tight')
+            data = base64.b64encode(buf.getvalue()).decode('ascii')
+            return f'<img src="data:image/png;base64,{data}"/>'
+        except Exception:
+            return None
+
     @property
     def segments(self) -> np.ndarray:
-        return self._builder.segments
+        # Prefer segments built on this instance; fall back to a wrapped builder.
+        if getattr(self, '_segments', None) is not None:
+            return self._segments
+        if getattr(self, '_builder', None) is not None:
+            return self._builder.segments
+        return np.empty((0, 2, 2), dtype=float)
 
     def show(self):
         # In ipympl the figure that is the cell's display object is what renders;
@@ -107,13 +126,13 @@ class ReconstructTracks:
         * mode='auto'   -> picks 'jshtml' unless an interactive backend is
                             already active (detected via the canvas class).
         """
-        b = self._builder
+        b = self._builder if self._builder is not None else self
 
-        fig, ax = b._new_axes(polar=self.polar)
+        fig, ax = b._new_axes(polar=self._use_polar)
         if controls:
             fig.subplots_adjust(right=0.80)
 
-        plot_x, plot_y = b._plot_coords(polar=self.polar)
+        plot_x, plot_y = b._plot_coords(polar=self._use_polar)
         starts = b._track_starts
         run_lengths = b._run_lengths
 
@@ -292,6 +311,35 @@ class ReconstructTracks:
         return anim
 
 
+    def reconstruct(
+        self,
+        spot_data: pd.DataFrame,
+        *,
+        align_at_start: bool = False,
+        categories: Optional[dict[str, list[Any]]] = None,
+        **kwargs
+    ) -> "ReconstructTracks":
+
+        self.spot_data = spot_data
+        self.align_at_start = align_at_start
+        self._use_polar = align_at_start
+        self.kwargs = get_aliases(kwargs, self.ALIASES)
+
+        self.track_data = pd.DataFrame()
+        self.categories = categories or {}
+
+        smoothing = self.kwargs.get('smoothing_index')
+
+        self._arrange_data()
+
+        # Colors are cheap and often the only thing that changes; recompute every call.
+        self._assign_color()
+
+        # Build the static figure and keep it, but return the container so
+        # callers can chain .animate() / .show() / .save().
+        self.figure = self.polar() if self.align_at_start else self.cartesian()
+        return self
+
 
 
 
@@ -310,8 +358,8 @@ class ReconstructTracks:
         ax.set_ylabel('y_coordinate [µm]', color=text_color)
         ax.set_title(self.kwargs.get('title', ''), fontsize=12, color=text_color)
 
-        self._background_color()
-        ax.set_facecolor(self.face_color)
+        # self._background_color()
+        # ax.set_facecolor(self.face_color)
         self._apply_cartesian_ticks(ax, text_color)
         ax.grid(False)
 
@@ -334,8 +382,8 @@ class ReconstructTracks:
 
         self._build_tracks(ax, polar=True)
 
-        self._background_color()
-        ax.set_facecolor(self.face_color)
+        # self._background_color()
+        # ax.set_facecolor(self.face_color)
         ax.grid(False)
 
         self._annotate_r_axis(ax)
@@ -359,7 +407,7 @@ class ReconstructTracks:
         ax.tick_params(axis='both', which='major', labelsize=8, colors=text_color)
 
 
-    def _arrange_data(self, ignore: bool = False):
+    def _arrange_data(self, ignore: bool = True):
         # When categories are ignored, categorize() is pure overhead: skip it.
         if not ignore:
             self.spot_data = categorize(self.spot_data, 
@@ -515,14 +563,15 @@ class ReconstructTracks:
 
         c = self.kwargs.get('color', 'black')
 
-        if c in self._DYE_COLOR_SET or is_color_code(c):
+        if c in dyes.colors or is_color_code(c):
             # Single color: store the scalar; _build_tracks handles broadcast
             # without allocating an N-length array.
             self._single_color = c
             self._colors = None
             return
 
-        n_tracks = self._track_uids.size
+        # n_tracks = self._track_uids.size
+        n_tracks = self.spot_data['track_uid'].nunique()
         if c == 'random_greys':
             colors = random_grey(n=n_tracks, code='hex', a=1.0)
         elif c in ('random', 'random_colors', 'random_colours'):
@@ -578,7 +627,7 @@ class ReconstructTracks:
         same = self._same_track
 
         if x.size < 2:
-            self.segments = np.empty((0, 2, 2), dtype=float)
+            self._segments = np.empty((0, 2, 2), dtype=float)
             self._seg_mask = np.empty(0, dtype=bool)
             return
 
@@ -594,13 +643,13 @@ class ReconstructTracks:
         # Store both the masked (drawn) segments and the mask itself so the
         # animator can index colors consistently.
         self._seg_mask = same
-        self.segments = segs[same]
+        self._segments = segs[same]
 
         color_arg = self._segment_color_arg(same)
 
         ax.add_collection(
             LineCollection(
-                self.segments,
+                self._segments,
                 colors=color_arg,
                 linewidths=self.kwargs.get('lw', 1),
             )
@@ -764,7 +813,7 @@ class ReconstructTracks:
 
     def _new_axes(self, *, polar: bool = False):
         """Create a fresh figure/axes matching the static plot's framing."""
-        self._background_color()
+        # self._background_color()
         if polar:
             fig, ax = plt.subplots(figsize=(12.5, 9.5),
                                    subplot_kw={'projection': 'polar'})
@@ -783,9 +832,16 @@ class ReconstructTracks:
             ax.set_xlabel('x_coordinate [µm]', color=tc)
             ax.set_ylabel('y_coordinate [µm]', color=tc)
             self._apply_cartesian_ticks(ax, tc)
-        ax.set_facecolor(self.face_color)
+        # ax.set_facecolor(self.face_color)
         ax.grid(False)
         return fig, ax
 
 
-reconstruct = ReconstructTracks().reconstruct
+# reconstruct = ReconstructTracks().reconstruct
+
+def reconstruct(spot_data: pd.DataFrame, **kwargs) -> "ReconstructTracks":
+    """Reconstruct tracks and return a ReconstructTracks container.
+
+    The returned object exposes .figure, .show(), .save(...) and .animate(...).
+    """
+    return ReconstructTracks().reconstruct(spot_data, **kwargs)
