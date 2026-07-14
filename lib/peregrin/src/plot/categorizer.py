@@ -61,9 +61,8 @@ class Categorizer:
         self.aggby = aggby if aggby is not None else []
         self.aggdict = aggdict if aggdict is not None else {}
 
-        if not params.ignore_categories or not kwargs.get('ignore_categories', False):
-            self._checkcats()
-            self._filter()
+        self._checkcats()
+        self._filter()
 
         if self.aggdict and self.aggby:
             self._aggregate()
@@ -87,7 +86,10 @@ class Categorizer:
         """ Filter DataFrame categories. """
 
         for cat in self.sets.keys():
-            self.data = self.data[self.data[cat].isin(self.sets[cat])]
+            try:
+                self.data = self.data[self.data[cat].isin(self.sets[cat])]
+            except Exception as e:
+                raise CategorizerError(f"Error filtering data category: '{cat}': {e}")
 
     def _aggregate(self) -> pd.DataFrame:
         """ Aggregate the filtered DataFrame. """

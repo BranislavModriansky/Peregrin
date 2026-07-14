@@ -1,4 +1,5 @@
 from inspect import Arguments
+from re import match
 from typing import Any, Optional
 
 import pandas as pd
@@ -25,65 +26,21 @@ from ...various import Values, get_aliases, is_empty, clock
 from ...compute.stats import Stats
 
 
-class ReconstructTracks:
+class AnimateTracks:
     """
-    Container returned by :func:`reconstruct`.
+    Handles growing-trajectory animation for a reconstructed set of tracks.
 
-    Holds the static figure plus all the cached plotting arrays needed to
-    (re)build the tracks, so that :meth:`animate` can grow the trajectories
-    over time without recomputing anything.
+    Kept separate from :class:`ReconstructTracks` so that the (heavy) animation
+    machinery is decoupled from the static plotting/data pipeline. Instances
+    are bound to a *builder* (a :class:`ReconstructTracks`) whose cached arrays
+    and styling kwargs drive every frame.
     """
 
-    ALIASES = {
-        'grid_lw': ['grid_linewidth', 'grid_line_width', 'grid_lw'],
-    }
-
-    def __init__(self, builder=None, figure=None):
+    def __init__(self, builder):
         self._builder = builder
-        self.figure = figure
-        self._use_polar = False
-        self._segments = None
-
-    # Convenience passthroughs -------------------------------------------------
-    @property
-    def fig(self) -> plt.Figure:
-        return self.figure
-
-    def _repr_html_(self):
-        # Let Jupyter render the static figure when the container is displayed.
-        try:
-            from io import BytesIO
-            import base64
-            buf = BytesIO()
-            self.figure.savefig(buf, format='png', bbox_inches='tight')
-            data = base64.b64encode(buf.getvalue()).decode('ascii')
-            return f'<img src="data:image/png;base64,{data}"/>'
-        except Exception:
-            return None
-
-    @property
-    def segments(self) -> np.ndarray:
-        # Prefer segments built on this instance; fall back to a wrapped builder.
-        if getattr(self, '_segments', None) is not None:
-            return self._segments
-        if getattr(self, '_builder', None) is not None:
-            return self._builder.segments
-        return np.empty((0, 2, 2), dtype=float)
-
-    def show(self):
-        # In ipympl the figure that is the cell's display object is what renders;
-        # prefer the animation figure if one exists.
-        fig = getattr(self, '_anim_fig', None) or self.figure
-        try:
-            fig.canvas.draw_idle()
-        except Exception:
-            pass
-        plt.show()
-        return fig
-
-    def save(self, path, **kwargs):
-        self.figure.savefig(path, **kwargs)
-
+        self._anim = None
+        self._anim_fig = None
+        self._html = None
 
     def animate(
         self,
@@ -126,13 +83,13 @@ class ReconstructTracks:
         * mode='auto'   -> picks 'jshtml' unless an interactive backend is
                             already active (detected via the canvas class).
         """
-        b = self._builder if self._builder is not None else self
+        b = self._builder
 
-        fig, ax = b._new_axes(polar=self._use_polar)
+        fig, ax = b._new_axes(polar=b.align_at_start)
         if controls:
             fig.subplots_adjust(right=0.80)
 
-        plot_x, plot_y = b._plot_coords(polar=self._use_polar)
+        plot_x, plot_y = b._plot_coords(polar=b.align_at_start)
         starts = b._track_starts
         run_lengths = b._run_lengths
 
@@ -243,8 +200,8 @@ class ReconstructTracks:
         plt.close(fig)
 
         if controls and mode == "live":
-            self._attach_controls(fig, anim, n_frames,
-                                   lambda idx: anim._draw_frame_public(int(idx)))
+            b._attach_controls(fig, anim, n_frames,
+                               lambda idx: anim._draw_frame_public(int(idx)))
 
         if mode in ("jshtml", "video"):
             from matplotlib.animation import HTMLWriter  # noqa: F401
@@ -256,9 +213,9 @@ class ReconstructTracks:
         return anim
 
     def _animate_live(self, fig, ax, seg_sorted, seg_count, colors_sorted,
-                       uniform_color, full_colors, head_xy, head_scatter_kwargs,
-                       lw, n_frames, interval, blit, loop, repeat_delay, bake_every,
-                       head_colors=None, head_outline=True, head_fill=False):
+                      uniform_color, full_colors, head_xy, head_scatter_kwargs,
+                      lw, n_frames, interval, blit, loop, repeat_delay, bake_every,
+                      head_colors=None, head_outline=True, head_fill=False):
         """
         Manual background-caching blit: previously revealed segments are
         baked into a snapshot bitmap periodically; each frame only draws the
@@ -334,9 +291,84 @@ class ReconstructTracks:
         return anim
 
 
+class ReconstructTracks:
+    """
+    Container returned by :func:`reconstruct`.
+
+    Holds the static figure plus all the cached plotting arrays needed to
+    (re)build the tracks. Animation is delegated to :class:`AnimateTracks`
+    via :meth:`animate`.
+    """
+
+    ALIASES = {
+        'color':   ['color', 'colour'],
+        'color_by': ['color_by', 'colour_by', 'colorby', 'colourby'],
+        'grid_lw': ['grid_linewidth', 'grid_line_width', 'grid_lw'],
+    }
+
+    def __init__(self, builder=None, figure=None):
+        self._builder = builder
+        self.figure = figure
+        self._use_polar = False
+        self._segments = None
+        self._animator = None
+
+    # Convenience passthroughs -------------------------------------------------
+    @property
+    def fig(self) -> plt.Figure:
+        return self.figure
+
+    def _repr_html_(self):
+        # Let Jupyter render the static figure when the container is displayed.
+        try:
+            from io import BytesIO
+            import base64
+            buf = BytesIO()
+            self.figure.savefig(buf, format='png', bbox_inches='tight')
+            data = base64.b64encode(buf.getvalue()).decode('ascii')
+            return f'<img src="data:image/png;base64,{data}"/>'
+        except Exception:
+            return None
+
+    @property
+    def segments(self) -> np.ndarray:
+        # Prefer segments built on this instance; fall back to a wrapped builder.
+        if getattr(self, '_segments', None) is not None:
+            return self._segments
+        if getattr(self, '_builder', None) is not None:
+            return self._builder.segments
+        return np.empty((0, 2, 2), dtype=float)
+
+    def show(self):
+        # In ipympl the figure that is the cell's display object is what renders;
+        # prefer the animation figure if one exists.
+        anim_fig = getattr(self._animator, '_anim_fig', None) if self._animator else None
+        fig = anim_fig or self.figure
+        try:
+            fig.canvas.draw_idle()
+        except Exception:
+            pass
+        plt.show()
+        return fig
+
+    def save(self, path, **kwargs):
+        self.figure.savefig(path, **kwargs)
+
+    def animate(self, **kwargs):
+        """
+        Create and return a growing-trajectory animation.
+
+        Delegates to :class:`AnimateTracks`, which is bound to the builder
+        holding this reconstruction's cached arrays and styling kwargs.
+        """
+        builder = self._builder if self._builder is not None else self
+        self._animator = AnimateTracks(builder)
+        return self._animator.animate(**kwargs)
+
     def reconstruct(
         self,
         spot_data: pd.DataFrame,
+        track_data: pd.DataFrame = None,
         *,
         align_at_start: bool = False,
         categories: Optional[dict[str, list[Any]]] = None,
@@ -345,11 +377,9 @@ class ReconstructTracks:
 
         self.spot_data = spot_data
         self.align_at_start = align_at_start
-        self._use_polar = align_at_start
         self.kwargs = get_aliases(kwargs, self.ALIASES)
-
-        self.track_data = pd.DataFrame()
-        self.categories = categories or {}
+        self.track_data = track_data
+        self.categories = categories
 
         smoothing = self.kwargs.get('smoothing_index')
 
@@ -383,15 +413,21 @@ class ReconstructTracks:
 
         # self._background_color()
         # ax.set_facecolor(self.face_color)
-        self._apply_cartesian_ticks(ax, text_color)
-        ax.grid(False)
+        self._cartesian_ticks(ax)
+        self._cartesian_spines(ax)
+
+        if self.kwargs.get('grid', True):
+            self._style_grid(ax, **self.kwargs)
+        else:
+            ax.grid(False)
 
         if self.kwargs.get('show_heads', True):
             self._head_markers(ax, polar=False)
         if self.kwargs.get('hide_backdrop', False):
             fig.set_facecolor('none')
 
-        return fig
+        return plt.gcf()
+
 
     def polar(self) -> plt.Figure:
         fig, ax = plt.subplots(figsize=(12.5, 9.5),
@@ -400,46 +436,51 @@ class ReconstructTracks:
 
         text_color = self.kwargs.get('text_color', 'black')
         ax.set_title(self.kwargs.get('title', ''), fontsize=12, color=text_color)
-        ax.set_ylim(0, self.y_max_global)
+        ax.set_ylim(0, self.y_max)
         ax.spines['polar'].set_visible(False)
 
         self._build_tracks(ax, polar=True)
 
         # self._background_color()
         # ax.set_facecolor(self.face_color)
-        ax.grid(False)
+        if self.kwargs.get('grid', True):
+            self._style_grid(ax, **self.kwargs)
+        else:
+            ax.grid(False)
 
-        self._annotate_r_axis(ax)
-        self._annotate_theta_axis(ax)
+        if isinstance(self.kwargs.get('annotate_r_axis', 'detailed'), str):
+            self._annotate_r_axis(ax)
+        else:
+            ax.set_yticklabels([])
+        if isinstance(self.kwargs.get('annotate_theta_axis', 'angular'), str):
+            self._annotate_theta_axis(ax)
+        else:
+            ax.set_xticklabels([])
 
         if self.kwargs.get('show_heads', True):
             self._head_markers(ax, polar=True)
         if self.kwargs.get('hide_backdrop', False):
             fig.set_facecolor('none')
 
-        return fig
+        return plt.gcf()
+    
+    def _cartesian_spines(self, ax):
+        for spine in ax.spines.values():
+            spine.set_color(self.kwargs.get('frame_color', 'black'))
 
-    @staticmethod
-    def _apply_cartesian_ticks(ax, text_color):
+    def _cartesian_ticks(self, ax):
         ax.xaxis.set_major_locator(MultipleLocator(200))
         ax.yaxis.set_major_locator(MultipleLocator(200))
         ax.xaxis.set_minor_locator(MultipleLocator(50))
         ax.yaxis.set_minor_locator(MultipleLocator(50))
         ax.xaxis.set_major_formatter(FormatStrFormatter('%.0f'))
         ax.yaxis.set_major_formatter(FormatStrFormatter('%.0f'))
-        ax.tick_params(axis='both', which='major', labelsize=8, colors=text_color)
+        ax.tick_params(axis='both', which='major', labelsize=8, colors=self.kwargs.get('annotation_color', 'black'))
 
 
-    def _arrange_data(self, ignore: bool = True):
-        # When categories are ignored, categorize() is pure overhead: skip it.
-        if not ignore:
-            self.spot_data = categorize(self.spot_data, 
-                                        {'condition': self.conditions, 
-                                         'replicate': self.replicates},
-                                        **self.kwargs)
-
-        sort_cols = (['track_uid', 'time_point'] if ignore
-                     else ['condition', 'replicate', 'track_id', 'time_point'])
+    def _arrange_data(self):
+        if self.categories is not None:
+            self.spot_data = categorize(self.spot_data, self.categories, **self.kwargs)
 
         self.spot_data = (
             self.spot_data
@@ -448,25 +489,25 @@ class ReconstructTracks:
         )
 
         if not is_empty(self.track_data):
-            if not ignore:
-                self.track_data = categorize(self.track_data, 
-                                             {'condition': self.conditions, 
-                                              'replicate': self.replicates},
-                                             **self.kwargs)
-                
-            self.track_data = self.track_data.sort_values(sort_cols[:-1], kind='stable')
+            if self.categories is not None:
+                try:
+                    self.track_data = categorize(self.track_data, self.categories, **self.kwargs)
+                except Exception as e:
+                    print(f"Error categorizing track_data: {e}")
+            self.track_data = self.track_data.sort_values(['track_uid'], kind='stable')
 
         # Only set the MultiIndex when we actually need category-based grouping
         # (smoothing path). For ignore mode we work purely on track_uid via
         # cached numpy arrays, so skip the expensive set_index.
-        if not ignore:
+        if self.categories is not None:
             if list(self.spot_data.index.names) != self.KEY_COLS:
                 self.spot_data = self.spot_data.set_index(self.KEY_COLS)
             if (not is_empty(self.track_data)
                     and list(self.track_data.index.names) != self.KEY_COLS):
                 self.track_data = self.track_data.set_index(self.KEY_COLS)
 
-        self._cache_arrays(ignore)
+        self._cache_arrays(self.categories is None)
+
 
     def _cache_arrays(self, ignore: bool = False):
         """Materialize plotting arrays and track run-boundaries once, after sorting."""
@@ -500,11 +541,11 @@ class ReconstructTracks:
         # Number of within-track segments per track (L - 1), for animation reveal.
         self._within_track_seg_lengths = np.maximum(self._run_lengths - 1, 0)
 
+
     def _get_radius(self):
         """Global maximum radius, computed from cached numpy arrays (no groupby)."""
         if self._x.size == 0:
-            self.y_max_global = 100.0
-            self.y_max_label_global = "100 μm"
+            self.y_max = 100.0
             return
 
         starts = self._track_starts
@@ -512,8 +553,7 @@ class ReconstructTracks:
         y0 = np.repeat(self._y[starts], self._run_lengths)
         r_max = np.hypot(self._x - x0, self._y - y0).max()
 
-        self.y_max_global = r_max + 10.0
-        self.y_max_label_global = f"{round(r_max) + 10} μm"
+        self.y_max = r_max + 100.0
 
     def _smooth(self, window: int):
         if not (isinstance(window, int) and window >= 1):
@@ -767,14 +807,14 @@ class ReconstructTracks:
         fig.set_facecolor(self.kwargs.get('face_color', 'white'))
 
 
-    def _style_grid(self, ax: plt.Axes, coord_system: str = 'cartesian'):
+    def _style_grid(self, ax: plt.Axes, **kwargs):
 
         grid_color = self.kwargs.get('grid_color', 'gainsboro')
         grid_lw    = self.kwargs.get('grid_lw', 0.75)
         grid_ls    = self.kwargs.get('grid_ls', '-')
 
         # Cartesian grid
-        if coord_system == 'cartesian':
+        if not self.align_at_start:
             ax.grid(
                 True, 
                 which='both', 
@@ -821,45 +861,77 @@ class ReconstructTracks:
 
 
     def _annotate_r_axis(self, ax: plt.Axes):
-        match self.kwargs.get('r_axis', 'none'):
+        text_color = self.kwargs.get('text_color', 'dimgrey')
+
+        # Use the outermost radial tick within the current limit as the label.
+        r_lim = ax.get_ylim()[1]
+        ticks = np.asarray(ax.get_yticks(), dtype=float)
+        ticks = ticks[(ticks > 0) & (ticks <= r_lim + 1e-9)]
+        if ticks.size:
+            self.y_max = float(ticks.max())
+            self.y_max_lbl = f"{round(self.y_max)} μm"
+
+        match self.kwargs.get('annotate_r_axis', 'minimal'):
             case 'minimal':
                 ax.set_yticklabels([])
-                gc = getattr(self, 'grid_color', 'grey')
-                ax.scatter(0, self.y_max_global + 35, color=gc,
-                           marker='.', s=5, clip_on=False)
-                ax.text(0, self.y_max_global + 50, self.y_max_label_global,
-                        va='center', fontsize=10, color=gc, clip_on=False)
+                # ax.scatter(np.deg2rad(20), self.y_max, color=text_color,
+                #            marker='.', s=5, clip_on=False)
+                ax.text(np.deg2rad(25), self.y_max + 75, self.y_max_lbl, horizontalalignment='center', verticalalignment='center',
+                        va='center', fontsize=10, color=text_color, clip_on=False)
             case 'detailed':
-                gc = getattr(self, 'grid_color', 'grey')
-                ax.set_yticklabels(ax.get_yticklabels(), fontsize=10, color=gc)
+                ax.set_yticks(ax.get_yticks())
+                ax.set_yticklabels(ax.get_yticklabels(), fontsize=10, color=text_color)
             case _:
                 ax.set_yticklabels([])
 
     def _annotate_theta_axis(self, ax: plt.Axes):
-        text_color = self.kwargs.get('text_color', 'black')
-        if self.kwargs.get('theta_axis', 'none') == 'detailed':
-            ax.set_xticklabels(ax.get_xticklabels(), fontsize=10, color=text_color)
-        else:
-            ax.set_xticklabels([])
+        text_color = self.kwargs.get('text_color', 'dimgrey')
+        match self.kwargs.get('annotate_theta_axis', 'compass'):
+            case 'angular':
+                # Pin ticks so relabeling doesn't trigger the fixed-ticks warning.
+                ax.set_xticks(ax.get_xticks())
+                ax.set_xticklabels(ax.get_xticklabels(), fontsize=10, color=text_color)
+            case 'compass':
+                ax.set_xticks(ax.get_xticks())
+                ax.set_xticklabels(['E', 'NE', 'N', 'NW', 'W', 'SW', 'S', 'SE'],
+                                   fontsize=10, color=text_color)
+            case _:
+                ax.set_xticklabels([])
 
-    @staticmethod
-    def frame_interval_ms(fps: float) -> float:
-        """Return the interval between frames in milliseconds."""
-        if fps <= 0:
-            raise ValueError("Frame rate must be positive.")
-        return 1000.0 / fps
+    # @staticmethod
+    # def frame_interval_ms(fps: float = 10) -> float:
+    #     """Return the interval between frames in milliseconds."""
+    #     if fps <= 0:
+    #         raise ValueError("Frame rate must be positive.")
+    #     return 1000.0 / fps
 
     def _new_axes(self, *, polar: bool = False):
-        """Create a fresh figure/axes matching the static plot's framing."""
+        """Create a fresh figure/axes matching the static plot's framing.
+
+        Reuses the same grid/axis styling as the already-built static
+        reconstruction so the animation inherits its look without needing
+        grid/axis arguments passed to :meth:`animate`.
+        """
         # self._background_color()
         if polar:
             fig, ax = plt.subplots(figsize=(12.5, 9.5),
                                    subplot_kw={'projection': 'polar'})
             self._get_radius()
-            ax.set_ylim(0, self.y_max_global)
+            tc = self.kwargs.get('text_color', 'black')
+            ax.set_title(self.kwargs.get('title', ''), fontsize=12, color=tc)
+            ax.set_ylim(0, self.y_max)
             ax.spines['polar'].set_visible(False)
+
+            if self.kwargs.get('grid', True):
+                self._style_grid(ax, **self.kwargs)
+            else:
+                ax.grid(False)
+
             self._annotate_r_axis(ax)
             self._annotate_theta_axis(ax)
+
+            if self.kwargs.get('hide_backdrop', False):
+                fig.set_facecolor('none')
         else:
             fig, ax = plt.subplots(figsize=(13, 10))
             if self._x.size:
@@ -869,9 +941,19 @@ class ReconstructTracks:
             tc = self.kwargs.get('text_color', 'black')
             ax.set_xlabel('x_coordinate [µm]', color=tc)
             ax.set_ylabel('y_coordinate [µm]', color=tc)
-            self._apply_cartesian_ticks(ax, tc)
+            ax.set_title(self.kwargs.get('title', ''), fontsize=12, color=tc)
+            self._cartesian_ticks(ax)
+            self._cartesian_spines(ax)
+
+            if self.kwargs.get('grid', True):
+                self._style_grid(ax, **self.kwargs)
+            else:
+                ax.grid(False)
+
+            if self.kwargs.get('hide_backdrop', False):
+                fig.set_facecolor('none')
+
         # ax.set_facecolor(self.face_color)
-        ax.grid(False)
         return fig, ax
 
 
