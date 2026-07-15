@@ -11,6 +11,8 @@ from ..categorizer import Categorizer, Painter
 from ...various import is_empty
 from ...compute.stats import Stats
 
+from ...compute.stats import Stats
+
 
 class MSD:
     """
@@ -28,41 +30,28 @@ class MSD:
     BRIGHTNESS_MIN = 0.06
 
 
-    def __init__(self, data: pd.DataFrame, conditions: list, replicates: list, 
-                 *, log_transform: bool = False, level: str = 'Condition', **kwargs):
+    def __init__(self): ...
+
+    def plot(
+        self,
+        data: pd.DataFrame, 
+        stat: str,
+        sets: Optional[dict[str, Any]] = None,
+        *, 
+        band: Optional[Literal['sd', 'sem', 'min-max', 'ci']] = None,
+        log: bool = False, 
+        linear_fit: bool = False,
+        **kwargs
+    ) -> plt.Figure:
         
-        self.data = data
-        self.conditions = conditions
-        self.replicates = replicates
+        self.data = kwargs.get('data')
+        self.level = kwargs.get('level', 'condition')
+        self.sets = kwargs.get('sets', {})
+        self.log_transform = kwargs.get('log_transform', False)
+
         
-        self.level = level
-        self.disaggregate = False
-        self.log_transform = log_transform
-
-        self.color = kwargs.get('color', None)
-        self.stock_palette = kwargs.get('stock_palette', None)
-        self.palette = kwargs.get('palette', None)
-        self.noticequeue = kwargs.get('noticequeue', None)
-
-        self.instance_kwargs = kwargs
-
-        self.painter = Painter(noticequeue=self.noticequeue)
-
-        self._check_errors()
-
-
-    def plot(self,
-             statistic: str = 'mean',
-             linear_fit: bool = False,
-             disper: Optional[Literal['sd', 'sem', 'min-max', 'ci']] = None,
-             *,
-             line: bool = True,
-             scatter: bool = False,
-             **kwargs) -> plt.Figure:
-
-        from ...compute.stats import Stats
         
-        if self.level == 'Condition':
+        if self.level == 'condition':
             prefix = '{per condition}'
             if not any('{per condition}' in col for col in self.data.columns.to_list()):
                 Reporter(Level.warning, "Expected aggregated data per condition but no columns with '{per condition}' found. Going to use '{per replicate}' data instead.", noticequeue=self.noticequeue)
@@ -99,15 +88,15 @@ class MSD:
             
         # Plot each condition
         for idx, condition in enumerate(self.conditions):
-            cond_data = self.data[self.data['Condition'] == condition]
+            cond_data = self.data[self.data['condition'] == condition]
 
-            if self.level == 'Condition':
+            if self.level == 'condition':
                 # grouped replicates
                 groups = [(condition, None, cond_data)]
             else:
                 # separate replicates
                 groups = []
-                for rep, rep_df in cond_data.groupby('Replicate'):
+                for rep, rep_df in cond_data.groupby('replicate'):
                     groups.append((condition, rep, rep_df))
 
             for g_idx, (cond_name, rep_name, gdata) in enumerate(groups):
@@ -532,3 +521,5 @@ def TurnAnglesHeatmap(data: pd.DataFrame, condition: str, replicates: list[str],
         spine.set_linewidth(0.5)
 
     return plt.gcf()
+
+

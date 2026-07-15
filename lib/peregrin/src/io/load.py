@@ -4,7 +4,9 @@ import warnings
 import pandas as pd
 import numpy as np
 import os.path as op
-from typing import Dict, List
+from typing import Dict, List, Optional
+from os import PathLike
+
 
 from .._pckg_exceptions._pckg_errors import *
 from .._pckg_exceptions._pckg_warnings import *
@@ -14,37 +16,34 @@ from ..compute.stats import stats
 class DataLoader:
 
     ALIASES = {
-        "devider": "devider_character",
-        "devider_character": "devider_character",
-        "devider_char": "devider_character",
-        "split": "devider_character",
-        "split_character": "devider_character",
-        "split_char": "devider_character",
+        
     }
 
-    def __init__(self, **kwargs):
+    CATEGORIES = {
+        'set': 5,
+        'subset': 4,
+        'group': 3,
+        'subgroup': 2,
+        'subsubgroup': 1
+    }
 
-        kwargs = {self.ALIASES.get(k, k): v for k, v in kwargs.items()}
+    def __init__(self): ...
 
-        self.ntcq = kwargs.get("ntcq")
 
     def load_data(
         self, 
-        files: str | dict | List[str | dict] | List[List[str | dict]], 
+        files: PathLike[str] | list | dict = None,
         colnames: dict = {
-            'id': None, 
-            't': None, 
-            'x': None, 
-            'y': None
+            'id': 'TRACK_ID', 
+            't':  'POSITION_T', 
+            'x':  'POSITION_X', 
+            'y':  'POSITION_Y'
         }, 
         t_unit: str = 's',
         *,
-        cond_lbls: str | int | List[str | int] | None = None, 
-        rep_lbls: str | int | List[str | int] | List[List[str | int]] | None = None, 
-        auto_label: bool = False,
-        strip_data: bool = True,
+        retain: Optional[list[str]] = None,
         **kwargs
-    ) -> pd.DataFrame | Dict[str, Dict[str, pd.DataFrame]]:
+    ) -> pd.DataFrame:
 
         """
         Load tracking data from any number of files into a single DataFrame, 
@@ -54,11 +53,45 @@ class DataLoader:
         
         Parameters
         ----------
-        files : str | dict | List[str | dict] | List[List[str | dict]]
-            Either a single file path or dictionary (single file - single condition, single replicate), 
-            a list of file paths or dictionaries (single set of files - single condition, multiple replicates), 
-            or a list of lists of file paths or dictionaries (multiple sets of files - multiple conditions, multiple replicates). 
-            Each file must contain tracking data with columns for track identifiers, time points, and x/y coordinates.
+        files : list[PathLike[str]] | dict
+            Either a list of file paths or a dictionary with keys as category indicies and values either as dicts (subcategories) or lists of file paths.
+            Data can be categorized up to 5 levels deep having the following structure:
+
+        ```
+        { set: { subset: { group: { subgroup: { subsubgroup: file }}}}}
+
+        Input example 1 (3-level categorization using lists of file paths):
+        [ [ ['path/to/file01.csv', 'path/to/file02.csv'], 
+            ['path/to/file03.csv', 'path/to/file04.csv']], 
+          [ ['path/to/file05.csv', 'path/to/file06.csv'], 
+            ['path/to/file07.csv', 'path/to/file08.csv']]]
+
+        Input example 2 (3-level categorization using dictionaries):
+        {'condition1': {'bio_replicate1': ['path/to/tech_replicate_A-10-10-10.csv', 'path/to/tech_replicate_B-10-10-10.csv'],
+                        'bio_replicate2': ['path/to/tech_replicate_A-11-10-10.csv', 'path/to/tech_replicate_B-11-10-10.csv']},
+         'condition2': {'bio_replicate1': ['path/to/tech_replicate_A-18-10-10.csv', 'path/to/tech_replicate_B-18-10-10.csv'],
+                        'bio_replicate2': ['path/to/tech_replicate_A-20-10-10.csv', 'path/to/tech_replicate_B-20-10-10.csv']}}
+
+        Input example 3 (4-level categorization using dictionaries):
+        {'A': {'A1': {'A1a': {'A1an': ['path/to/file01.csv', 'path/to/file02.csv'],
+                              'A1am': ['path/to/file03.csv', 'path/to/file04.csv']},
+                      'A1b': {'A1bn': ['path/to/file05.csv', 'path/to/file06.csv'],
+                              'A1bm': ['path/to/file07.csv', 'path/to/file08.csv']}},
+               'A2': {'A2a': {'A2an': ['path/to/file09.csv', 'path/to/file10.csv'],
+                              'A2am': ['path/to/file11.csv', 'path/to/file12.csv']},
+                      'A2b': {'A2bn': ['path/to/file13.csv', 'path/to/file14.csv'],
+                              'A2bm': ['path/to/file15.csv', 'path/to/file16.csv']}}},
+         'B': {'B1': {'B1a': {'B1an': ['path/to/file17.csv', 'path/to/file18.csv'],
+                              'B1am': ['path/to/file19.csv', 'path/to/file20.csv']},
+                      'B1b': {'B1bn': ['path/to/file21.csv', 'path/to/file22.csv'],
+                              'B1bm': ['path/to/file23.csv', 'path/to/file24.csv']}},
+               'B2': {'B2a': {'B2an': ['path/to/file25.csv', 'path/to/file26.csv'],
+                              'B2am': ['path/to/file27.csv', 'path/to/file28.csv']},
+                      'B2b': {'B2bn': ['path/to/file29.csv', 'path/to/file30.csv'],
+                              'B2bm': ['path/to/file31.csv', 'path/to/file32.csv']}}}}
+        
+        ```
+         See more detailed documentation of this method here: https://branislavmodriansky.github.io/peregrin/lib/overview.html
 
         colnames : dict
             A dictionary specifying the column names for track identifiers, time points, and x/y coordinates. 
@@ -67,31 +100,14 @@ class DataLoader:
 
         t_unit : str, optional, default 's'
             The unit of time used in the input data. Supported units include: 'ms', 's', 'min', 'h', 'day'.
-
-        cond_lbls : str | int | List[str | int], optional
-            Condition labels to be assigned to the loaded data. The number of labels must match the number of conditions 
-            (sets of files) being loaded. If None, the method will assign default labels: 1, 2, 3, ... for each condition.
-
-        rep_lbls : str | int | List[str | int] | List[List[str | int]], optional
-            Replicate labels to be assigned to the loaded data. The number of labels must match the number of replicates 
-            (files) being loaded per set. If None, the method will assign default labels - file names or indices - for each replicate.
-            
-        auto_label : bool, optional, default False
-            If True, the method will attempt to automatically extract condition and replicate labels from the file names, 
-            using a devider character (default: '#'). First part of the file name - between the first and second occurrence 
-            of the devider character - will be treated as the condition label, while the second part - between the second 
-            and third occurrence of the devider character - will be treated as the replicate label.
         
-        strip_data : bool, optional, default True
-            If True, the method will extract only the 4 key columns (id, t, x, y) from the loaded data, dropping all other columns.
-            If False, the method will keep all columns intact, while still renaming the 4 key columns to standard names.
+        retain : list[str], optional, default None
+            A list of column names from the original input data to be retained. If None, only the essential columns 
+            (track_id, time_point, x_coordinate, y_coordinate) are extracted, while all other columns are discarded.
 
         time_conversion : str, optional, default None
             If provided, time will be converted from the input unit `t_unit` to the specified target unit. 
             Supported units include: 'ms', 's', 'min', 'h', 'day'.
-
-        devider_character : str, optional, default '#'
-            The character used to split file names for automatic label extraction when `auto_label` is True
 
         mirror_y : bool, optional, default False
             If True, the method will mirror the y-coordinates across their midpoint - useful for correcting mirrored y-coordinates in exported data.
@@ -99,9 +115,26 @@ class DataLoader:
         mirror_x : bool, optional, default False
             If True, the method will mirror the x-coordinates across their midpoint - useful for correcting mirrored x-coordinates in exported data.
 
-        merge: bool, optional, default True
-            If True, the method will merge all loaded data into a single DataFrame.
-            If False, the method will return a dictionary of dictionaries with DataFrames, organized as {condition: {replicate: DataFrame}}.
+        merge : Literal['all', 'sets', 'subsets', 'groups', 'subgroups', None], default 'all'
+            Specifies how to merge the loaded data:
+
+        split_filename : bool, optional, default False
+            If True, the method will split file names during subsubgroup labeling using the `split_filename_position` and `split_filename_delimiter` parameters.
+
+        split_filename_position : Literal['first', 'last'] | int, optional, default 'last'
+            Determines how to split file names during subsubgroup labeling when `split_filename` is True.
+            Either one of 'first' or 'last' to split at the first or last occurrence of the `split_character`, or an integer to split at a specific index.
+
+        split_filename_delimiter : str, optional, default '-'
+            The character used to split file names for automatic label extraction when `split_filename` is True.
+        ```
+        'all' - merge all data into a single DataFrame (default)
+        'sets' - merge data within each set, but keep sets separate
+        'subsets' - merge data within each subset, but keep subsets separate
+        'groups' - merge data within each group, but keep groups separate
+        'subgroups' - merge data within each subgroup, but keep subgroups separate
+        None - do not merge; return data as a dictionary of dictionaries with DataFrames
+        ```
 
         Returns
         -------
@@ -110,128 +143,234 @@ class DataLoader:
         
         """
 
-        # Wrap single file or label inputs into lists for uniform handling
-        if isinstance(files, (str, dict)):
-            files = [files]
-        if isinstance(files, list) and all(isinstance(f, (str, dict)) for f in files):
-            files = [files]
+        self.retain = retain
+        self.kwargs = kwargs
 
-        if isinstance(cond_lbls, (str, int)):
-            cond_lbls = [cond_lbls]
+        self.id_col = colnames['id']
+        self.t_col  = colnames['t']
+        self.x_col  = colnames['x']
+        self.y_col  = colnames['y']
 
-        if isinstance(rep_lbls, (str, int)):
-            rep_lbls = [rep_lbls]
-        elif isinstance(rep_lbls, list) and all(isinstance(r, (str, int)) for r in rep_lbls):
-            rep_lbls = [rep_lbls] 
-
-        # Handle aliases for keyword arguments
-        kwargs = {self.ALIASES.get(k, k): v for k, v in kwargs.items()}
-        
+        # Time / transform options (wired as kwargs)
         self.t_unit = t_unit
         self.time_conversion = kwargs.get('time_conversion', None)
-        devider_character = kwargs.get("devider_character", "#")
+        self.mirror_y = kwargs.get('mirror_y', False)
+        self.mirror_x = kwargs.get('mirror_x', False)
+        self.merge = kwargs.get('merge', 'all')
 
-        _rep_guard_list = []
-        self.rep_multiplicates = False
+        # Wrap single file into a list for uniform handling
+        if isinstance(files, str):
+            files = [files]
 
-        if kwargs.get("merge", True): 
-            cache = []
-        else: 
-            cache = {}
-        
-        for file_set_idx, file_set in enumerate(files):
-            if isinstance(file_set, (str, dict)):
-                file_set = [file_set]
-        
-            for file_idx, fileinfo in enumerate(file_set):
-                if isinstance(fileinfo, dict) and "datapath" in fileinfo:
-                    df = self._read_file(fileinfo["datapath"])
-                else:
-                    df = self._read_file(fileinfo)
-
-                extracted = self._extract(
-                    df,
-                    colnames,
-                    strip_data,
-                    mirror_y=kwargs.get("mirror_y", False),
-                    mirror_x=kwargs.get("mirror_x", False),
-                )
-
-                if (auto_label 
-                    and isinstance(fileinfo, dict) 
-                    and fileinfo.get("name") 
-                    and len(fileinfo.get("name").split(devider_character)) >= 2):
-
-                    if cond_lbls is not None:
-                        warnings.warn(message="cond_lbls are provided while auto_label is True -> cond_lbls will be ignored.",
-                                        category=LabelWarning,
-                                        stacklevel=2)
-
-                    file_info = fileinfo.get("name")
-
-                    cond_lbl = file_info.split(devider_character)[1]
-                    rep_lbl = file_info.split(devider_character)[2]
-
-                    if file_idx > 1:
-                        extracted = self._guard_replicates(rep_lbl, file_info, extracted, _rep_guard_list)
-
-                elif (auto_label 
-                      and isinstance(fileinfo, str)
-                      and len(op.basename(fileinfo).split(devider_character)) >= 2):
-
-                    if cond_lbls is not None:
-                        warnings.warn(message="cond_lbls are provided while auto_label is True -> cond_lbls will be ignored.",
-                                        category=LabelWarning,
-                                        stacklevel=2)
-
-                    cond_lbl = op.basename(fileinfo).split(devider_character)[1]
-                    rep_lbl = op.basename(fileinfo).split(devider_character)[2]
-
-                    if file_idx > 1:
-                        extracted = self._guard_replicates(rep_lbl, file_info, extracted, _rep_guard_list)
-
-                else:
-                    if cond_lbls is not None:
-                        cond_lbl = cond_lbls[file_set_idx]
-                    else:
-                        cond_lbl = file_set_idx + 1
-
-                    if rep_lbls is not None:
-                        rep_lbl = rep_lbls[file_set_idx][file_idx]
-                    else:
-                        if isinstance(fileinfo, dict):
-                            rep_lbl = f"file_{file_idx + 1}_" + fileinfo.get("name", f"file_{file_idx + 1}")
-                        else:
-                            rep_lbl = f"file_{file_idx + 1}_" + op.basename(fileinfo)
-
-                _rep_guard_list.append(rep_lbl)
-
-                extracted["condition"] = str(cond_lbl)
-                extracted["replicate"] = str(rep_lbl)
-
-                if kwargs.get("merge", True):
-                    cache.append(extracted)
-                else:
-                    if str(cond_lbl) not in cache:
-                        cache[str(cond_lbl)] = {}
-                    cache[str(cond_lbl)][str(rep_lbl)] = extracted
-
-                if self.rep_multiplicates:
-                    warnings.warn(message=f"Multiplicates of the same replicate label under the same condition -> track ids in these replicates have been prefixed to avoid conflicts.",
-                                  category=LabelWarning,
-                                  stacklevel=2)
-
-            if not kwargs.get("merge", True):
-                return pd.concat(cache, axis=0)
-            else:
-                pass
-
-        if kwargs.get("merge", True):
-            return pd.concat(cache, axis=0)
+        if isinstance(files, list):
+            depth = self._max_list_depth(files)
+            leaves = self._iter_list_tree(files, depth)
+        elif isinstance(files, dict):
+            depth = self._max_dict_depth(files)
+            leaves = self._iter_dict_tree(files, depth)
         else:
-            return cache
+            raise TypeError("`files` must be a str, list or dict.")
+
+        # Category columns used (bottom-up), 'subsubgroup' is always the file level
+        category_order = ['set', 'subset', 'group', 'subgroup', 'subsubgroup']
+        used_categories = category_order[-depth:]
+
+        records = []
+        for labels, filepath in leaves:
+            df = self._read_file(filepath)
+            df = self._extract(df)
+
+            for cat, label in zip(used_categories, labels):
+                df[cat] = label
+
+            records.append(df)
+
+        return self._merge(records, used_categories)
+
+
+
+    def merge_leaf_lists(tree, depth):
+        current = [tree]
+
+        # Go to the parents of the leaf lists
+        for _ in range(depth - 2):
+            current = [item for lst in current for item in lst]
+
+        # Merge each leaf list
+        for i, leaf in enumerate(current):
+            current[i] = [pd.concat(leaf, ignore_index=True)]
+
+        return tree  
+
+    
+
+    def _merge(self, records: list, used_categories: list):
+        """
+        Merge extracted per-file DataFrames according to `self.merge`.
+
+        'all'        -> single concatenated DataFrame
+        'sets'       -> dict keyed by set
+        'subsets'    -> dict keyed by set/subset
+        'groups'     -> dict keyed down to group
+        'subgroups'  -> dict keyed down to subgroup
+        None         -> dict keyed down to subsubgroup (unconcatenated leaves)
+        """
+        if not records:
+            return pd.DataFrame()
+
+        if self.merge == 'all':
+            return pd.concat(records, ignore_index=True)
+
+        merge_levels = {
+            'sets': 1,
+            'subsets': 2,
+            'groups': 3,
+            'subgroups': 4,
+            None: 5,
+        }
+        target = merge_levels.get(self.merge)
+        if target is None:
+            raise ValueError(
+                f"Invalid merge option: {self.merge!r}. "
+                "Choose from 'all', 'sets', 'subsets', 'groups', 'subgroups', None."
+            )
+
+        # How many of the available (bottom-up) categories to key on.
+        full_order = ['set', 'subset', 'group', 'subgroup', 'subsubgroup']
+        # index of the deepest keying category within full_order
+        deepest_idx = target - 1
+        # only keep categories that actually exist in the data
+        key_cats = [c for c in full_order[:target] if c in used_categories]
+
+        result = {}
+        for df in records:
+            keys = [str(df[c].iloc[0]) for c in key_cats]
+
+            node = result
+            for k in keys[:-1]:
+                node = node.setdefault(k, {})
+
+            last = keys[-1]
+            if self.merge is None:
+                node[last] = df
+            else:
+                node.setdefault(last, []).append(df)
+
+        # Concatenate leaf lists (unless merge is None)
+        if self.merge is not None:
+            self._concat_leaves(result)
+
+        return result
+
+    def _concat_leaves(self, node):
+        """Recursively concatenate lists of DataFrames stored in a nested dict."""
+        for key, val in node.items():
+            if isinstance(val, list):
+                node[key] = pd.concat(val, ignore_index=True)
+            elif isinstance(val, dict):
+                self._concat_leaves(val)
+
+
+    def _iter_list_tree(self, tree: list, depth: int, labels: tuple = ()):
+        """
+        Yield (labels, filepath) leaves from a nested list tree.
+        Non-file levels are labelled with their 1-based index (as str);
+        the file level is labelled with the file's basename.
+        """
+        if depth == 1:
+            # This list holds file paths
+            for path in tree:
+                yield labels + (self._subsubgroup_label(path),), path
+        else:
+            for i, sub in enumerate(tree):
+                yield from self._iter_list_tree(sub, depth - 1, labels + (str(i + 1),))
+
+    def _iter_dict_tree(self, tree, depth: int, labels: tuple = ()):
+        """
+        Yield (labels, filepath) leaves from a nested dict tree.
+        Non-file levels are labelled with their dict key;
+        the file level is labelled with the file's basename.
+        """
+        if depth == 1:
+            # This dict maps filename -> filepath, OR is a list of paths
+            if isinstance(tree, dict):
+                for name, path in tree.items():
+                    yield labels + (self._subsubgroup_label(path),), path
+            else:  # list of file paths
+                for path in tree:
+                    yield labels + (self._subsubgroup_label(path),), path
+        else:
+            for key, sub in tree.items():
+                yield from self._iter_dict_tree(sub, depth - 1, labels + (str(key),))
             
 
+    def _max_list_depth(self, obj):
+        if not isinstance(obj, list) or not obj:
+            return 0
+
+        return 1 + self._max_list_depth(obj[0])
+
+    def _max_dict_depth(self, d):
+        if not isinstance(d, dict) or not d:
+            return 0
+
+        return 1 + max(self._max_dict_depth(v) for v in d.values())
+
+
+    def _subsubgroup_label(self, path: str) -> str:
+        """
+        Derive the subsubgroup (file-level) label from a file path.
+
+        With `split_filename=False` (default) the full basename is used.
+        With `split_filename=True` the stem is split on `split_character`
+        according to `split_how`:
+            'first' -> keep the part before the first occurrence
+            'last'  -> keep the part before the last occurrence
+            int i   -> keep the i-th part (0-based) of the split
+        """
+        name = op.basename(path)
+        stem, _ = op.splitext(name)
+
+        if not self.kwargs.get('split_filename', False):
+            return name
+
+        sep = self.kwargs.get('split_filename_delimiter', '-')
+        how = self.kwargs.get('split_filename_position', 'last')
+
+        if isinstance(how, int):
+            parts = stem.split(sep)
+            if -len(parts) <= how < len(parts):
+                return parts[how]
+            return stem  # index out of range -> fall back to full stem
+
+        if how == 'first':
+            return stem.split(sep, 1)[0]
+
+        if how == 'last':
+            return stem.rsplit(sep, 1)[0] if sep in stem else stem
+
+        return stem
+    
+
+    def _load_from_list(self, file_tree_list: list, depth: int) -> pd.DataFrame:
+
+        current = [file_tree_list]
+
+        for _ in range(depth - 1):
+            current = [item for lst in current for item in lst]
+
+        return [f for group in current for f in group]
+    
+    def _load_from_dict(self, file_tree_dict: dict, depth: int) -> pd.DataFrame:
+        current = [file_tree_dict]
+
+        for _ in range(depth - 1):
+            current = [item for d in current for item in d.values()]
+
+        return [f for group in current for f in group]
+            
+
+            
     def _read_file(self, filepath: str) -> pd.DataFrame:
         
         _, ext = op.splitext(filepath.lower())
@@ -249,60 +388,66 @@ class DataLoader:
                 return pd.read_json(filepath)
             case _:
                 raise FileFormatError(f"{ext} is not supported. Supported formats include: .csv, .xls, .xlsx, .xml., .json, .parquet")
+            
 
     def _extract(
         self,
-        df: pd.DataFrame, 
-        colnames: dict,
-        strip_data: bool = True,
-        *, 
-        mirror_y: bool = False, 
-        mirror_x: bool = False
+        df: pd.DataFrame
     ) -> pd.DataFrame:
 
-        id_col = colnames['id']
-        t_col  = colnames['t']
-        x_col  = colnames['x']
-        y_col  = colnames['y']
-
-        if not all(col in df.columns for col in [id_col, t_col, x_col, y_col]):
-            missing = [col for col in [id_col, t_col, x_col, y_col] if col not in df.columns]
+        if not all(col in df.columns for col in [self.id_col, self.t_col, self.x_col, self.y_col]):
+            missing = [col for col in [self.id_col, self.t_col, self.x_col, self.y_col] if col not in df.columns]
             raise ColumnsNotFoundError(f"missing columns: {missing}")
 
-        if strip_data:
-            df = df[[id_col, t_col, x_col, y_col]].apply(pd.to_numeric, errors='coerce')
+        if self.retain is None:
+            df = df[[self.id_col, self.t_col, self.x_col, self.y_col]].apply(pd.to_numeric, errors='coerce')
         else:
-            for c in [id_col, t_col, x_col, y_col]:
+            df = df[[self.id_col, self.t_col, self.x_col, self.y_col] + self.retain].copy()
+            for c in [self.id_col, self.t_col, self.x_col, self.y_col]:
                 df[c] = pd.to_numeric(df[c], errors='coerce')
+            self._py_numeric_df(df)
 
-        df = df.dropna(subset=[id_col, t_col, x_col, y_col]).reset_index(drop=True)
+        df = df.dropna(subset=[self.id_col, self.t_col, self.x_col, self.y_col]).reset_index(drop=True)
         
-        if mirror_y:
-            y_mid = (df[y_col].min() + df[y_col].max()) / 2
-            df[y_col] = 2 * y_mid - df[y_col]
-        if mirror_x:
-            x_mid = (df[x_col].min() + df[x_col].max()) / 2
-            df[x_col] = 2 * x_mid - df[x_col]
+        if self.mirror_y:
+            y_mid = (df[self.y_col].min() + df[self.y_col].max()) / 2
+            df[self.y_col] = 2 * y_mid - df[self.y_col]
+        if self.mirror_x:
+            x_mid = (df[self.x_col].min() + df[self.x_col].max()) / 2
+            df[self.x_col] = 2 * x_mid - df[self.x_col]
 
-        # normalize column names
-        df = self._standname(df, id_col, t_col, x_col, y_col)
-        try:
-            df.columns = [self._clean_name(c) if c != 'track_id' else c for c in df.columns]
-        except Exception:
-            pass
-        
-        df.sort_values('time_point', inplace=True)
-        t_steps = np.diff(df['time_point'].unique())
+        df.sort_values(self.t_col, inplace=True)
+        t_steps = np.diff(df[self.t_col].unique())
 
-        if np.all(t_steps == t_steps[0]):
-            stats.t_step = float(t_steps[0])
+        if t_steps.size == 0:
+            self.t_step = float('nan')
         else:
-            stats.t_step = float(np.median(t_steps))
-            warnings.warn(message=f"Non-uniformly spaced time point data -> will probably lead to incorrect data computation.\nObserved time steps:\n{t_steps}\nUsing: {stats.t_step}",
-                            category=LabelWarning,
-                            stacklevel=2)
-        
-        self._py_numeric_df(df)
+            # Base step = smallest positive interval (one frame).
+            positive = t_steps[t_steps > 0]
+            base = float(positive.min()) if positive.size else float(t_steps.min())
+
+            if base > 0:
+                ratios = t_steps / base
+                # Uniform if every gap is an (near-)integer multiple of the base step
+                # -> tolerates dropped frames (e.g. a single 120 among 60s).
+                is_regular = np.all(np.isclose(ratios, np.round(ratios), atol=1e-6))
+            else:
+                is_regular = False
+
+            if is_regular:
+                self.t_step = base
+            else:
+                self.t_step = float(np.median(t_steps))
+                warnings.warn(
+                    message=(
+                        f"Non-uniformly spaced time point data -> will probably lead to incorrect data computation.\n"
+                        f"Observed time steps:\n{t_steps}\nUsing: {self.t_step}"
+                    ),
+                    category=LabelWarning,
+                    stacklevel=2
+                )
+            
+        df = self._standname(df, self.id_col, self.t_col, self.x_col, self.y_col)
 
         # run time conversion for any requested target unit handled by _convert_time
         if self.time_conversion not in (None, ""):
@@ -454,7 +599,6 @@ class DataLoader:
         return df
 
 
-loader = DataLoader()
-load_data = loader.load_data
-get_columns = loader.get_columns
-match_columns = loader.match_columns
+load_data = DataLoader().load_data
+get_columns = DataLoader().get_columns
+match_columns = DataLoader().match_columns
