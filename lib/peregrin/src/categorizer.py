@@ -12,13 +12,16 @@ import matplotlib as mpl
 from typing import Any, List, Tuple
 
 import warnings
-from ..settings import params
-from .._pckg_exceptions._pckg_errors import *
-from .._pckg_exceptions._pckg_warnings import *
+from .settings import params
+from ._pckg_exceptions._pckg_errors import *
+from ._pckg_exceptions._pckg_warnings import *
 
 
 
 class Categorizer:
+
+    DEFAULT_CATEGORIES = ['set', 'subset', 'group', 'subgroup', 'subsubgroup']
+
 
     def __init__(self): ...
 
@@ -26,7 +29,7 @@ class Categorizer:
     def categorize(
         self,
         data: pd.DataFrame,
-        sets: dict[str, Any] | None = None,
+        sets: dict[str, list] | None = None,
         *,
         aggby: list | None = None,
         aggdict: dict | None = None,

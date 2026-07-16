@@ -17,18 +17,25 @@ class CheckData:
     def __init__(self):
         pass
 
-    def is_empty(self, data: pd.DataFrame | pd.Series, *, details: bool = False) -> bool:
+    def is_empty(self, data: pd.DataFrame | pd.Series | list | dict | str, *, details: bool = False) -> bool:
         """
         Checks if a pd.DataFrame or pd.Series is empty.
         """
 
         isempty = False
         
-        if data is None or data.empty:
+        if data is None:
             isempty = True
+            
+        elif isinstance(data, (pd.DataFrame, pd.Series)):
+            if data.empty:
+                isempty = True
+            if details:
+                self._get_details(isempty, data)
 
-        if details:
-            self._get_details(isempty, data)
+        elif isinstance(data, (list, dict, str)):
+            if len(data) == 0:
+                isempty = True
         
         return isempty
 

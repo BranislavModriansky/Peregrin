@@ -5,7 +5,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 
-from ..categorizer import Categorizer, Painter
+from ...categorizer import Categorizer, Painter
 from ...various import is_empty
 from ...compute.stats import Stats
 

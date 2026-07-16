@@ -5,9 +5,9 @@ import warnings
 import numpy as np
 import pandas as pd
 from scipy import stats
-from typing import Any, Callable, Optional, Tuple, Dict, List, Union
+from typing import Any, Callable, Literal, Optional, Tuple, Dict, List, Union
 
-from ..various import Values
+from ..various import Values, is_empty
 from ..settings import params
 from .._pckg_exceptions._pckg_errors import *
 from .._pckg_exceptions._pckg_warnings import *
@@ -60,10 +60,10 @@ class Stats:
     """
 
     # Input: pd.DataFrame = pd.DataFrame()
-    Spots_df: pd.DataFrame = pd.DataFrame()
-    Tracks_df: pd.DataFrame = pd.DataFrame()
-    Frames_df: pd.DataFrame = pd.DataFrame()
-    TimeIntervals_df: pd.DataFrame = pd.DataFrame()
+    # Spots_df: pd.DataFrame = pd.DataFrame()
+    # Tracks_df: pd.DataFrame = pd.DataFrame()
+    # Frames_df: pd.DataFrame = pd.DataFrame()
+    # TimeIntervals_df: pd.DataFrame = pd.DataFrame()
 
     ignore_categories: bool = params.ignore_categories
 
@@ -71,6 +71,8 @@ class Stats:
     t_unit: str = 's'
     significant_figures: Optional[int] = None
     decimal_places: Optional[int] = None
+
+    DEFAULT_CATEGORIES = ['track_id', 'subsubgroup', 'subgroup', 'group', 'subset', 'set']
 
     BOOTSTRAP_RESAMPLES: int = 1000
     CONFIDENCE_LEVEL: float = 95
@@ -82,9 +84,8 @@ class Stats:
         'first', 'last', 'var', 'prod', 'size', 'nunique',
     })
 
-    _EXCLUDE_SUFFIXES = frozenset([
-        'per', 'condition', 'replicate', 'track_id', 'track_uid',
-        'time_point', 'frame', 'time_lag', 'frame_lag', 'sd', 'var', 'sem', 'q25', 'q75'
+    _EXCLUDE_SUFFIXES = set([
+        'track_id', 'track_uid', 'time_point', 'frame', 'time_lag', 'frame_lag', 'sd', 'var', 'sem', 'q25', 'q75'
     ])
 
     # Class-level defaults for stat categories
@@ -126,7 +127,7 @@ class Stats:
         **kwargs
     ) -> None:
 
-        self.tier: List[str] = ['condition', 'replicate']
+        self.tier: List[str] = ['set', 'subset', 'group', 'subgroup', 'subsubgroup']
 
         self.cat_descr = cat_descr
         self.cat_descr_err = cat_descr_err
@@ -213,17 +214,16 @@ class Stats:
             self.tier = []
 
         # self.Input = df
-        self.spots(df, **kwargs)
-        self.tracks(self.Spots_df, **kwargs)
-        self.frames(self.Spots_df, **kwargs)
-        self.time_intervals(self.Spots_df, **kwargs)
+        spots_df = self.spots(df, **kwargs)
 
-        return self.Spots_df, self.Tracks_df, self.Frames_df, self.TimeIntervals_df
+        return spots_df, self.tracks(spots_df, **kwargs), self.frames(spots_df, **kwargs), self.time_intervals(spots_df, **kwargs)
 
 
     def spots(
         self, 
         df: pd.DataFrame,
+        *,
+        grouping_level: list[str] | int | Literal['top', 'lowest'] | None = 'top',
         **kwargs
     ) -> pd.DataFrame:
         """ Computes per-trajectory-point statistics, both local (previous -> current position) and cumulative (start -> current position).
@@ -232,8 +232,6 @@ class Stats:
         ----------
         df : pd.DataFrame
             The input DataFrame must contain these columns:
-            - *`condition`*
-            - *`replicate`*
             - `track_id`
             - `x_coordinate`
             - `y_coordinate`
@@ -327,12 +325,7 @@ class Stats:
 
         """
 
-        # self.Input = df.copy()
-
         df = df.copy()
-
-        if kwargs.get('ignore_categories', params.ignore_categories):
-            self.tier = []
 
         if df.empty:
             warnings.warn(message="Input DataFrame is empty. No computation performed.", 
@@ -341,7 +334,13 @@ class Stats:
             
             return pd.DataFrame(columns=self.COLUMNS['SPOTS'])
 
-        df.sort_values(self.tier + ['track_id', 'time_point'], inplace=True)
+        # Get the grouping columns based on the specified grouping level
+        grouping_cols = self._get_grouping_level(df.columns, grouping_level)
+
+        # Create a unique track identifier (track_uid) based on the grouping columns
+        df = self._assign_track_uid(df)
+
+        df.sort_values(grouping_cols + ['time_point'], inplace=True)
 
         if self.t_step is None:
             _t = df.copy()
@@ -357,29 +356,14 @@ class Stats:
                                 stacklevel=2)
         else:
             t_step = self.t_step
-        
-        # Define grouping keys
-        gkeys = self.tier + ['track_id']
 
-        grp = df.groupby(gkeys, sort=False)
+        grp = df.groupby(level='track_uid', sort=False)
 
-        # Provides a unique trajectory identifier (track_uid) as index that is consistent throughout dataflow and is used for grouping, iterating, filtering, and merging.
-        df['track_uid'] = grp.ngroup()
-        df.set_index(['track_uid'], drop=False, append=False, inplace=True, verify_integrity=False)
+        df['frame'] = grp['time_point'].rank(method='dense').astype('Int64') - 1
 
-        # Assigns frame numbers within each data subset based on the order of time points; starts at 0 for the first point in each track.
-        if not kwargs.get('ignore_categories', params.ignore_categories):
-            df['frame'] = df.groupby(self.tier, sort=False)['time_point'].rank(method='dense').astype('Int64') - 1
-        else:
-            df['frame'] = df.groupby(['track_id'], sort=False)['time_point'].rank(method='dense').astype('Int64') - 1
-
-        # Sanity guard, checking for multiple frames assigned to the same tier × time point combination
-        if not kwargs.get('ignore_categories', params.ignore_categories):
-            bad = df.groupby(self.tier + ['time_point'], sort=False)['frame'].nunique(dropna=True).max()
-        else:
-            bad = df.groupby(['track_id', 'time_point'], sort=False)['frame'].nunique(dropna=True).max()
+        bad = df.groupby(grouping_cols + ['time_point'], sort=False)['frame'].nunique(dropna=True).max()
         if bad and bad > 1:
-            raise TimePointError(f"Multiple frames assigned to the same {self.tier} × time_point combination. Multiplicates of time_point values within the data. Max frames per time point: {bad}.")
+            raise TimePointError(f"Multiple frames assigned to the same {grouping_cols} × time_point combination. Multiplicates of time_point values within the data. Max frames per time point: {bad}.")
 
         # distance between the previous and the current position
         df['distance'] = np.hypot(
@@ -411,10 +395,9 @@ class Stats:
         df['cum_forward_progression_linearity'] = df['cum_mean_straight_line_speed'] / df['cum_speed_mean']
 
         # Instantaneous direction of motion (rad) -> difference between the previous and current position
-        df['direction'] = np.arctan2(
-            grp['y_coordinate'].diff(),
-            grp['x_coordinate'].diff()
-        ).fillna(np.nan)
+        dy = grp['y_coordinate'].diff()
+        dx = grp['x_coordinate'].diff()
+        df['direction'] = np.arctan2(dy, dx).fillna(np.nan)
 
         # Directional change (turning angle) -> angular difference between consecutive directions, wrapped to [-π, π], then absolute, converted to degrees
         raw_dir_change = grp['direction'].diff()
@@ -422,13 +405,18 @@ class Stats:
         wrapped_dir_change = (raw_dir_change + np.pi) % (2 * np.pi) - np.pi
         df['directional_change'] = np.rad2deg(wrapped_dir_change.abs()).fillna(np.nan)
 
-        # Mean directional change -> mean of absolute directional changes (degrees) along the track up to the current position
-        _temp = df.groupby(gkeys, sort=False).directional_change.expanding()
+        # Mean directional change -> vectorized cumulative sum/mean over the same track_uid grouping.
+        # NaN entries (first two points of each track) must be excluded from the running count,
+        # matching the previous expanding().mean() behavior which skipped NaNs.
+        dc = df['directional_change']
+        dc_filled = dc.fillna(0.0)
+        df['cum_sum_directional_change'] = grp_dc_sum = df.groupby(level='track_uid', sort=False)['directional_change'].cumsum(skipna=True)
 
-        df['cum_sum_directional_change'], df['cum_mean_directional_change'] = (
-            _temp.sum().droplevel(list(range(len(gkeys)))).values,
-            _temp.mean().droplevel(list(range(len(gkeys)))).values
-        )
+        # Running count of non-NaN directional_change values within each track
+        valid = dc.notna()
+        valid_count = valid.groupby(level='track_uid', sort=False).cumsum()
+        with np.errstate(invalid='ignore', divide='ignore'):
+            df['cum_mean_directional_change'] = df['cum_sum_directional_change'] / valid_count.replace(0, np.nan)
 
         # First two points of each track have no directional change; set them to NaN
         df.loc[df['directional_change'].isna(), ['cum_mean_directional_change']] = np.nan
@@ -436,33 +424,27 @@ class Stats:
         # _log.info(f"[INFO] Cumulative mean directional change rate calculated using t_step = {t_step} and current track point count = {cumulative_count}: \n{df['Cumulative mean directional change rate']}")
 
         # Cumulative direction of motion (circular mean and variance) calculations
-        df['_dir'] = np.arctan2(
-            grp['y_coordinate'].diff(),
-            grp['x_coordinate'].diff()
-        )
+        # Reuse already-computed dy/dx instead of recomputing arctan2.
+        _dir = np.arctan2(dy, dx)
+        _sin = np.sin(_dir)
+        _cos = np.cos(_dir)
 
-        # Cumulative direction of motion (circular mean and variance) calculations
-        df['_sin'] = np.sin(df['_dir'])
-        df['_cos'] = np.cos(df['_dir'])
-
-        # Cumulative sums respect track boundaries via grp
-        cum_sin = grp['_sin'].cumsum()
-        cum_cos = grp['_cos'].cumsum()
+        # Cumulative sums respect track boundaries via grp; NaN at track starts contribute 0.
+        cum_sin = _sin.groupby(level='track_uid', sort=False).cumsum()
+        cum_cos = _cos.groupby(level='track_uid', sort=False).cumsum()
 
         # Number of contributing angles (0 at first timepoint, 1 at second, ...)
-        tp_rank  = df.groupby(gkeys, sort=False)['time_point'].rank(method='first')
-        n_angles = tp_rank - 1
+        n_angles = cumulative_count - 1
 
         # cum_direction_mean and circular variance
         df['cum_direction_mean'] = np.arctan2(cum_sin, cum_cos)
 
-        R = np.hypot(cum_sin, cum_cos) / n_angles.replace(0, np.nan)
+        with np.errstate(invalid='ignore', divide='ignore'):
+            R = np.hypot(cum_sin, cum_cos) / pd.Series(n_angles, index=df.index).replace(0, np.nan)
         df['cum_direction_var'] = 1.0 - R
 
         df.loc[n_angles == 0, 'cum_direction_var'] = np.nan
         df.loc[n_angles == 1, 'cum_direction_var'] = 0.0
-
-        df.drop(columns=['_dir', '_sin', '_cos'], inplace=True)
 
         # Drop all-NaN columns (if any are present)
         df.dropna(how='all', axis='columns', inplace=True)
@@ -472,14 +454,14 @@ class Stats:
         if self.decimal_places:
             df = self.norm_decimals(df)
 
-        self.Spots_df = df.copy()
-
         return df
 
 
     def tracks(
         self, 
         df: pd.DataFrame,
+        *,
+        grouping_level: list[str] | int | Literal['top', 'lowest'] | None = 'top',
         **kwargs
     ) -> pd.DataFrame:
         """ Computes a comprehensive DataFrame of track-level statistics for each trajectory of the input Spots_df.
@@ -488,8 +470,6 @@ class Stats:
         ----------
         df : pd.DataFrame
             This method expects the dataframe returned from `stats.spots()`. The input DataFrame must contain these columns:
-            - *`condition`*
-            - *`replicate`*
             - `track_id`
             - `track_uid`
             - `frame`
@@ -509,8 +489,6 @@ class Stats:
         pd.DataFrame
             A DataFrame with one row per unique track, containing the following columns:
 
-            - *`condition`*
-            - *`replicate`*
             - `track_id`
             - `track_uid`
 
@@ -583,11 +561,15 @@ class Stats:
         # Work on a copy to avoid mutating the caller's DataFrame
         df = df.copy()
 
-        if kwargs.get('ignore_categories', params.ignore_categories):
-            self.tier = []
-
         if df.empty:
+            warnings.warn(message="Input DataFrame is empty. No computation performed.", 
+                          category=DataFrameWarning, 
+                          stacklevel=2)
+            
             return pd.DataFrame(columns=self.COLUMNS['TRACKS'])
+
+        grouping_cols = self._get_grouping_level(df.columns, grouping_level)
+        df = self._assign_track_uid(df)
         
         if self.t_step is None:
             _t = df.copy()
@@ -605,15 +587,11 @@ class Stats:
             t_step = self.t_step
 
         # Stash the categorical identifiers for merging them back into the aggregated result DataFrame
-        stash = df[self.tier + ['track_id']].drop_duplicates()
+        stash = df[grouping_cols].drop_duplicates()
 
-        if not kwargs.get('ignore_categories', params.ignore_categories):
-            df = df.set_index('track_uid', drop=True, verify_integrity=False)
-            _id = ['track_uid']
-        else:
-            df = df.set_index('track_id', drop=True, verify_integrity=False)
-            _id = ['track_id']
-        grp = df.groupby(level=_id, sort=False)
+        # df = df.set_index('track_uid', drop=True, verify_integrity=False)
+        # _id = ['track_uid']
+        grp = df.groupby(level='track_uid', sort=False)
 
         speed_agg_spec = {
             'speed_min':    lambda x: x.min() / t_step,
@@ -655,15 +633,12 @@ class Stats:
         agg_spec['mean_directional_change_rate'] = ('cum_mean_directional_change_rate', 'last')
 
         agg = grp.agg(**agg_spec)
-
         
         # If colors were assigned, carry them over
-        if 'replicate_color' in df.columns:
-            colors = grp['replicate_color'].first()
-            agg = agg.merge(colors, left_index=True, right_index=True)
-        if 'condition_color' in df.columns:
-            colors = grp['condition_color'].first()
-            agg = agg.merge(colors, left_index=True, right_index=True)
+        for col in df.columns:
+            if col.endswith('color'):
+                colors = grp[col].first()
+                agg = agg.merge(colors, left_index=True, right_index=True)
 
         # Displacement and straightness
         agg['track_displacement'] = np.hypot(agg['end_x'] - agg['start_x'], agg['end_y'] - agg['start_y'])
@@ -674,7 +649,13 @@ class Stats:
         n = grp.size().rename('track_points')
         agg = agg.merge(n, left_index=True, right_index=True)
         df = df.merge(agg, left_index=True, right_index=True, how='right')
-        df = df.drop(['condition', 'replicate', 'track_id'], axis=1, errors='ignore')
+        df = df.drop(grouping_cols, axis=1, errors='ignore')
+
+        # Drop any columns that also live in `stash` to avoid _x/_y suffix collisions
+        # when merging the categorical identifiers back in.
+        overlap = [c for c in stash.columns if c in df.columns]
+        df = df.drop(columns=overlap, errors='ignore')
+
         df = stash.merge(df, left_index=True, right_index=True, how='right')
 
         for col in self.COLUMNS['SPOTS']:
@@ -684,23 +665,22 @@ class Stats:
         df.drop_duplicates(inplace=True)
 
         # Insert track_uid as a column right after track_id
-        if not kwargs.get('ignore_categories', params.ignore_categories):
-            df.insert(df.columns.get_loc('track_id') + 1, 'track_uid', df.index)
-        
+        # if not kwargs.get('ignore_categories', params.ignore_categories):
+        # df.insert(df.columns.get_loc('track_id') + 1, 'track_uid', df.index)
         
         if self.significant_figures:
             df = self.signify(df)
         if self.decimal_places:
             df = self.norm_decimals(df)
         
-        self.Tracks_df = df.copy()
-
         return df
     
 
     def frames(
         self, 
         df: pd.DataFrame,
+        *,
+        grouping_level: list[str] | int | Literal['top', 'lowest'] | None = 'top',
         **kwargs
     ) -> pd.DataFrame:
         
@@ -714,8 +694,6 @@ class Stats:
         ----------
         df : pd.DataFrame
             This method expects the dataframe acquired by `stats.spots()`. The input DataFrame must contain these columns:
-            - *`condition`*
-            - *`replicate`*
             - `time_point`
             - `frame`
             - `distance`
@@ -737,8 +715,6 @@ class Stats:
             A DataFrame with one row per unique combination of `condition` × `replicate` × `time_point` 
             if `ignore_categories` is False, otherwise a single row for all data. It contains the following columns:
 
-            - *`condition`*
-            - *`replicate`*
             - `time_point`
             - `frame`
 
@@ -777,12 +753,15 @@ class Stats:
 
         # Work on a copy to avoid mutating the caller's DataFrame
         df = df.copy()
+        
+        grouping_cols = self._get_grouping_level(df.columns, grouping_level)
+        df = self._assign_track_uid(df)
 
-        if kwargs.get('ignore_categories', params.ignore_categories):
-            self.tier = []
+        # if kwargs.get('ignore_categories', params.ignore_categories):
+        #     self.tier = []
 
         # Stash color columns if present, to carry them over to the output
-        _color_cols = [c for c in ('replicate_color', 'condition_color') if c in df.columns]
+        _color_cols = [c for c in df.columns if c.endswith('color')]
         _color_stash = None
         if _color_cols:
             # Build a lookup keyed by the replicate/condition grouping columns
@@ -790,8 +769,8 @@ class Stats:
             _color_stash = df[_stash_keys + _color_cols].drop_duplicates(subset=_stash_keys)
 
         rep_group_cols  =  self.tier + ['time_point', 'frame']
-        if not kwargs.get('ignore_categories', params.ignore_categories):
-            cond_group_cols = ['condition', 'time_point', 'frame']
+        # if not kwargs.get('ignore_categories', params.ignore_categories):
+        #     cond_group_cols = ['condition', 'time_point', 'frame']
 
         # Expected metrics to compute stats for (their input df labels)
         metrics = [
@@ -920,8 +899,6 @@ class Stats:
             df = self.signify(df)
         if self.decimal_places:
             df = self.norm_decimals(df)
-
-        self.Frames_df = df.copy()
 
         return df
     
@@ -1340,9 +1317,77 @@ class Stats:
         if self.decimal_places:
             df = self.norm_decimals(df)
 
-        self.TimeIntervals_df = df.copy()
-
         return df
+    
+
+
+    def _assign_track_uid(
+        self, 
+        df: pd.DataFrame
+    ) -> pd.DataFrame:
+        """ Creates a unique track identifier `track_uid` by combining the default category columns (`self.DEFAULT_CATEGORIES`) present in the DataFrame. """
+
+        if 'track_uid' not in df.columns:
+            grouping_columns = [col for col in self.DEFAULT_CATEGORIES if col in df.columns]
+            if not all(col in df.columns for col in grouping_columns):
+                missing_cols = [col for col in grouping_columns if col not in df.columns]
+                raise ColumnsNotFoundError(f"Missing required columns for track_uid creation: {missing_cols}")
+
+            # Create a unique track identifier by assigning a unique integer to each combination of the grouping columns
+            df['track_uid'] = df.groupby(grouping_columns, sort=False).ngroup()
+        
+        df.set_index(['track_uid'], drop=True, append=False, inplace=True, verify_integrity=False)
+        return df
+
+
+    def _get_grouping_level(
+        self, 
+        df_cols: pd.Index,
+        grouping_level: list[str] | int | Literal['top', 'lowest'] | None = 'top',
+        *,
+        include: str | list[str] | [] = []
+    ) -> list[str]:
+
+        if isinstance(include, str):
+            include = [include]
+
+        if isinstance(grouping_level, list):
+            if not all(col in df_cols for col in grouping_level): 
+                which = [col for col in grouping_level if col not in df_cols]
+                raise ColumnsNotFoundError(f"Columns in grouping_level: {which} are not present in the DataFrame columns: {df_cols}")
+
+            return grouping_level + include
+
+        grouping_cols = [col for col in self.DEFAULT_CATEGORIES if col in df_cols]
+
+        for col in include:
+            if col not in grouping_cols:
+                grouping_cols.append(col)
+            else:
+                warnings.warn(message=f"Some columns in 'include' are already present in the default grouping columns: {grouping_cols}. They will be included only once.",
+                            category=ConflictWarning,
+                            stacklevel=2)
+
+        if is_empty(grouping_cols):
+            raise ColumnsNotFoundError(f"No grouping columns found in DataFrame columns: {df_cols}")
+        
+        if isinstance(grouping_level, int):
+            if grouping_level < 0 or grouping_level >= len(grouping_cols):
+                raise IndexError(f"Grouping level index {grouping_level} is out of bounds for DataFrame columns: {grouping_cols}")
+
+            return grouping_cols[:grouping_level]
+
+        if grouping_level == 'top':
+            return grouping_cols
+        elif grouping_level == 'lowest':
+            return grouping_cols[:2]
+    
+        elif grouping_level is None:
+            return [grouping_cols[0]]
+
+        else:
+            raise InvalidParameterError(f"Invalid grouping_level parameter: {grouping_level}. Must be a list of column names, an integer index, 'top', 'lowest', or None.")
+        
 
 
     def format_digits(self, df: pd.DataFrame, *, sig_figs: int = None, decimals: int = None) -> pd.DataFrame:

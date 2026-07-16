@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 from typing import *
 
-from ..categorizer import Categorizer, Painter
+from ...categorizer import Categorizer, Painter
 from ...various import is_empty
 from ...compute.stats import Stats
 

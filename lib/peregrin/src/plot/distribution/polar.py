@@ -6,7 +6,7 @@ from matplotlib.colors import Normalize
 from typing import Any
 from scipy import stats
 
-from ..categorizer import Painter, Categorizer
+from ...categorizer import Painter, Categorizer
 from ...compute.stats import Stats
 from ...various import Values
 

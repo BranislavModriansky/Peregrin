@@ -17,7 +17,7 @@ from ...settings import params
 from ..._pckg_exceptions._pckg_errors import *
 from ..._pckg_exceptions._pckg_warnings import *
 
-from ..categorizer import categorize
+from ...categorizer import categorize
 from ..painter import (
     retrieve_palette, retrieve_cmap, random_color, random_grey,
     cmap_lut, dyes, is_color_code,
