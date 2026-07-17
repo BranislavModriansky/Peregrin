@@ -47,11 +47,13 @@ class FileTree:
         for name, subtree in folders.items():
             self._guard(subtree, path=f"{path}/{name}")
 
+
     def make_tree(self, root_path):
         self.root_name = os.path.basename(os.path.abspath(root_path))
         self.tree = self._build(root_path)
         self._guard()
         return self
+    
 
     def show(self, tree=None, root_name=None, prefix=''):
 

@@ -173,7 +173,7 @@ class DataLoader:
 
         # Category columns used (bottom-up), 'subsubgroup' is always the file level
         category_order = ['set', 'subset', 'group', 'subgroup', 'subsubgroup']
-        used_categories = category_order[-depth:]
+        used_categories = category_order[:depth]
 
         records = []
         for labels, filepath in leaves:
