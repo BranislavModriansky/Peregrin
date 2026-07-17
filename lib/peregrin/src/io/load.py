@@ -347,7 +347,7 @@ class DataLoader:
             return stem.split(sep, 1)[0]
 
         if how == 'last':
-            return stem.rsplit(sep, 1)[0] if sep in stem else stem
+            return stem.rsplit(sep, 1)[-1] if sep in stem else stem
 
         return stem
     

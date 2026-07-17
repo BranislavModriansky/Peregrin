@@ -157,65 +157,65 @@ class Stats:
                 f"consider using 'mean' or 'median'."
             )
 
-    def get_all(
-        self, df: pd.DataFrame,
-        **kwargs
-    ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-        """
-        Compute trajectory data at all levels of aggregation 
-        (`spots`, `tracks`, `frames`, `time_intervals`) from input spot data.
+    # def get_all(
+    #     self, df: pd.DataFrame,
+    #     **kwargs
+    # ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    #     """
+    #     Compute trajectory data at all levels of aggregation 
+    #     (`spots`, `tracks`, `frames`, `time_intervals`) from input spot data.
 
-        Parameters
-        ----------
-        df : pd.DataFrame
-            Input DataFrame must contain these columns:
-            - *`condition`*
-            - *`replicate`*
-            - `track_id`
-            - `x_coordinate`
-            - `y_coordinate`
-            - `time_point`
+    #     Parameters
+    #     ----------
+    #     df : pd.DataFrame
+    #         Input DataFrame must contain these columns:
+    #         - *`condition`*
+    #         - *`replicate`*
+    #         - `track_id`
+    #         - `x_coordinate`
+    #         - `y_coordinate`
+    #         - `time_point`
 
-        ignore_categories : bool, optional
-            If True, the `condition` and `replicate` columns will be ignored in the computation, and all data will be treated as a single group.
-            If not specified, the default value is taken from the package settings. 
-            To change the default configuration and behavior throughout all computations, use `peregrin.settings(ignore_categories=...)`
+    #     ignore_categories : bool, optional
+    #         If True, the `condition` and `replicate` columns will be ignored in the computation, and all data will be treated as a single group.
+    #         If not specified, the default value is taken from the package settings. 
+    #         To change the default configuration and behavior throughout all computations, use `peregrin.settings(ignore_categories=...)`
 
-        Returns
-        -------
-        tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame] : `stats.Spots_df`, `stats.Tracks_df`, `stats.Frames_df` and `stats.TimeIntervals_df` DataFrames.
+    #     Returns
+    #     -------
+    #     tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame] : `stats.Spots_df`, `stats.Tracks_df`, `stats.Frames_df` and `stats.TimeIntervals_df` DataFrames.
 
-        See also
-        --------
-        `stats.spots()`- 
-        computes per-trajectory-point statistics, both local (previous -> current position) and cumulative (start -> current position).
+    #     See also
+    #     --------
+    #     `stats.spots()`- 
+    #     computes per-trajectory-point statistics, both local (previous -> current position) and cumulative (start -> current position).
 
-        `stats.tracks()`- 
-        computes per-whole-trajectory statistics from the Spots_df.
+    #     `stats.tracks()`- 
+    #     computes per-whole-trajectory statistics from the Spots_df.
 
-        `stats.frames()`- 
-        computes per-time-point statistics from the Spots_df.
+    #     `stats.frames()`- 
+    #     computes per-time-point statistics from the Spots_df.
 
-        `stats.time_intervals()`- 
-        computes per-time-interval statistics from the Spots_df.
+    #     `stats.time_intervals()`- 
+    #     computes per-time-interval statistics from the Spots_df.
 
-        Documentation
-        -------------
-        links..
+    #     Documentation
+    #     -------------
+    #     links..
 
-        """
+    #     """
 
-        # self.Input = df
-        spots_df = self.spots(df, **kwargs)
+    #     # self.Input = df
+    #     spots_df = self.spots(df, **kwargs)
 
-        return spots_df, self.tracks(spots_df, **kwargs), self.frames(spots_df, **kwargs), self.time_intervals(spots_df, **kwargs)
+    #     return spots_df, self.tracks(spots_df, **kwargs), self.frames(spots_df, **kwargs), self.time_intervals(spots_df, **kwargs)
 
 
     def spots(
         self, 
         df: pd.DataFrame,
         *,
-        grouping_level: Literal['top', 'lowest'] | str | int | list | None = 'top',
+        to_disk: bool = ...,
         **kwargs
     ) -> pd.DataFrame:
         """ Computes per-trajectory-point statistics, both local (previous -> current position) and cumulative (start -> current position).
@@ -326,7 +326,8 @@ class Stats:
             
             return pd.DataFrame(columns=self.COLUMNS['SPOTS'])
 
-        grouping_cols = self._get_grouping_level(df.columns, grouping_level)
+        # grouping_cols = self._get_grouping_level(df.columns, grouping_level)
+        grouping_cols = [col for col in self.DEFAULT_CATEGORIES if col in df.columns]
 
         # Create a unique track identifier (track_uid) based on the grouping columns
         df = self._assign_track_uid(df)
@@ -450,7 +451,7 @@ class Stats:
         self, 
         df: pd.DataFrame,
         *,
-        grouping_level: Literal['top', 'lowest'] | str | int | list | None = 'top',
+        to_disk: bool = ...,
         **kwargs
     ) -> pd.DataFrame:
         """ Computes a comprehensive DataFrame of track-level statistics for each trajectory of the input Spots_df.
@@ -557,7 +558,11 @@ class Stats:
             
             return pd.DataFrame(columns=self.COLUMNS['TRACKS'])
 
-        grouping_cols = self._get_grouping_level(df.columns, grouping_level)
+        
+        # grouping_cols = self._get_grouping_level(df.columns, grouping_level)
+        
+        grouping_cols = [col for col in self.DEFAULT_CATEGORIES if col in df.columns and col != 'track_id']
+
         df = self._assign_track_uid(df)
         
         if self.t_step is None:
@@ -663,7 +668,8 @@ class Stats:
         self, 
         df: pd.DataFrame,
         *,
-        grouping_level: Literal['top', 'lowest'] | str | int | list | None = 'top',
+        grouping_level: Literal['highest', 'lowest'] | str | int | list | None = 'highest',
+        to_disk: bool = ...,
         **kwargs
     ) -> pd.DataFrame:
         
@@ -737,7 +743,20 @@ class Stats:
         # Work on a copy to avoid mutating the caller's DataFrame
         df = df.copy()
         
-        grouping_cols = self._get_grouping_level(df.columns, grouping_level, exclude=['track_id'])
+        grouping_set = []
+
+        if (isinstance(grouping_level, list) 
+            and (all(isinstance(g, list) for g in grouping_level)
+                 or not any(g in df.columns for g in grouping_level))):
+                
+                for g in grouping_level:
+                    grouping_cols = self._get_grouping_level(df.columns, g, exclude='track_id')
+                    grouping_set.append(grouping_cols)
+                grouping_cols = max(grouping_set, key=len)
+        else:
+            grouping_cols = self._get_grouping_level(df.columns, grouping_level, exclude='track_id')
+            grouping_set = [grouping_cols]
+        
         df = self._assign_track_uid(df)
 
         # Stash color columns if present, to carry them over to the output
@@ -748,7 +767,7 @@ class Stats:
             _stash_keys = grouping_cols
             _color_stash = df[_stash_keys + _color_cols].drop_duplicates(subset=_stash_keys)
 
-        group_cols = grouping_cols + ['time_point', 'frame']
+        group_cols = [grouping_cols[-1]] + ['time_point', 'frame']
 
         # Expected metrics to compute stats for (their input df labels)
         metrics = [
@@ -779,8 +798,8 @@ class Stats:
                     out[f'{mout}_max'] = sgrp.max()
                     out[f'{mout}_mean'] = sgrp.mean()
                     out[f'{mout}_median'] = sgrp.median()
-                    out[f'{mout}_q25'] = sgrp.agg(self._q25)
-                    out[f'{mout}_q75'] = sgrp.agg(self._q75)
+                    # out[f'{mout}_q25'] = sgrp.agg(self._q25)
+                    # out[f'{mout}_q75'] = sgrp.agg(self._q75)
                 if self.cat_descr_err:
                     out[f'{mout}_sd'] = sgrp.std(ddof=1)
                 if self.cat_infer_err:
@@ -824,19 +843,58 @@ class Stats:
                 cos_cum=('_cos_cum', 'mean'),
             )
 
-            out[f'{prefix}_instantaneous_direction_mean'] = np.arctan2(circ['sin_dir'], circ['cos_dir'])
-            out[f'{prefix}_instantaneous_direction_var'] = 1.0 - np.hypot(circ['sin_dir'], circ['cos_dir'])
-            out[f'{prefix}_cum_direction_mean'] = np.arctan2(circ['sin_cum'], circ['cos_cum'])
-            out[f'{prefix}_cum_direction_var'] = 1.0 - np.hypot(circ['sin_cum'], circ['cos_cum'])
-            out[f'{prefix}_cum_mean_directional_change_mean'] = source.groupby(by_cols, sort=False)['cum_mean_directional_change'].mean().values
+            out[f'instantaneous_direction_mean'] = np.arctan2(circ['sin_dir'], circ['cos_dir'])
+            out[f'instantaneous_direction_var'] = 1.0 - np.hypot(circ['sin_dir'], circ['cos_dir'])
+            out[f'cum_direction_mean'] = np.arctan2(circ['sin_cum'], circ['cos_cum'])
+            out[f'cum_direction_var'] = 1.0 - np.hypot(circ['sin_cum'], circ['cos_cum'])
+            out[f'cum_mean_directional_change_mean'] = source.groupby(by_cols, sort=False)['cum_mean_directional_change'].mean().values
             return out.reset_index()
 
-        # Base level (per replicate or per condition)
-        df  = _compute_level(df, group_cols, grouping_cols[-1])
+        # Compute one frame-stats block per grouping set, then stack them.
+        level_frames = []
+        for grouping_cols in grouping_set:
+            group_cols = [grouping_cols[-1]] + ['time_point', 'frame']
 
-        # Re-attach color columns if they were present on input
-        if _color_stash is not None:
-            df = df.merge(_color_stash, on=_stash_keys, how='left')
+            # Stash color columns if present, to carry them over to the output
+            _color_cols = [c for c in df.columns if c.endswith('color')]
+            _color_stash = None
+            if _color_cols:
+                _stash_keys = grouping_cols
+                _color_stash = df[_stash_keys + _color_cols].drop_duplicates(subset=_stash_keys)
+
+            # Stash higher-level grouping columns so each lower-level group can be
+            # attributed back to its (unambiguous) parent group(s).
+            _parent_cols = grouping_cols[:-1]
+            _parent_stash = None
+            if _parent_cols:
+                _key = grouping_cols[-1]
+                _parent_stash = (
+                    df[[_key] + _parent_cols]
+                    .drop_duplicates(subset=[_key])
+                    .copy()
+                )
+                # Normalize key dtype to avoid silent merge failures
+                # (e.g. categorical vs object mismatches producing NaNs).
+                _parent_stash[_key] = _parent_stash[_key].astype('object')
+
+            level_df = _compute_level(df, group_cols, grouping_cols[-1])
+
+            # Re-attach higher-level grouping columns (parents of the lowest level)
+            if _parent_stash is not None:
+                _key = grouping_cols[-1]
+                level_df[_key] = level_df[_key].astype('object')
+                level_df = level_df.merge(_parent_stash, on=_key, how='left')
+
+            # Tag the grouping level so stacked rows remain distinguishable
+            level_df['grouping_level'] = str(grouping_cols[-1])
+
+            # Re-attach color columns if they were present on input
+            if _color_stash is not None:
+                level_df = level_df.merge(_color_stash, on=_stash_keys, how='left')
+
+            level_frames.append(level_df)
+
+        df = pd.concat(level_frames, ignore_index=True) if level_frames else pd.DataFrame()
 
         if self.significant_figures:
             df = self.signify(df)
@@ -850,7 +908,8 @@ class Stats:
         self, 
         df: pd.DataFrame,
         *,
-        grouping_level: Literal['top', 'lowest'] | str | int | list | None = 'top',
+        grouping_level: Literal['highest', 'lowest'] | str | int | list | None = 'highest',
+        to_disk: bool = ...,
         **kwargs
     ) -> pd.DataFrame:
         """ 
@@ -963,8 +1022,19 @@ class Stats:
 
         if df.empty: 
             return pd.DataFrame(columns=self.COLUMNS['TIMEINTERVALS'])
+        
+        grouping_set = []
 
-        grouping_cols = self._get_grouping_level(df.columns, grouping_level, exclude='track_id')
+        grouping_set = []
+
+        if isinstance(grouping_level, list) and all(isinstance(g, list) for g in grouping_level):
+                for g in grouping_level:
+                    grouping_cols = self._get_grouping_level(df.columns, g, exclude='track_id')
+                    grouping_set.append(grouping_cols)
+                grouping_cols = max(grouping_set, key=len)
+        else:
+            grouping_cols = self._get_grouping_level(df.columns, grouping_level, exclude='track_id')
+            grouping_set = [grouping_cols]
 
         # Stash color columns if present, to carry them over to the output
         _color_cols = [c for c in df.columns if c.endswith('color')]
@@ -1225,7 +1295,7 @@ class Stats:
     def _get_grouping_level(
         self, 
         df_cols: pd.Index,
-        grouping_level: Literal['top', 'lowest'] | str | int | list | None = 'top',
+        grouping_level: Literal['highest', 'lowest'] | str | int | list | None = 'highest',
         *,
         multiple: bool = False,
         include: str | list[str] | None = None,
@@ -1251,22 +1321,24 @@ class Stats:
             if grouping_level < 0 or grouping_level >= len(grouping_cols):
                 raise IndexError(f"Grouping level index {grouping_level} is out of bounds for DataFrame columns: {grouping_cols}")
 
-            grouping_cols = grouping_cols[:grouping_level]
+            grouping_cols = grouping_cols[:grouping_level + 1]
 
-        elif grouping_level == 'top':
-            pass
+        elif grouping_level == 'highest':
+            # Aggregate at the top of the hierarchy (broadest group).
+            grouping_cols = grouping_cols[:1]
         elif grouping_level == 'lowest':
-            grouping_cols = grouping_cols[:2]
+            # Aggregate at the bottom of the hierarchy (finest group),
+            # retaining all parent levels for attribution.
+            pass
 
         elif isinstance(grouping_level, str):
             idx = grouping_cols.index(grouping_level)
-            grouping_cols = grouping_cols[:idx]
+            grouping_cols = grouping_cols[:idx + 1]
     
         elif grouping_level is None:
             grouping_cols = [grouping_cols[0]]
-
         else:
-            raise InvalidParameterValueError(f"Invalid grouping_level parameter: {grouping_level}. Must be a list of column names, an integer index, 'top', 'lowest', or None.")
+            raise InvalidParameterValueError(f"Invalid grouping_level parameter: {grouping_level}. Must be a list of column names, an integer index, 'highest', 'lowest', or None.")
     
         for col in include:
             if col not in grouping_cols:
@@ -1659,6 +1731,7 @@ class Stats:
             'cum_straightness_ratio': 'µm',
             'cum_speed_mean': f'µm ⋅ {t_unit}⁻¹',
             'cum_mean_straight_line_speed': f'µm ⋅ {t_unit}⁻¹',
+            'cum_forward_progression_linearity': 'µm',
             'direction': 'rad',
             'directional_change': 'rad',
             'cum_sum_directional_change': 'rad',
@@ -1749,13 +1822,13 @@ class Summarize:
             "type": "type_zero",
             "missing": int(series.isna().sum()),
             "distinct": int(series.nunique(dropna=True)),
-            "top": [(idx, round(val * 100, 1)) for idx, val in value_counts.items()],
+            "highest": [(idx, round(val * 100, 1)) for idx, val in value_counts.items()],
         }
 
 
 
 stats = Stats()
-get_all = stats.get_all
+# get_all = stats.get_all
 spots = stats.spots
 tracks = stats.tracks
 frames = stats.frames

@@ -30,5 +30,3 @@ class ComputeBatch:
 
         self.dir = dir
         self.kwargs = kwargs
-
-        self.stats = Stats()
