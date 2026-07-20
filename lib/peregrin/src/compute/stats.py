@@ -66,7 +66,7 @@ class Stats:
     significant_figures: Optional[int] = None
     decimal_places: Optional[int] = None
 
-    DEFAULT_CATEGORIES = ['track_id', 'subsubgroup', 'subgroup', 'group', 'subset', 'set']
+    DEFAULT_CATEGORIES = ['track_uid', 'subsubgroup', 'subgroup', 'group', 'subset', 'set']
 
     BOOTSTRAP_RESAMPLES: int = 1000
     CONFIDENCE_LEVEL: float = 95
@@ -561,7 +561,7 @@ class Stats:
         
         # grouping_cols = self._get_grouping_level(df.columns, grouping_level)
         
-        grouping_cols = [col for col in self.DEFAULT_CATEGORIES if col in df.columns and col != 'track_id']
+        grouping_cols = [col for col in self.DEFAULT_CATEGORIES if col in df.columns]
 
         df = self._assign_track_uid(df)
         
@@ -668,7 +668,7 @@ class Stats:
         self, 
         df: pd.DataFrame,
         *,
-        grouping_level: Literal['highest', 'lowest'] | str | int | list | None = 'highest',
+        grouping_level: Literal['highest', 'lowest'] | str | int | list = 'highest',
         to_disk: bool = ...,
         **kwargs
     ) -> pd.DataFrame:
@@ -748,13 +748,13 @@ class Stats:
         if (isinstance(grouping_level, list) 
             and (all(isinstance(g, list) for g in grouping_level)
                  or not any(g in df.columns for g in grouping_level))):
-                
+
                 for g in grouping_level:
-                    grouping_cols = self._get_grouping_level(df.columns, g, exclude='track_id')
+                    grouping_cols = self._get_grouping_level(df.columns, g, exclude='track_uid')
                     grouping_set.append(grouping_cols)
                 grouping_cols = max(grouping_set, key=len)
         else:
-            grouping_cols = self._get_grouping_level(df.columns, grouping_level, exclude='track_id')
+            grouping_cols = self._get_grouping_level(df.columns, grouping_level, exclude='track_uid')
             grouping_set = [grouping_cols]
         
         df = self._assign_track_uid(df)
@@ -886,7 +886,7 @@ class Stats:
                 level_df = level_df.merge(_parent_stash, on=_key, how='left')
 
             # Tag the grouping level so stacked rows remain distinguishable
-            level_df['grouping_level'] = str(grouping_cols[-1])
+            level_df['grouping_level'] = str(grouping_cols[0])
 
             # Re-attach color columns if they were present on input
             if _color_stash is not None:
@@ -894,7 +894,13 @@ class Stats:
 
             level_frames.append(level_df)
 
-        df = pd.concat(level_frames, ignore_index=True) if level_frames else pd.DataFrame()
+        if not level_frames:
+            return pd.DataFrame(columns=self.COLUMNS['TIMEINTERVALS'])
+
+        df = pd.concat(level_frames, ignore_index=True)
+
+        # JSON-safe cleanup for Shiny/front-end serializers (no NaN/Inf in strict JSON)
+        df = df.replace([np.inf, -np.inf], np.nan)
 
         if self.significant_figures:
             df = self.signify(df)
@@ -1025,15 +1031,16 @@ class Stats:
         
         grouping_set = []
 
-        grouping_set = []
+        if (isinstance(grouping_level, list) 
+            and (all(isinstance(g, list) for g in grouping_level)
+                 or not any(g in df.columns for g in grouping_level))):
 
-        if isinstance(grouping_level, list) and all(isinstance(g, list) for g in grouping_level):
                 for g in grouping_level:
-                    grouping_cols = self._get_grouping_level(df.columns, g, exclude='track_id')
+                    grouping_cols = self._get_grouping_level(df.columns, g, exclude='track_uid')
                     grouping_set.append(grouping_cols)
                 grouping_cols = max(grouping_set, key=len)
         else:
-            grouping_cols = self._get_grouping_level(df.columns, grouping_level, exclude='track_id')
+            grouping_cols = self._get_grouping_level(df.columns, grouping_level, exclude='track_uid')
             grouping_set = [grouping_cols]
 
         # Stash color columns if present, to carry them over to the output
@@ -1073,121 +1080,6 @@ class Stats:
             
         else:
             t_step = self.t_step
-
-        # Vectorized per-track, per-lag computation
-        # Sort once; assign within-a-track sequential position for shift-based lag computation
-        temp = (
-            df[grouping_cols + ['track_uid', 'time_point', 'x_coordinate', 'y_coordinate']]
-            .copy()
-            .sort_values(['track_uid', 'time_point'])
-        )
-
-        _cols = [col for col in grouping_cols]
-        _cols = {key: key for key in _cols}
-
-        uid_col = temp.track_uid.values if 'track_uid' in temp.columns else temp.index.get_level_values('track_uid').values
-
-        # Within-a-track sequential position (0, 1, 2, …) for shift-based lag computations
-        temp['_pos'] = temp.groupby('track_uid', sort=False).cumcount()
-
-        # Number of track points per track for filtering and lag validation
-        track_sizes = temp.groupby('track_uid', sort=False).size()
-        temp['_n'] = temp['track_uid'].map(track_sizes).values if 'track_uid' in temp.columns else uid_col
-
-        # Filter out tracks with <2 points early
-        temp = temp[temp['_n'] >= 2].copy()
-
-        if temp.empty:
-            raise DataQualityError(f"No tracks with 2 or more points available for TimeIntervals computation; returning empty DataFrame.")
-
-        # Pre-compute consecutive angles (theta) for turning angle computation
-        # theta[i] = arctan2(y[i]-y[i-1], x[i]-x[i-1])
-        grp_temp = temp.groupby('track_uid', sort=False)
-        temp['_dx1']   = grp_temp['x_coordinate'].diff()
-        temp['_dy1']   = grp_temp['y_coordinate'].diff()
-        temp['_theta'] = np.arctan2(temp['_dy1'].values, temp['_dx1'].values)
-
-        max_lag = int(track_sizes.max()) - 1
-
-        # Collect raw per-pair per-lag records; aggregate later at replicate/condition levels
-        msd_records = []
-        turn_records = []
-
-        # We group once and iterate by lag
-        # For each lag, compute shifted coordinates within trajectories
-        x_arr     = temp['x_coordinate'].values
-        y_arr     = temp['y_coordinate'].values
-        theta_arr = temp['_theta'].values
-        pos_arr   = temp['_pos'].values
-        n_arr     = temp['_n'].values
-        cat_arrs  = {
-            col: temp[col].values for col in grouping_cols
-        }
-        uid_arr   = temp['track_uid'].values if 'track_uid' in temp.columns else temp.index.get_level_values('track_uid').values
-
-        for lag in range(1, max_lag + 1):
-            # Only rows where pos + lag < n (i.e., the shifted partner exists)
-            valid_mask = (pos_arr + lag) < n_arr
-
-            if not valid_mask.any():
-                break
-
-            # MSD: x[pos+lag] - x[pos] and y[pos+lag] - y[pos]
-            shifted_x = grp_temp['x_coordinate'].shift(-lag)
-            shifted_y = grp_temp['y_coordinate'].shift(-lag)
-
-            dx = shifted_x.values - x_arr
-            dy = shifted_y.values - y_arr
-
-            sq_disp = np.hypot(dy, dx)**2
-
-            valid_idx = np.where(valid_mask)[0]
-            if valid_idx.size == 0:
-                continue
-
-            # Keep raw squared-displacement pairs for pooled aggregation later
-            lag_df = pd.DataFrame({
-                'track_uid': uid_arr[valid_idx],
-                **{col: cat_arrs[col][valid_idx] for col in grouping_cols},
-                'sq_disp':   sq_disp[valid_idx],
-                'frame_lag': lag,
-                'time_lag':  lag * t_step,
-            })
-            msd_records.append(lag_df)
-
-            # Turning angles: theta[pos+lag] - theta[pos]
-            shifted_theta = grp_temp['_theta'].shift(-lag)
-            dtheta_all = shifted_theta.values - theta_arr
-            dtheta_all = (dtheta_all + np.pi) % (2 * np.pi) - np.pi
-
-            # Valid directional changes: pos >= 1 AND pos+lag < n AND both thetas finite
-            turn_valid = valid_mask & (pos_arr >= 1) & np.isfinite(theta_arr) & np.isfinite(shifted_theta.values)
-            turn_idx = np.where(turn_valid)[0]
-
-            if turn_idx.size > 0:
-                turn_df = pd.DataFrame({
-                    'track_uid': uid_arr[turn_idx],
-                    **{col: cat_arrs[col][turn_idx] for col in grouping_cols},
-                    'dtheta':    dtheta_all[turn_idx],
-                    'frame_lag': lag,
-                    'time_lag':  lag * t_step,
-                })
-                turn_records.append(turn_df)
-
-        # If no records produced, return empty
-        if not msd_records:
-            return pd.DataFrame(columns=self.COLUMNS['TIMEINTERVALS'])
-
-        # Concatenate all lag results
-        all_msd  = pd.concat(msd_records, ignore_index=True)
-        all_turn = (
-            pd.concat(turn_records, ignore_index=True)
-            if turn_records
-            else pd.DataFrame(columns=[*grouping_cols, 'track_uid', 'dtheta', 'frame_lag', 'time_lag'])
-        )
-
-        # Aggregate pooled pairs per tier × lag
-        lag_group_cols = grouping_cols + ['frame_lag', 'time_lag']
 
         def _agg_msd_turn(msd_src: pd.DataFrame, turn_src: pd.DataFrame, by_cols: list[str]) -> pd.DataFrame:
             """Aggregate pooled MSD pairs and turning-angle pairs for given grouping."""
@@ -1240,22 +1132,156 @@ class Stats:
                 if self.cat_descr_err:
                     result['directional_change_var'] = pd.Series(circ_var, index=turn_circ.index)
 
-
             return result
 
-        # Aggregate pooled pairs per tier × lag in one shot.
-        # `lag_group_cols` includes `frame_lag`, so this single groupby already
-        # partitions the aggregation per lag -- no need to loop over lags again
-        # (the earlier code duplicated the shift/compute logic in a second loop
-        # and reassigned `lags` on every iteration, silently discarding all but
-        # the last lag's result).
-        lags = _agg_msd_turn(all_msd, all_turn, lag_group_cols)
-        lags.reset_index(inplace=True)
+        def _compute_level(source: pd.DataFrame, grouping_cols: list[str]) -> pd.DataFrame:
+            """Compute time-interval stats for a single grouping level."""
 
-        if lags is None or lags.empty:
+            # Vectorized per-track, per-lag computation
+            temp = (
+                source[grouping_cols + ['track_uid', 'time_point', 'x_coordinate', 'y_coordinate']]
+                .copy()
+                .sort_values(['track_uid', 'time_point'])
+                .reset_index(drop=True)
+            )
+
+            # Integer frame index per track (0,1,2,...) based on ordered unique time points.
+            # Using dense rank makes lag pairing robust to non-uniform / missing time points:
+            # a "lag" is defined in *frames*, not in array-row offsets.
+            temp['_frame'] = (
+                temp.groupby('track_uid', sort=False)['time_point']
+                .rank(method='dense')
+                .astype('int64') - 1
+            )
+
+            # Number of frames spanned per track (max frame index), for lag validation
+            track_span = temp.groupby('track_uid', sort=False)['_frame'].transform('max')
+            temp['_n'] = track_span + 1  # frame count spanned
+
+            # Filter out tracks with <2 points early
+            track_sizes = temp.groupby('track_uid', sort=False).size()
+            valid_uids = track_sizes[track_sizes >= 2].index
+            temp = temp[temp['track_uid'].isin(valid_uids)].copy()
+
+            if temp.empty:
+                return pd.DataFrame(columns=self.COLUMNS['TIMEINTERVALS'])
+
+            # Consecutive step angles theta[i] = arctan2(dy, dx) between successive frames
+            grp_temp = temp.groupby('track_uid', sort=False)
+            temp['_dx1']   = grp_temp['x_coordinate'].diff()
+            temp['_dy1']   = grp_temp['y_coordinate'].diff()
+            temp['_theta'] = np.arctan2(temp['_dy1'].values, temp['_dx1'].values)
+
+            max_lag = int(temp['_frame'].max())
+            if max_lag < 1:
+                return pd.DataFrame(columns=self.COLUMNS['TIMEINTERVALS'])
+
+            # Build a (track_uid, frame) -> row lookup so a lag pairs points that are
+            # exactly `lag` frames apart (correct even with gaps / non-uniform spacing).
+            key = list(zip(temp['track_uid'].values, temp['_frame'].values))
+            pos_of = {k: i for i, k in enumerate(key)}
+
+            x_arr     = temp['x_coordinate'].values
+            y_arr     = temp['y_coordinate'].values
+            theta_arr = temp['_theta'].values
+            uid_arr   = temp['track_uid'].values
+            frame_arr = temp['_frame'].values
+            cat_arrs  = {col: temp[col].values for col in grouping_cols}
+
+            msd_records = []
+            turn_records = []
+
+            for lag in range(1, max_lag + 1):
+                # For every row, does a partner exactly `lag` frames ahead exist in the same track?
+                partner_keys = list(zip(uid_arr, frame_arr + lag))
+                partner_pos = np.fromiter(
+                    (pos_of.get(k, -1) for k in partner_keys),
+                    dtype=np.int64, count=len(partner_keys)
+                )
+                valid_mask = partner_pos >= 0
+                if not valid_mask.any():
+                    continue
+
+                valid_idx   = np.where(valid_mask)[0]
+                partner_idx = partner_pos[valid_idx]
+
+                dx = x_arr[partner_idx] - x_arr[valid_idx]
+                dy = y_arr[partner_idx] - y_arr[valid_idx]
+                sq_disp = dx * dx + dy * dy
+
+                lag_df = pd.DataFrame({
+                    'track_uid': uid_arr[valid_idx],
+                    **{col: cat_arrs[col][valid_idx] for col in grouping_cols},
+                    'sq_disp':   sq_disp,
+                    'frame_lag': lag,
+                    'time_lag':  lag * t_step,
+                })
+                msd_records.append(lag_df)
+
+                # Turning angle: theta at partner frame minus theta at current frame.
+                # theta is defined only where a preceding step exists (frame >= 1).
+                theta_now = theta_arr[valid_idx]
+                theta_par = theta_arr[partner_idx]
+                turn_valid = (frame_arr[valid_idx] >= 1) & np.isfinite(theta_now) & np.isfinite(theta_par)
+
+                if turn_valid.any():
+                    ti = valid_idx[turn_valid]
+                    pi = partner_idx[turn_valid]
+                    dtheta = theta_arr[pi] - theta_arr[ti]
+                    dtheta = (dtheta + np.pi) % (2 * np.pi) - np.pi
+                    turn_records.append(pd.DataFrame({
+                        'track_uid': uid_arr[ti],
+                        **{col: cat_arrs[col][ti] for col in grouping_cols},
+                        'dtheta':    dtheta,
+                        'frame_lag': lag,
+                        'time_lag':  lag * t_step,
+                    }))
+
+            if not msd_records:
+                return pd.DataFrame(columns=self.COLUMNS['TIMEINTERVALS'])
+
+            all_msd  = pd.concat(msd_records, ignore_index=True)
+            all_turn = (
+                pd.concat(turn_records, ignore_index=True)
+                if turn_records
+                else pd.DataFrame(columns=[*grouping_cols, 'track_uid', 'dtheta', 'frame_lag', 'time_lag'])
+            )
+
+            lag_group_cols = grouping_cols + ['frame_lag', 'time_lag']
+            lags = _agg_msd_turn(all_msd, all_turn, lag_group_cols)
+            lags.reset_index(inplace=True)
+
+            return lags
+
+        # Compute one time-interval block per grouping set, then stack them.
+        level_frames = []
+        for grouping_cols in grouping_set:
+
+            # Stash color columns if present, to carry them over to the output
+            _color_cols = [c for c in df.columns if c.endswith('color')]
+            _color_stash = None
+            if _color_cols:
+                _stash_keys = grouping_cols
+                _color_stash = df[_stash_keys + _color_cols].drop_duplicates(subset=_stash_keys)
+
+            level_df = _compute_level(df, grouping_cols)
+
+            if level_df.empty:
+                continue
+
+            # Tag the grouping level so stacked rows remain distinguishable
+            level_df['grouping_level'] = str(grouping_cols[0])
+
+            # Re-attach color columns if they were present on input
+            if _color_stash is not None:
+                level_df = level_df.merge(_color_stash, on=_stash_keys, how='left')
+
+            level_frames.append(level_df)
+
+        if not level_frames:
             return pd.DataFrame(columns=self.COLUMNS['TIMEINTERVALS'])
 
-        df = lags.copy()
+        df = pd.concat(level_frames, ignore_index=True)
 
         # JSON-safe cleanup for Shiny/front-end serializers (no NaN/Inf in strict JSON)
         df = df.replace([np.inf, -np.inf], np.nan)
@@ -1322,24 +1348,20 @@ class Stats:
                 raise IndexError(f"Grouping level index {grouping_level} is out of bounds for DataFrame columns: {grouping_cols}")
 
             grouping_cols = grouping_cols[:grouping_level + 1]
-
         elif grouping_level == 'highest':
             # Aggregate at the top of the hierarchy (broadest group).
-            grouping_cols = grouping_cols[:1]
+            grouping_cols = [grouping_cols[-1]]
         elif grouping_level == 'lowest':
             # Aggregate at the bottom of the hierarchy (finest group),
             # retaining all parent levels for attribution.
             pass
-
         elif isinstance(grouping_level, str):
             idx = grouping_cols.index(grouping_level)
             grouping_cols = grouping_cols[:idx + 1]
-    
-        elif grouping_level is None:
-            grouping_cols = [grouping_cols[0]]
         else:
             raise InvalidParameterValueError(f"Invalid grouping_level parameter: {grouping_level}. Must be a list of column names, an integer index, 'highest', 'lowest', or None.")
     
+
         for col in include:
             if col not in grouping_cols:
                 grouping_cols.append(col)
@@ -1347,9 +1369,12 @@ class Stats:
                 warnings.warn(message=f"Some columns in 'include' are already present in the default grouping columns: {grouping_cols}. They will be included only once.",
                             category=ConflictWarning,
                             stacklevel=2)
-        
+
         if not is_empty(exclude):
             grouping_cols = [col for col in grouping_cols if col not in exclude]
+
+            if len(grouping_cols) == 0:
+                grouping_cols = ['track_uid']
 
         return grouping_cols
     
