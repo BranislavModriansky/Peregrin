@@ -9,9 +9,9 @@ from typing import Any, Literal
 from pandas.api.types import is_object_dtype
 from math import floor, ceil
 
-from .._pckg_exceptions._pckg_errors import FilteringError
+from .._pckg_exceptions._pckg_errors import *
 from ..various import clock, is_empty
-from .stats import Stats
+from ..compute.stats import stats
 
 
 # TODO: fix reindexing so that data is then later on plotted correctly.
@@ -48,7 +48,7 @@ class Inventory1D:
     track_data = pd.DataFrame()
 
 
-class Filter1D:
+class Filter:
 
     noticequeue: Any = None
 
@@ -442,3 +442,6 @@ class Filter1D:
 class Filter2D:
     ...
 
+
+
+filter = Filter()
