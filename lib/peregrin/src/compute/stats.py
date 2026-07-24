@@ -12,6 +12,8 @@ from ..settings import params
 from .._pckg_exceptions._pckg_errors import *
 from .._pckg_exceptions._pckg_warnings import *
 
+
+
 class Stats:
     """
     A class with methods for computing trajectory statistics at various levels of aggregation:
