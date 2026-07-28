@@ -13,6 +13,79 @@ from .._pckg_exceptions._pckg_errors import *
 from .._pckg_exceptions._pckg_warnings import *
 
 
+# ---------------------------------------------------------------------------
+# Metric registry
+# ---------------------------------------------------------------------------
+class MetricRegistry:
+    """
+    Maps an output column name -> a callable that computes that single column.
+
+    The driver groups the source data once, builds a shared context dict, then
+    invokes only the requested computers. This removes the need for per-column
+    conditional statements at compute time.
+
+    A `gate` classifies each column so that, when `subset` is None, only the
+    columns enabled by the current statistical flags are computed.
+
+    gate values:
+        'always'    -> always produced (e.g. contribution counts)
+        'descr'     -> produced only when cat_descr is True
+        'descr_err' -> produced only when cat_descr_err is True
+        'infer_err' -> produced only when cat_infer_err is True
+    """
+
+    def __init__(self) -> None:
+        self._computers: Dict[str, Callable] = {}
+        self._gate: Dict[str, str] = {}
+        # Preserve registration order for deterministic column ordering.
+        self._order: List[str] = []
+
+    def register(self, column: str, *, gate: str = 'always') -> Callable:
+        def _wrap(fn: Callable) -> Callable:
+            if column not in self._computers:
+                self._order.append(column)
+            self._computers[column] = fn
+            self._gate[column] = gate
+            return fn
+        return _wrap
+
+    def add(self, column: str, fn: Callable, *, gate: str = 'always') -> None:
+        """Imperative registration (non-decorator)."""
+        self.register(column, gate=gate)(fn)
+
+    def all_columns(self, *, descr: bool, descr_err: bool, infer_err: bool) -> List[str]:
+        """All columns enabled by the given statistical flags (subset=None case)."""
+        allowed = {'always'}
+        if descr:
+            allowed.add('descr')
+        if descr_err:
+            allowed.add('descr_err')
+        if infer_err:
+            allowed.add('infer_err')
+        return [c for c in self._order if self._gate[c] in allowed]
+
+    def resolve(
+        self,
+        subset: Optional[List[str]],
+        *,
+        descr: bool,
+        descr_err: bool,
+        infer_err: bool,
+    ) -> List[str]:
+        """Determine which registered columns to compute."""
+        if subset is None:
+            return self.all_columns(descr=descr, descr_err=descr_err, infer_err=infer_err)
+        # Keep only requested columns that are registered, preserving registry order.
+        requested = set(subset)
+        return [c for c in self._order if c in requested and c in self._computers]
+
+    def compute(self, wanted: List[str], ctx: dict) -> pd.DataFrame:
+        """Run the requested computers against a shared context."""
+        out: Dict[str, Any] = {}
+        for col in wanted:
+            out[col] = self._computers[col](ctx)
+        return pd.DataFrame(out)
+
 
 class Stats:
     """
@@ -26,7 +99,7 @@ class Stats:
     ----------
     cat_descr : bool, default True
         If True, descriptive statistics (min, max, mean, median, q25, q75) will be computed for categories.
-    
+
     cat_descr_err : bool, default True
         If True, descriptive error statistics (std) will be computed.
 
@@ -50,11 +123,11 @@ class Stats:
 
     CONFIDENCE_LEVEL : int, default 95
         *Confidence level (%) to use when calculating confidence intervals.*
-    
+
     CI_STATISTIC : str, default 'mean'
         *Statistic to calculate confidence intervals for (e.g. 'mean', 'median').*
 
-    
+
     Methods
     -------
     GetAllData(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]
@@ -141,7 +214,7 @@ class Stats:
                 self.INFER_ERR.append('ci')
         else:
             self.INFER_ERR = []
-        
+
         # Custom aggregation functions
         self.CUSTOM_AGG_FUNCTIONS: Dict[str, Callable] = {
             'q25': self._q25,
@@ -159,12 +232,181 @@ class Stats:
                 f"consider using 'mean' or 'median'."
             )
 
+        # Build metric registries once per instance.
+        self._frames_registry = self._build_frames_registry()
+        self._ti_registry = self._build_time_intervals_registry()
+
+    # -----------------------------------------------------------------------
+    # Registry builders
+    # -----------------------------------------------------------------------
+    def _build_frames_registry(self) -> MetricRegistry:
+        """Register one computer per FRAMES output column."""
+        reg = MetricRegistry()
+
+        # Input metric label -> output metric label.
+        metric_out = {
+            'cum_track_length': 'cum_track_length',
+            'cum_track_displacement': 'cum_track_displacement',
+            'cum_straightness_ratio': 'cum_straightness_ratio',
+            'cum_speed_mean': 'cum_speed_mean',
+            'distance': 'instantaneous_speed',
+            'cum_mean_straight_line_speed': 'cum_mean_straight_line_speed',
+            'cum_forward_progression_linearity': 'cum_forward_progression_linearity',
+            'cum_sum_directional_change': 'cum_sum_directional_change',
+            'cum_mean_directional_change': 'cum_mean_directional_change',
+        }
+
+        # --- Scalar statistic factories -------------------------------------
+        def _make_scalar(src_col: str, agg: str) -> Callable:
+            return lambda ctx: getattr(ctx['grp'][src_col], agg)()
+
+        def _make_std(src_col: str) -> Callable:
+            return lambda ctx: ctx['grp'][src_col].std(ddof=1)
+
+        def _make_sem(src_col: str) -> Callable:
+            return lambda ctx: ctx['grp'][src_col].agg(self.sem)
+
+        def _make_ci(src_col: str, which: int) -> Callable:
+            def _fn(ctx: dict) -> pd.Series:
+                cache = ctx['ci_cache']
+                if src_col not in cache:
+                    s = ctx['grp'][src_col].agg(self.ci)
+                    cache[src_col] = pd.DataFrame(
+                        s.tolist(), index=s.index, columns=['low', 'high']
+                    )
+                return cache[src_col].iloc[:, which]
+            return _fn
+
+        for src, mout in metric_out.items():
+            reg.add(f'{mout}_min', _make_scalar(src, 'min'), gate='descr')
+            reg.add(f'{mout}_max', _make_scalar(src, 'max'), gate='descr')
+            reg.add(f'{mout}_mean', _make_scalar(src, 'mean'), gate='descr')
+            reg.add(f'{mout}_median', _make_scalar(src, 'median'), gate='descr')
+            reg.add(f'{mout}_sd', _make_std(src), gate='descr_err')
+            reg.add(f'{mout}_sem', _make_sem(src), gate='infer_err')
+
+            if 'ci' in self.INFER_ERR:
+                low = f'{mout}_{self.CI_STATISTIC}_ci{self.CONFIDENCE_LEVEL}_low'
+                high = f'{mout}_{self.CI_STATISTIC}_ci{self.CONFIDENCE_LEVEL}_high'
+                reg.add(low, _make_ci(src, 0), gate='infer_err')
+                reg.add(high, _make_ci(src, 1), gate='infer_err')
+
+        # --- Circular statistics --------------------------------------------
+        def _circ(kind: str) -> Callable:
+            def _fn(ctx: dict) -> pd.Series:
+                c = ctx['circ']
+                if kind == 'inst_mean':
+                    return np.arctan2(c['sin_dir'], c['cos_dir'])
+                if kind == 'inst_var':
+                    return 1.0 - np.hypot(c['sin_dir'], c['cos_dir'])
+                if kind == 'cum_mean':
+                    return np.arctan2(c['sin_cum'], c['cos_cum'])
+                if kind == 'cum_var':
+                    return 1.0 - np.hypot(c['sin_cum'], c['cos_cum'])
+            return _fn
+
+        reg.add('instantaneous_direction_mean', _circ('inst_mean'), gate='descr')
+        reg.add('instantaneous_direction_var', _circ('inst_var'), gate='descr')
+        reg.add('cum_direction_mean', _circ('cum_mean'), gate='descr')
+        reg.add('cum_direction_var', _circ('cum_var'), gate='descr')
+        reg.add(
+            'cum_mean_directional_change_mean',
+            lambda ctx: ctx['src']
+            .groupby(ctx['by'], sort=False, observed=True)['cum_mean_directional_change']
+            .mean(),
+            gate='descr',
+        )
+
+        return reg
+
+    def _build_time_intervals_registry(self) -> MetricRegistry:
+        """Register one computer per TIMEINTERVALS output column."""
+        reg = MetricRegistry()
+
+        # --- MSD scalar statistics ------------------------------------------
+        reg.add('MSD', lambda ctx: ctx['msd_grp'].mean(), gate='descr')
+        reg.add('MSD_sd', lambda ctx: ctx['msd_grp'].std(ddof=1), gate='descr_err')
+        reg.add('MSD_sem', lambda ctx: ctx['msd_grp'].agg(self.sem), gate='infer_err')
+
+        def _make_ci(which: int) -> Callable:
+            def _fn(ctx: dict) -> pd.Series:
+                cache = ctx['ci_cache']
+                if 'MSD' not in cache:
+                    s = ctx['msd_grp'].agg(self.ci)
+                    cache['MSD'] = pd.DataFrame(
+                        s.tolist(), index=s.index, columns=['low', 'high']
+                    )
+                return cache['MSD'].iloc[:, which]
+            return _fn
+
+        if 'ci' in self.INFER_ERR:
+            low = f'MSD_{self.CI_STATISTIC}_ci{self.CONFIDENCE_LEVEL}_low'
+            high = f'MSD_{self.CI_STATISTIC}_ci{self.CONFIDENCE_LEVEL}_high'
+            reg.add(low, _make_ci(0), gate='infer_err')
+            reg.add(high, _make_ci(1), gate='infer_err')
+
+        # --- Contribution counts (always produced) --------------------------
+        reg.add(
+            'tracks_contributing',
+            lambda ctx: ctx['msd_grouped']['track_uid'].nunique().astype(int),
+            gate='always',
+        )
+        reg.add(
+            'position_pairs_contributing',
+            lambda ctx: ctx['msd_grp'].size().astype(int),
+            gate='always',
+        )
+
+        # --- Turning-angle circular statistics ------------------------------
+        def _circ_stats(ctx: dict) -> Optional[dict]:
+            """Compute (and cache) circular mean/var of turning angles."""
+            cache = ctx['circ_cache']
+            if 'done' in cache:
+                return cache.get('data')
+
+            turn_src = ctx['turn_src']
+            if turn_src.empty:
+                cache['done'] = True
+                cache['data'] = None
+                return None
+
+            turn_sin = turn_src.assign(
+                _s=np.sin(turn_src.dtheta.values),
+                _c=np.cos(turn_src.dtheta.values),
+            )
+            turn_circ = turn_sin.groupby(ctx['by'], sort=False, observed=True).agg(
+                ms=('_s', 'mean'),
+                mc=('_c', 'mean'),
+            )
+            circ_mean = np.arctan2(turn_circ.ms.values, turn_circ.mc.values)
+            circ_R = np.hypot(turn_circ.ms.values, turn_circ.mc.values)
+            data = {
+                'mean': pd.Series(np.rad2deg(np.abs(circ_mean)), index=turn_circ.index),
+                'var': pd.Series(1.0 - circ_R, index=turn_circ.index),
+            }
+            cache['done'] = True
+            cache['data'] = data
+            return data
+
+        def _circ_mean(ctx: dict) -> Optional[pd.Series]:
+            data = _circ_stats(ctx)
+            return data['mean'] if data is not None else None
+
+        def _circ_var(ctx: dict) -> Optional[pd.Series]:
+            data = _circ_stats(ctx)
+            return data['var'] if data is not None else None
+
+        reg.add('directional_change_mean', _circ_mean, gate='descr')
+        reg.add('directional_change_var', _circ_var, gate='descr_err')
+
+        return reg
+
     # def get_all(
     #     self, df: pd.DataFrame,
     #     **kwargs
     # ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     #     """
-    #     Compute trajectory data at all levels of aggregation 
+    #     Compute trajectory data at all levels of aggregation
     #     (`spots`, `tracks`, `frames`, `time_intervals`) from input spot data.
 
     #     Parameters
@@ -180,7 +422,7 @@ class Stats:
 
     #     ignore_categories : bool, optional
     #         If True, the `condition` and `replicate` columns will be ignored in the computation, and all data will be treated as a single group.
-    #         If not specified, the default value is taken from the package settings. 
+    #         If not specified, the default value is taken from the package settings.
     #         To change the default configuration and behavior throughout all computations, use `peregrin.settings(ignore_categories=...)`
 
     #     Returns
@@ -189,16 +431,16 @@ class Stats:
 
     #     See also
     #     --------
-    #     `stats.spots()`- 
+    #     `stats.spots()`-
     #     computes per-trajectory-point statistics, both local (previous -> current position) and cumulative (start -> current position).
 
-    #     `stats.tracks()`- 
+    #     `stats.tracks()`-
     #     computes per-whole-trajectory statistics from the Spots_df.
 
-    #     `stats.frames()`- 
+    #     `stats.frames()`-
     #     computes per-time-point statistics from the Spots_df.
 
-    #     `stats.time_intervals()`- 
+    #     `stats.time_intervals()`-
     #     computes per-time-interval statistics from the Spots_df.
 
     #     Documentation
@@ -214,7 +456,7 @@ class Stats:
 
 
     def spots(
-        self, 
+        self,
         df: pd.DataFrame,
         *,
         to_disk: bool = ...,
@@ -233,7 +475,7 @@ class Stats:
 
         ignore_categories : bool, optional
             If True, the `condition` and `replicate` columns will be ignored in the computation, and all data will be treated as a single group.
-            If not specified, the default value is taken from the package settings. 
+            If not specified, the default value is taken from the package settings.
             To change the default configuration and behavior throughout all computations, use `peregrin.settings(ignore_categories=...)`
 
         Returns
@@ -249,19 +491,19 @@ class Stats:
             - `x_coordinate`
             - `y_coordinate`
 
-            - `distance` = 
+            - `distance` =
             euclidean distance between consecutive (previous -> current) positions
 
-            - `cum_track_length` = 
+            - `cum_track_length` =
             cumulative sum of `distance` along the track up to the current position
 
-            - `cum_track_displacement` = 
+            - `cum_track_displacement` =
             euclidean distance from the starting position of the track to the current position
 
-            - `cum_straightness_ratio = 
+            - `cum_straightness_ratio =
             cum_track_displacement / cum_track_length`
 
-            - `cum_speed_mean` = 
+            - `cum_speed_mean` =
             `cum_track_length / frame`
 
             - `cum_mean_straight_line_speed` =
@@ -270,44 +512,44 @@ class Stats:
             - `cum_forward_progression_linearity` =
             calculated as `cum_mean_straight_line_speed` / `cum_speed_mean`
 
-            - `direction` = 
+            - `direction` =
             instantaneous direction of motion in radians `np.arctan2(Δy, Δx)`. Calculated between the previous and current positions.
 
-            - `directional_change` = 
+            - `directional_change` =
             absolute turning angle (degrees) between consecutive directions, calculated as the angular difference between the current and previous `direction` values, wrapped to the range [-180°, 180°].
 
             - `cum_sum_directional_change` =
             cumulative sum of `directional_change` along the track up to the current position.
 
-            - `cum_mean_directional_change` = 
+            - `cum_mean_directional_change` =
             mean of all absolute `directional_change` values along the track up to the current position
 
-            - `cum_mean_directional_change_rate` = 
+            - `cum_mean_directional_change_rate` =
             mean of all absolute `directional_change` values / (current track point count * `t_step`).
 
-            - `cum_direction_mean` = 
+            - `cum_direction_mean` =
             mean of directions of motion from the starting to the current position.
 
-            - `cum_direction_var` = 
+            - `cum_direction_var` =
             cumulative direction variance from the starting to the current position.
 
-            - *`other`* = 
+            - *`other`* =
             *any additional columns from the input DataFrame that are not part of the above list will be retained in the output if they contain any non-NA values; otherwise, they will be dropped.*
 
             \n See documentation: links..
 
         See also
         --------
-        `stats.get_all()` - 
+        `stats.get_all()` -
         computes and returnes all DataFrames (Spots_df, Tracks_df, Frames_df, TimeIntervals_df) from input spot data in one call.
 
-        `stats.tracks()` - 
+        `stats.tracks()` -
         computes per-whole-trajectory statistics from the Spots_df.
 
-        `stats.frames()` - 
+        `stats.frames()` -
         computes per-time-point statistics from the Spots_df.
 
-        `stats.time_intervals()` - 
+        `stats.time_intervals()` -
         computes per-time-interval statistics from the Spots_df.
 
         Documentation
@@ -320,10 +562,10 @@ class Stats:
         df = df.copy()
 
         if df.empty:
-            warnings.warn(message="Input DataFrame is empty. No computation performed.", 
-                          category=DataFrameWarning, 
+            warnings.warn(message="Input DataFrame is empty. No computation performed.",
+                          category=DataFrameWarning,
                           stacklevel=2)
-            
+
             return pd.DataFrame(columns=self.COLUMNS['SPOTS'])
 
         # grouping_cols = self._get_grouping_level(df.columns, grouping_level)
@@ -343,8 +585,8 @@ class Stats:
                 t_step = float(t_steps[0])
             else:
                 t_step = float(np.median(t_steps))
-                warnings.warn(message=f"Time points are not uniformly spaced -> this will most probably lead to incorrect data computation. (spot stats + time stats)\nObserved time steps:\n{t_steps}\nUsing: {t_step}", 
-                                category=TimePointWarning, 
+                warnings.warn(message=f"Time points are not uniformly spaced -> this will most probably lead to incorrect data computation. (spot stats + time stats)\nObserved time steps:\n{t_steps}\nUsing: {t_step}",
+                                category=TimePointWarning,
                                 stacklevel=2)
         else:
             t_step = self.t_step
@@ -412,7 +654,7 @@ class Stats:
         # First two points of each track have no directional change; set them to NaN
         df.loc[df['directional_change'].isna(), ['cum_mean_directional_change']] = np.nan
         df['cum_mean_directional_change_rate'] = df['cum_mean_directional_change'] / (cumulative_count * t_step)
-        
+
         # Cumulative direction of motion (circular mean and variance) calculations
         # Reuse already-computed dy/dx instead of recomputing arctan2.
         _dir = np.arctan2(dy, dx)
@@ -448,7 +690,7 @@ class Stats:
 
 
     def tracks(
-        self, 
+        self,
         df: pd.DataFrame,
         *,
         to_disk: bool = ...,
@@ -471,7 +713,7 @@ class Stats:
 
         ignore_categories : bool, optional
             If True, the `condition` and `replicate` columns will be ignored in the computation, and all data will be treated as a single group.
-            If not specified, the default value is taken from the package settings. 
+            If not specified, the default value is taken from the package settings.
             To change the default configuration and behavior throughout all computations, use `peregrin.settings(ignore_categories=...)`
 
         Returns
@@ -487,26 +729,26 @@ class Stats:
 
             - `x_location`-
             The mean X position of the track's starting position.
-            
-            - `track_length`- 
+
+            - `track_length`-
             Total length of the track (sum of `distance`).
 
-            - `speed_min`, `speed_max`, `speed_mean`, `speed_sd`, `speed_median` - 
+            - `speed_min`, `speed_max`, `speed_mean`, `speed_sd`, `speed_median` -
             of the `Distances` between consecutive points (step lengths).
 
-            - `max_distance_reached`- 
+            - `max_distance_reached`-
             Maximum Euclidean distance from the starting position reached at any point along the track.
 
-            - `track_start_frame`- 
+            - `track_start_frame`-
             frame number of the first point in the track.
 
-            - `track_end_frame`- 
+            - `track_end_frame`-
             frame number of the last point in the track.
 
-            - `track_displacement`- 
+            - `track_displacement`-
             Euclidean distance from the starting position to the end position of the track.
 
-            - `straightness_ratio`- 
+            - `straightness_ratio`-
             Track's straigtness calculated as `track_displacement` / `track_length`.
 
             - `mean_straight_line_speed`-
@@ -515,35 +757,35 @@ class Stats:
             - `forward_progression_linearity`-
             Calculated as `mean_straight_line_speed` / `speed_mean`
 
-            - `track_points`- 
+            - `track_points`-
             The number of points the trajectory is comprised of.
 
-            - `direction_mean`- 
+            - `direction_mean`-
             Circular mean of the `direction` values.
 
-            - `mean_directional_change`- 
+            - `mean_directional_change`-
             Mean of absolute directional changes per track (degrees).
 
             - `mean_directional_change_rate`-
             `mean_directional_change` / (`track_points` * `t_step`)
 
-            - `direction_var`- 
+            - `direction_var`-
             Circular variance of the `direction` values.
 
-            - *`other`* - 
+            - *`other`* -
             any additional columns from the input DataFrame that are not part of the above list will be retained in the output if they contain any non-NA values; otherwise, they will be dropped.*
 
             \n See documentation: links..
 
         See also
         --------
-        `stats.get_all()`- 
+        `stats.get_all()`-
         computes all DataFrames (Spots_df, Tracks_df, Frames_df, TimeIntervals_df) from raw spot data in one call.
 
-        `stats.frames()`- 
+        `stats.frames()`-
         computes per-time-point statistics from the Spots_df.
 
-        `stats.time_intervals()`- 
+        `stats.time_intervals()`-
         computes per-time-interval statistics from the Spots_df.
 
         """
@@ -552,24 +794,24 @@ class Stats:
         df = df.copy()
 
         if df.empty:
-            warnings.warn(message="Input DataFrame is empty. No computation performed.", 
-                          category=DataFrameWarning, 
+            warnings.warn(message="Input DataFrame is empty. No computation performed.",
+                          category=DataFrameWarning,
                           stacklevel=2)
-            
+
             return pd.DataFrame(columns=self.COLUMNS['TRACKS'])
 
-        
+
         # grouping_cols = self._get_grouping_level(df.columns, grouping_level)
-        
+
         grouping_cols = [col for col in self.DEFAULT_CATEGORIES if col in df.columns]
 
         df = self._assign_track_uid(df)
-        
+
         if self.t_step is None:
             _t = df.copy()
             _t.sort_values('time_point', inplace=True)
             t_steps = np.diff(_t.time_point.unique())
-            
+
             if np.all(t_steps == t_steps[0]):
                 t_step = float(t_steps[0])
             else:
@@ -598,7 +840,7 @@ class Stats:
             'track_length': ('distance', 'sum'),
         }
         for label, func in speed_agg_spec.items():
-            agg_spec[label] = ('distance', func) 
+            agg_spec[label] = ('distance', func)
 
         # Add coordinates first/last for displacement calculation
         agg_spec['start_x'] = ('x_coordinate', 'first')
@@ -615,7 +857,7 @@ class Stats:
         agg_spec['track_start_time'] = ('time_point', 'min')
         agg_spec['track_end_frame'] = ('frame', 'max')
         agg_spec['track_end_time'] = ('time_point', 'max')
-        
+
         agg_spec['mean_straight_line_speed'] = ('cum_mean_straight_line_speed', 'last')
         agg_spec['forward_progression_linearity'] = ('cum_forward_progression_linearity', 'last')
 
@@ -625,7 +867,7 @@ class Stats:
         agg_spec['mean_directional_change_rate'] = ('cum_mean_directional_change_rate', 'last')
 
         agg = grp.agg(**agg_spec)
-        
+
         # If colors were assigned, carry them over
         for col in df.columns:
             if col.endswith('color'):
@@ -655,25 +897,26 @@ class Stats:
                 df = df.drop(columns=[col])
 
         df.drop_duplicates(inplace=True)
-        
+
         if self.significant_figures:
             df = self.signify(df)
         if self.decimal_places:
             df = self.norm_decimals(df)
-        
+
         return df
-    
+
 
     def frames(
-        self, 
+        self,
         df: pd.DataFrame,
+        subset: list[str] = None,
         *,
         grouping_level: Literal['highest', 'lowest'] | str | int | list = 'highest',
         to_disk: bool = ...,
         **kwargs
     ) -> pd.DataFrame:
-        
-        """ 
+
+        """
         Computes time point statistics for each category (group). Specifically for example:
 
         - per replicate - across all trajectories of the same `replicate`
@@ -693,15 +936,21 @@ class Stats:
             - `direction`
             - `cum_direction_mean`
 
+        subset : list[str], optional
+            If provided, only the listed metric columns are computed. The returned
+            DataFrame still includes the grouping/category columns as well as
+            `time_point` and `frame`. If None (default), all metrics enabled by the
+            current statistical flags are computed.
+
         ignore_categories : bool, optional
             If True, the `condition` and `replicate` columns will be ignored in the computation, and all data will be treated as a single group.
-            If not specified, the default value is taken from the package settings. 
+            If not specified, the default value is taken from the package settings.
             To change the default configuration and behavior throughout all computations, use `peregrin.settings(ignore_categories=...)`
 
         Returns
         -------
         pd.DataFrame
-            A DataFrame with one row per unique combination of `condition` × `replicate` × `time_point` 
+            A DataFrame with one row per unique combination of `condition` × `replicate` × `time_point`
             if `ignore_categories` is False, otherwise a single row for all data. It contains the following columns:
 
             - `time_point`
@@ -710,10 +959,10 @@ class Stats:
             \n`per_(category)_(metric)_`...
                 - ***descriptive base statistics:***  `min`, `max`, `mean`, `median`, `q25`, `q75` (iqr) if `cat_descr` is set `True` when initializing the `stats` class
                 - ***descriptive error statistics:*** `std` if `descr_descr_err` is set `True` when initializing the `stats` class
-                - ***inferative error statistics:***  `sem`, if `descr_infer_err` is set `True` when initializing the `stats` class, 
+                - ***inferative error statistics:***  `sem`, if `descr_infer_err` is set `True` when initializing the `stats` class,
                 `(CI_STATISTIC)_ci(CONFIDENCE_LEVEL)_low` and `(CI_STATISTIC)_ci(CONFIDENCE_LEVEL)_high` (confidence interval) if both `descr_infer_err` and `bootstrap_ci` are set `True`
                 - ***circular statistics:*** `mean` (circular mean) and `var` (circular variance) calculated for each of `direction` and `cum_direction`.
-            
+
             - for each of these metrics
                 - `cum_track_length`
                 - `cum_track_displacement`
@@ -729,23 +978,23 @@ class Stats:
 
         See also
         --------
-        `Stats.get_all()`- 
+        `Stats.get_all()`-
         computes all DataFrames (Spots_df, Tracks_df, Frames_df, TimeIntervals_df) from raw spot data in one call.
 
-        `Stats.tracks()`- 
+        `Stats.tracks()`-
         computes per-whole-trajectory statistics from the Spots_df.
 
-        `Stats.time_intervals()`- 
+        `Stats.time_intervals()`-
         computes per-time-interval statistics from the Spots_df.
 
         """
 
         # Work on a copy to avoid mutating the caller's DataFrame
         df = df.copy()
-        
+
         grouping_set = []
 
-        if (isinstance(grouping_level, list) 
+        if (isinstance(grouping_level, list)
             and (all(isinstance(g, list) for g in grouping_level)
                  or not any(g in df.columns for g in grouping_level))):
 
@@ -756,98 +1005,59 @@ class Stats:
         else:
             grouping_cols = self._get_grouping_level(df.columns, grouping_level, exclude='track_uid')
             grouping_set = [grouping_cols]
-        
+
         df = self._assign_track_uid(df)
 
-        # Stash color columns if present, to carry them over to the output
-        _color_cols = [c for c in df.columns if c.endswith('color')]
-        _color_stash = None
-        if _color_cols:
-            # Build a lookup keyed by the replicate/condition grouping columns
-            _stash_keys = grouping_cols
-            _color_stash = df[_stash_keys + _color_cols].drop_duplicates(subset=_stash_keys)
+        # Resolve which metric columns to compute once (respecting subset & flags).
+        wanted = self._frames_registry.resolve(
+            subset,
+            descr=self.cat_descr,
+            descr_err=self.cat_descr_err,
+            infer_err=self.cat_infer_err,
+        )
 
-        group_cols = [grouping_cols[-1]] + ['time_point', 'frame']
+        # Circular columns require building a sin/cos context. Only do so if needed.
+        _circ_cols = {
+            'instantaneous_direction_mean', 'instantaneous_direction_var',
+            'cum_direction_mean', 'cum_direction_var',
+        }
+        _need_circ = bool(_circ_cols & set(wanted))
 
-        # Expected metrics to compute stats for (their input df labels)
-        metrics = [
-            'cum_track_length',
-            'cum_track_displacement',
-            'cum_straightness_ratio',
-            'cum_speed_mean',
-            'distance',
-            'cum_mean_straight_line_speed',
-            'cum_forward_progression_linearity',
-            'cum_sum_directional_change',
-            'cum_mean_directional_change',
-        ]
-        # (output df labels)
-        metric_out = {m: m for m in metrics}
-        metric_out['distance'] = 'instantaneous_speed'
-
-        def _compute_level(source: pd.DataFrame, by_cols: list[str], prefix: str) -> pd.DataFrame:
+        def _compute_level(source: pd.DataFrame, by_cols: list[str]) -> pd.DataFrame:
             grp = source.groupby(by_cols, sort=False, observed=True)
-            out = pd.DataFrame(index=grp.size().index)
+            index = grp.size().index
 
-            # Batch scalar statistics via a single named-agg call
-            for m in metrics:
-                mout = metric_out[m]
-                sgrp = grp[m]
-                if self.cat_descr:
-                    out[f'{mout}_min'] = sgrp.min()
-                    out[f'{mout}_max'] = sgrp.max()
-                    out[f'{mout}_mean'] = sgrp.mean()
-                    out[f'{mout}_median'] = sgrp.median()
-                    # out[f'{mout}_q25'] = sgrp.agg(self._q25)
-                    # out[f'{mout}_q75'] = sgrp.agg(self._q75)
-                if self.cat_descr_err:
-                    out[f'{mout}_sd'] = sgrp.std(ddof=1)
-                if self.cat_infer_err:
-                    out[f'{mout}_sem'] = sgrp.agg(self.sem)
-                    if 'ci' in self.INFER_ERR:
-                        ci_series = sgrp.agg(self.ci)
-                        ci_unpacked = pd.DataFrame(
-                            ci_series.tolist(),
-                            index=ci_series.index,
-                            columns=[
-                                f'{mout}_{self.CI_STATISTIC}_ci{self.CONFIDENCE_LEVEL}_low',
-                                f'{mout}_{self.CI_STATISTIC}_ci{self.CONFIDENCE_LEVEL}_high',
-                            ],
-                        )
-                        for c in ci_unpacked.columns:
-                            out[c] = ci_unpacked[c]
+            circ = None
+            if _need_circ:
+                dir_vals = pd.to_numeric(source['direction'], errors='coerce').to_numpy(dtype=float)
+                cum_vals = pd.to_numeric(source['cum_direction_mean'], errors='coerce').to_numpy(dtype=float)
 
-            # Circular statistics: compute sin/cos
-            dir_vals = pd.to_numeric(source['direction'], errors='coerce').to_numpy(dtype=float)
-            cum_vals = pd.to_numeric(source['cum_direction_mean'], errors='coerce').to_numpy(dtype=float)
+                circ_df = pd.DataFrame({
+                    '_sin_dir': np.sin(dir_vals),
+                    '_cos_dir': np.cos(dir_vals),
+                    '_sin_cum': np.sin(cum_vals),
+                    '_cos_cum': np.cos(cum_vals),
+                }, index=source.index)
+                for col in by_cols:
+                    circ_df[col] = source[col].values
 
-            sin_dir = np.sin(dir_vals)
-            cos_dir = np.cos(dir_vals)
-            sin_cum = np.sin(cum_vals)
-            cos_cum = np.cos(cum_vals)
+                circ = circ_df.groupby(by_cols, sort=False, observed=True).agg(
+                    sin_dir=('_sin_dir', 'mean'),
+                    cos_dir=('_cos_dir', 'mean'),
+                    sin_cum=('_sin_cum', 'mean'),
+                    cos_cum=('_cos_cum', 'mean'),
+                )
 
-            # Build a temporary DataFrame for circular stats aggregation
-            circ_df = pd.DataFrame({
-                '_sin_dir': sin_dir,
-                '_cos_dir': cos_dir,
-                '_sin_cum': sin_cum,
-                '_cos_cum': cos_cum,
-            }, index=source.index)
-            for col in by_cols:
-                circ_df[col] = source[col].values
+            ctx = {
+                'grp': grp,
+                'src': source,
+                'by': by_cols,
+                'circ': circ,
+                'ci_cache': {},
+            }
 
-            circ = circ_df.groupby(by_cols, sort=False, observed=True).agg(
-                sin_dir=('_sin_dir', 'mean'),
-                cos_dir=('_cos_dir', 'mean'),
-                sin_cum=('_sin_cum', 'mean'),
-                cos_cum=('_cos_cum', 'mean'),
-            )
-
-            out[f'instantaneous_direction_mean'] = np.arctan2(circ['sin_dir'], circ['cos_dir'])
-            out[f'instantaneous_direction_var'] = 1.0 - np.hypot(circ['sin_dir'], circ['cos_dir'])
-            out[f'cum_direction_mean'] = np.arctan2(circ['sin_cum'], circ['cos_cum'])
-            out[f'cum_direction_var'] = 1.0 - np.hypot(circ['sin_cum'], circ['cos_cum'])
-            out[f'cum_mean_directional_change_mean'] = source.groupby(by_cols, sort=False)['cum_mean_directional_change'].mean().values
+            out = self._frames_registry.compute(wanted, ctx)
+            out.index = index
             return out.reset_index()
 
         # Compute one frame-stats block per grouping set, then stack them.
@@ -877,7 +1087,7 @@ class Stats:
                 # (e.g. categorical vs object mismatches producing NaNs).
                 _parent_stash[_key] = _parent_stash[_key].astype('object')
 
-            level_df = _compute_level(df, group_cols, grouping_cols[-1])
+            level_df = _compute_level(df, group_cols)
 
             # Re-attach higher-level grouping columns (parents of the lowest level)
             if _parent_stash is not None:
@@ -908,22 +1118,23 @@ class Stats:
             df = self.norm_decimals(df)
 
         return df
-    
-    
+
+
     def time_intervals(
-        self, 
+        self,
         df: pd.DataFrame,
+        subset: list[str] = None,
         *,
         grouping_level: Literal['highest', 'lowest'] | str | int | list | None = 'highest',
         to_disk: bool = ...,
         **kwargs
     ) -> pd.DataFrame:
-        """ 
+        """
         Computes per-time-interval statistics.
 
         For each `frame_lag` value (1, 2, …, maximum), squared displacements and turning angles are computed across trajectories
         and then processed (e.g. averaged) for each category (group). Specifically for example:
-        
+
         - per replicate - across all trajectories of the same `replicate`
         - per condition - across all trajectories of the same `condition`
 
@@ -956,13 +1167,13 @@ class Stats:
         MSDᵢ(k) = ||pᵢ(t+k) - pᵢ(t)||²
         ```
         \n The per-track MSD values are then aggregated across tracks within each of unique `time_lag` × grouping. In case that `ignore_categories` is set to `True`, the aggregation will be performed across all tracks for each unique of `time_lag`.
-        
-            
+
+
         Turning angle formula for a given time lag *k* for a trajectory *i* with trajectory point positions *y* and *x* at a time position *t* :
         ```
         Δθᵢ(k) = ||θᵢ(Δy(t+k), Δx(t+k)) - θᵢ(Δy(t), Δx(t))||
         ```
-        \n The angular difference in the direction of motion is then wrapped to [−π, π]. 
+        \n The angular difference in the direction of motion is then wrapped to [−π, π].
         Per-track turning angles values are then aggregated (circular mean and variance) across tracks within each of unique `time_lag`.
 
 
@@ -976,9 +1187,15 @@ class Stats:
             - `x_coordinate`
             - `y_coordinate`
 
+        subset : list[str], optional
+            If provided, only the listed metric columns are computed. The returned
+            DataFrame still includes the grouping/category columns as well as
+            `frame_lag` and `time_lag`. If None (default), all metrics enabled by
+            the current statistical flags are computed.
+
         ignore_categories : bool, optional
             If True, the `condition` and `replicate` columns will be ignored in the computation, and all data will be treated as a single group.
-            If not specified, the default value is taken from the package settings. 
+            If not specified, the default value is taken from the package settings.
             To change the default configuration and behavior throughout all computations, use `peregrin.settings(ignore_categories=...)`
 
         Returns
@@ -1010,28 +1227,28 @@ class Stats:
 
         See also
         --------
-        `stats.get_all()`- 
+        `stats.get_all()`-
         computes all DataFrames (Spots_df, Tracks_df, Frames_df, TimeIntervals_df) from raw spot data in one call.
 
-        `stats.spots()`- 
+        `stats.spots()`-
         computes per-trajectory-point statistics, both local (previous -> current position) and cumulative (start -> current position).
 
-        `stats.tracks()`- 
+        `stats.tracks()`-
         computes per-whole-trajectory statistics from the Spots_df.
 
-        `stats.frames()`- 
+        `stats.frames()`-
         computes per-time-point statistics from the Spots_df.
 
         """
 
         df = df.copy()
 
-        if df.empty: 
+        if df.empty:
             return pd.DataFrame(columns=self.COLUMNS['TIMEINTERVALS'])
-        
+
         grouping_set = []
 
-        if (isinstance(grouping_level, list) 
+        if (isinstance(grouping_level, list)
             and (all(isinstance(g, list) for g in grouping_level)
                  or not any(g in df.columns for g in grouping_level))):
 
@@ -1077,61 +1294,32 @@ class Stats:
                 warnings.warn(message=f"Time points are not uniformly spaced -> this will most probably lead to incorrect data computation. (time interval stats)\nObserved time steps:\n{t_steps}\nUsing: {t_step}",
                                 category=TimePointWarning,
                                 stacklevel=2)
-            
+
         else:
             t_step = self.t_step
+
+        # Resolve which metric columns to compute once (respecting subset & flags).
+        wanted = self._ti_registry.resolve(
+            subset,
+            descr=self.cat_descr,
+            descr_err=self.cat_descr_err,
+            infer_err=self.cat_infer_err,
+        )
 
         def _agg_msd_turn(msd_src: pd.DataFrame, turn_src: pd.DataFrame, by_cols: list[str]) -> pd.DataFrame:
             """Aggregate pooled MSD pairs and turning-angle pairs for given grouping."""
             msd_grouped = msd_src.groupby(by_cols, sort=False, observed=True)
-            msd_grp = msd_grouped['sq_disp']
-
-            agg_dict = {}
-            if self.cat_descr:
-                agg_dict['MSD'] = msd_grp.mean()
-
-            if self.cat_descr_err:
-                agg_dict['MSD_sd'] = msd_grp.std(ddof=1)
-
-            if self.cat_infer_err:
-                agg_dict['MSD_sem'] = msd_grp.agg(self.sem)
-                if 'ci' in self.INFER_ERR:
-                    ci_series = msd_grp.agg(self.ci)
-                    ci_unpacked = pd.DataFrame(
-                        ci_series.tolist(),
-                        index=ci_series.index,
-                        columns=[
-                            f'MSD_{self.CI_STATISTIC}_ci{self.CONFIDENCE_LEVEL}_low',
-                            f'MSD_{self.CI_STATISTIC}_ci{self.CONFIDENCE_LEVEL}_high',
-                        ],
-                    )
-                    for c in ci_unpacked.columns:
-                        agg_dict[c] = ci_unpacked[c]
-
-            agg_dict['tracks_contributing'] = msd_grouped['track_uid'].nunique().astype(int)
-            agg_dict['position_pairs_contributing'] = msd_grp.size().astype(int)
-
-            result = pd.DataFrame(agg_dict)
-
-            if not turn_src.empty:
-                turn_sin = turn_src.assign(
-                    _s=np.sin(turn_src.dtheta.values),
-                    _c=np.cos(turn_src.dtheta.values),
-                )
-                turn_circ = turn_sin.groupby(by_cols, sort=False, observed=True).agg(
-                    ms=('_s', 'mean'),
-                    mc=('_c', 'mean'),
-                )
-                circ_mean = np.arctan2(turn_circ.ms.values, turn_circ.mc.values)
-                circ_R = np.hypot(turn_circ.ms.values, turn_circ.mc.values)
-                circ_var = 1.0 - circ_R
-
-                if self.cat_descr or self.cat_descr_err or self.cat_infer_err:
-                    result['directional_change_mean'] = pd.Series(np.rad2deg(np.abs(circ_mean)), index=turn_circ.index)
-
-                if self.cat_descr_err:
-                    result['directional_change_var'] = pd.Series(circ_var, index=turn_circ.index)
-
+            ctx = {
+                'msd_grouped': msd_grouped,
+                'msd_grp': msd_grouped['sq_disp'],
+                'turn_src': turn_src,
+                'by': by_cols,
+                'ci_cache': {},
+                'circ_cache': {},
+            }
+            result = self._ti_registry.compute(wanted, ctx)
+            # Drop columns that produced no data (e.g. circular stats with empty turns).
+            result = result.dropna(axis=1, how='all') if not result.empty else result
             return result
 
         def _compute_level(source: pd.DataFrame, grouping_cols: list[str]) -> pd.DataFrame:
@@ -1300,7 +1488,7 @@ class Stats:
 
 
     def _assign_track_uid(
-        self, 
+        self,
         df: pd.DataFrame
     ) -> pd.DataFrame:
         """ Creates a unique track identifier `track_uid` by combining the default category columns (`self.DEFAULT_CATEGORIES`) present in the DataFrame. """
@@ -1313,13 +1501,13 @@ class Stats:
 
             # Create a unique track identifier by assigning a unique integer to each combination of the grouping columns
             df['track_uid'] = df.groupby(grouping_columns, sort=False).ngroup()
-        
+
         df.set_index(['track_uid'], drop=True, append=False, inplace=True, verify_integrity=False)
         return df
 
 
     def _get_grouping_level(
-        self, 
+        self,
         df_cols: pd.Index,
         grouping_level: Literal['highest', 'lowest'] | str | int | list | None = 'highest',
         *,
@@ -1339,10 +1527,10 @@ class Stats:
             grouping_cols = [self._get_grouping_level(df_cols, g_lvl, include=include) for g_lvl in grouping_level]
             if not multiple:
                 grouping_cols = max(grouping_cols, key=len)
-            
+
         if is_empty(grouping_cols):
             raise ColumnsNotFoundError(f"No grouping columns found in DataFrame columns: {df_cols}")
-        
+
         if isinstance(grouping_level, int):
             if grouping_level < 0 or grouping_level >= len(grouping_cols):
                 raise IndexError(f"Grouping level index {grouping_level} is out of bounds for DataFrame columns: {grouping_cols}")
@@ -1360,7 +1548,7 @@ class Stats:
             grouping_cols = grouping_cols[:idx + 1]
         else:
             raise InvalidParameterValueError(f"Invalid grouping_level parameter: {grouping_level}. Must be a list of column names, an integer index, 'highest', 'lowest', or None.")
-    
+
 
         for col in include:
             if col not in grouping_cols:
@@ -1377,7 +1565,7 @@ class Stats:
                 grouping_cols = ['track_uid']
 
         return grouping_cols
-    
+
 
     def format_digits(self, df: pd.DataFrame, *, sig_figs: int = None, decimals: int = None) -> pd.DataFrame:
         """ Formats numeric values in the DataFrame according to specified significant figures and decimal places. """
@@ -1407,14 +1595,14 @@ class Stats:
             df_rounded[col] = df_rounded[col].apply(lambda x: valuer.RoundSigFigs(x, sigfigs=sig_figs))
 
         return df_rounded
-    
+
 
     def norm_decimals(self, df: pd.DataFrame, decimals: int = None) -> pd.DataFrame:
         """ Normalize decimal places across numeric columns in a DataFrame by rounding to a specified number of decimal places. """
 
         if df.empty:
             return df.copy()
-        
+
         if decimals is None:
             decimals = self.decimal_places
 
@@ -1469,14 +1657,14 @@ class Stats:
 
             # drop multiplicates if present
             additional = additional.drop_duplicates()
-            
+
             return additional
-        
+
         except Exception as e:
-            warnings.warn(message=f"Stats._general_agg_stats() encountered an error: {e}. Returning empty DataFrame. Traceback:\n{traceback.format_exc()}", 
-                          category=FailedWarning, 
+            warnings.warn(message=f"Stats._general_agg_stats() encountered an error: {e}. Returning empty DataFrame. Traceback:\n{traceback.format_exc()}",
+                          category=FailedWarning,
                           stacklevel=2)
-            
+
             return pd.DataFrame(index=df.index)
 
 
@@ -1496,7 +1684,7 @@ class Stats:
         # named aggregation so output columns are already flat
         named_agg = {}
         for col in value_cols:
-            
+
             if any(t in col for t in ['direction', 'direction', 'Directional', 'directional', 'Turn', 'turn']) and not col.endswith('var'):
                 for stat_name, func in resolving_circular.items():
                     named_agg[f"per_{group_cols[-1].lower()}_{col}_{stat_name}"] = (col, func)
@@ -1513,11 +1701,11 @@ class Stats:
             .reset_index())
 
         return df.merge(grp_stats, on=group_cols, how='left')
-    
-    
+
+
     def resolve(self, agg_spec: dict[str, str] | list[str]) -> dict[str, str | callable]:
         """ Resolves a list or dictionary of aggregation specs into a mapping of output labels to aggregation functions. """
-        
+
         resolved = {}
         if isinstance(agg_spec, list):
             for func_name in agg_spec:
@@ -1543,7 +1731,7 @@ class Stats:
                         f"Available: {sorted(self._PANDAS_BUILTINS | set(self.CUSTOM_AGG_FUNCTIONS))}"
                     )
         return resolved
-        
+
 
     def _insert_at_position(self, d: dict, key: Any, value: Any = None, *, where: int | str = 0) -> dict:
         """ Insert a (key: value) pair into a dictionary at a specific position.
@@ -1570,10 +1758,10 @@ class Stats:
             if where not in keys:
                 raise ValueError(f"Key '{where}' not found in dictionary.")
             index = keys.index(where) + 1
-            
+
         else:
             raise ValueError("Parameter 'where' must be an integer index or a string key.")
-        
+
         items.insert(index, (key, value))
 
         return dict(items)
@@ -1589,12 +1777,12 @@ class Stats:
         a = np.asarray(a, dtype=float)
         if a.size == 0:
             return np.nan
-        
+
         s = np.nanmean(np.sin(a))
         c = np.nanmean(np.cos(a))
         if np.isnan(s) or np.isnan(c):
             return np.nan
-        
+
         return float(np.arctan2(s, c))
 
 
@@ -1603,15 +1791,15 @@ class Stats:
         a = np.asarray(a, dtype=float)
         if a.size == 0:
             return np.nan
-        
+
         s = np.nanmean(np.sin(a))
         c = np.nanmean(np.cos(a))
         if np.isnan(s) or np.isnan(c):
             return np.nan
-        
+
         R = np.hypot(s, c)
         return float(1.0 - R)
-    
+
 
     def _q25(self, a: np.ndarray) -> float:
         """ Lower bound of the interquartile range = Q1. """
@@ -1620,7 +1808,7 @@ class Stats:
         if a.size == 0:
             return np.nan
         return float(np.percentile(a, 25))
-    
+
 
     def _q75(self, a: np.ndarray) -> float:
         """ Upper bound of the interquartile range = Q3. """
@@ -1629,16 +1817,16 @@ class Stats:
         if a.size == 0:
             return np.nan
         return float(np.percentile(a, 75))
-    
+
 
     def ci(self, a, *, n_resamples: int | None = None, confidence_level: float | None = None, **kwargs) -> tuple[float, float]:
         """ Confidence interval via bootstrap.
-        
+
         Parameters
         ----------
         a : array-like
             *1D array of values to compute the confidence interval for.*
-        
+
         n_resamples : int, (default self.BOOTSTRAP_RESAMPLES = 1000)
             *Number of bootstrap resamples to perform. Can be set through Stats.BOOTSTRAP_RESAMPLES*
 
@@ -1647,11 +1835,11 @@ class Stats:
 
         statistic : callable, (default `np.mean`)
             *Function for which the confidence interval is computed (e.g. `np.mean`, `np.median`).*
-        
+
         method : str, (default 'BCa')
-            *Confidence interval computation method. Default is 'BCa' (bias-corrected and accelerated). 
+            *Confidence interval computation method. Default is 'BCa' (bias-corrected and accelerated).
             If 'BCa' fails, the method falls back to 'percentile'. Used method is stored in and can be acquired through `Stats._ci_method_used`.*
-            
+
         Returns
         -------
         tuple[float, float]
@@ -1660,8 +1848,8 @@ class Stats:
 
         method = kwargs.get('method', 'BCa')
         seed = 42 # Fixed seed for reproducibility
-        
-        # Ensure input is a numpy array of floats for the bootstrap compatibility 
+
+        # Ensure input is a numpy array of floats for the bootstrap compatibility
         a = np.asarray(a, dtype=float)
 
         # Drop NaN values, for bootstrap cannot handle them
@@ -1686,7 +1874,7 @@ class Stats:
             )
             self._ci_method_used = method
             return (float(result.confidence_interval.low), float(result.confidence_interval.high))
-        
+
         except Exception:
             # Fallback to the percentile method if previous the method fails
             try:
@@ -1700,13 +1888,13 @@ class Stats:
                 )
                 self._ci_method_used = 'percentile'
                 return (float(result.confidence_interval.low), float(result.confidence_interval.high))
-            
+
             except Exception as e:
                 warnings.warn(message=f"Bootstrap confidence interval computation failed for both '{method}' and fallback 'percentile' methods: {e}. Returning (np.nan, np.nan). Traceback:\n{traceback.format_exc()}",
                               category=FailedWarning,
                               stacklevel=2)
                 return (np.nan, np.nan)
-    
+
 
     def sem(self, x: np.ndarray | pd.Series) -> float:
         """ Standard error of the mean. """
@@ -1725,8 +1913,8 @@ class Stats:
 
 
     def stat_units(self, col: str = None, *, time_unit: str = None, **kwargs) -> dict[str, str]:
-        """ Returns a dictionary mapping metric names to their corresponding units 
-        
+        """ Returns a dictionary mapping metric names to their corresponding units
+
         Parameters
         ----------
         col : str, optional
