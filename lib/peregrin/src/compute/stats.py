@@ -91,7 +91,7 @@ class Stats:
 
     COLUMNS = {
         'SPOTS': [
-            'condition', 'replicate', 'track_id', 'track_uid',
+            'track_id', 'track_uid',
             'time_point', 'frame', 'x_coordinate', 'y_coordinate', 'distance',
             'cum_track_length', 'cum_track_displacement', 'cum_straightness_ratio',
             'cum_speed_mean', 'cum_mean_straight_line_speed',
@@ -245,8 +245,6 @@ class Stats:
             - `track_uid`
             - `time_point`
             - `frame`
-            - *`condition`*
-            - *`replicate`*
 
             - `x_coordinate`
             - `y_coordinate`

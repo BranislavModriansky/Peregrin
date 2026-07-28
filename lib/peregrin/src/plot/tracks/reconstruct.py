@@ -375,10 +375,10 @@ class ReconstructTracks:
         **kwargs
     ) -> "ReconstructTracks":
 
-        self.spot_data = spot_data
+        self.spot_data = spot_data.copy() if spot_data is not None else pd.DataFrame()
         self.align_at_start = align_at_start
         self.kwargs = get_aliases(kwargs, self.ALIASES)
-        self.track_data = track_data
+        self.track_data = track_data.copy() if track_data is not None else None
         self.categories = categories
 
         smoothing = self.kwargs.get('smoothing_index')
@@ -401,9 +401,10 @@ class ReconstructTracks:
         self._build_tracks(ax)
 
         x = self._x
+        self.x_gap = (x.max() - x.min()) * 0.025
         if x.size:
-            ax.set_xlim(x.min(), x.max())
-            ax.set_ylim(self._y.min(), self._y.max())
+            ax.set_xlim(x.min() - self.x_gap, x.max() + self.x_gap)
+            ax.set_ylim(self._y.min() - self.x_gap, self._y.max() + self.x_gap)
 
         ax.set_aspect('equal', adjustable='box')
         text_color = self.kwargs.get('text_color', 'black')
@@ -481,6 +482,9 @@ class ReconstructTracks:
     def _arrange_data(self):
         if self.categories is not None:
             self.spot_data = categorize(self.spot_data, self.categories, **self.kwargs)
+
+        if 'track_uid' not in self.spot_data.columns:
+            self.spot_data['track_uid'] = self.spot_data.index
 
         self.spot_data = (
             self.spot_data
@@ -785,6 +789,35 @@ class ReconstructTracks:
             zorder=12,
         )
 
+        if self.kwargs.get('display_uid', False):
+            self._annotate_uids(ax, px, py, colors)
+
+    def _annotate_uids(self, ax: plt.Axes, px, py, colors):
+        """Draw the track_uid label next to each track head."""
+        uids = getattr(self, '_track_uids', None)
+        if uids is None or len(uids) == 0:
+            return
+
+        # Resolve a per-track color list so labels can match their heads.
+        if isinstance(colors, str):
+            label_colors = [colors] * len(uids)
+        else:
+            label_colors = list(colors)
+
+        fontsize = self.kwargs.get('uid_fontsize', 9)
+        offset = self.kwargs.get('uid_offset', 2)
+
+        for x, y, uid, col in zip(px, py, uids, label_colors):
+            ax.annotate(
+                str(uid),
+                xy=(x, y),
+                xytext=(offset, offset),
+                textcoords='offset points',
+                fontsize=fontsize,
+                color=col,
+                clip_on=True,
+                zorder=14,
+            )
 
     def _head_colors(self, has_pt: np.ndarray):
         """Per-track head colors, aligned to the tracks kept by `has_pt`.
@@ -935,8 +968,8 @@ class ReconstructTracks:
         else:
             fig, ax = plt.subplots(figsize=(13, 10))
             if self._x.size:
-                ax.set_xlim(self._x.min(), self._x.max())
-                ax.set_ylim(self._y.min(), self._y.max())
+                ax.set_xlim(self._x.min() - self.x_gap, self._x.max() + self.x_gap)
+                ax.set_ylim(self._y.min() - self.x_gap, self._y.max() + self.x_gap)
             ax.set_aspect('equal', adjustable='box')
             tc = self.kwargs.get('text_color', 'black')
             ax.set_xlabel('x_coordinate [µm]', color=tc)
