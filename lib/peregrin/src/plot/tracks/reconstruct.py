@@ -18,10 +18,7 @@ from ..._pckg_exceptions._pckg_errors import *
 from ..._pckg_exceptions._pckg_warnings import *
 
 from ...categorizer import categorize
-from ..painter import (
-    retrieve_palette, retrieve_cmap, random_color, random_grey,
-    cmap_lut, dyes, is_color_code,
-)
+from ..painter import paint
 from ...various import Values, get_aliases, is_empty, clock
 from ...compute.stats import Stats
 
@@ -597,84 +594,35 @@ class ReconstructTracks:
 
 
     def _assign_color(self):
-        color_by = self.kwargs.get('color_by')
 
-        if color_by is not None:
-            if self.kwargs.get('color') is not None:
-                warnings.warn(
-                    "Both 'color' and 'color_by' parameters are provided -> Parameter "
-                    "'color' will be ignored -> Using 'color_by' for color assignment.",
-                    category=ConflictingParametersWarning, stacklevel=2)
+        color = self.kwargs.get('color', 'black')
 
-            datatype = None
-            if isinstance(color_by, tuple) and len(color_by) == 2:
-                color_by, datatype = color_by
-                if datatype not in ('categorical', 'numeric'):
-                    raise ValueError(
-                        f"Invalid datatype parameter '{datatype}' for color_by. "
-                        "Must be one of ['categorical', 'numeric'].")
-
-            col = self.spot_data[color_by]
-
-            if datatype == 'categorical' or is_categorical_dtype(col):
-                self._colors = self._categorical_colors(col)
-            elif datatype == 'numeric' or is_numeric_dtype(col):
-                self._colors = self._numeric_colors(col)
-            else:
-                raise InvalidParameterValueError(
-                    f"Invalid color_by value: '{color_by}'. Must be a column name in "
-                    "spot_data with categorical or numeric data or a tuple where the "
-                    "data type is specified (column_name, 'categorical'|'numeric').")
+        # 'random' / 'random greys' produce ONE color per trajectory. We ask
+        # the painter for exactly n_tracks colors and expand them to per-spot
+        # via run-length repeat so whole tracks share a color.
+        if color in ('random', 'random greys'):
+            n_tracks = self._track_starts.size
+            per_track = paint(
+                # Give the painter a frame whose unique-index count == n_tracks
+                # so it generates one color per track.
+                pd.DataFrame(index=np.arange(n_tracks)),
+                color=color,
+            )
+            per_track = np.asarray(per_track)
+            self._colors = np.repeat(per_track, self._run_lengths, axis=0)
             self._single_color = None
             return
 
-        c = self.kwargs.get('color', 'black')
+        c = paint(self.spot_data, **self.kwargs)
 
-        if c in dyes.colors or is_color_code(c):
-            # Single color: store the scalar; _build_tracks handles broadcast
-            # without allocating an N-length array.
+        if isinstance(c, str):
             self._single_color = c
             self._colors = None
             return
-
-        # n_tracks = self._track_uids.size
-        n_tracks = self.spot_data['track_uid'].nunique()
-        if c == 'random greys':
-            colors = random_grey(n=n_tracks, code='hex', a=1.0)
-        elif c in ('random', 'random colors', 'random colours'):
-            colors = random_color(n=n_tracks, code='hex', a=1.0)
         else:
-            raise InvalidParameterValueError(
-                f"Invalid color parameter: {c}. Must be a valid color name, hex "
-                "code, or one of ['random', 'random greys'].")
-
-        # Map one color per track onto every spot via run-length repeat.
-        self._colors = np.repeat(np.asarray(colors, dtype=object), self._run_lengths)
-        self._single_color = None
-
-    def _categorical_colors(self, col: pd.Series) -> np.ndarray:
-        palette = self.kwargs.get('palette', 'tab10')
-        if isinstance(palette, (str, list)):
-            categories = col.dropna().unique().tolist()
-            palette = retrieve_palette(categories, palette)
-        elif not isinstance(palette, dict):
-            raise PlottingError(
-                f"Invalid palette type: {type(palette)}. Must be str, list, or dict.")
-        return col.map(palette).fillna("#000000FF").to_numpy()
-
-    def _numeric_colors(self, col: pd.Series) -> np.ndarray:
-        cmap = retrieve_cmap(self.kwargs.get('cmap', 'viridis'))
-        norm, vals = cmap_lut(
-            col,
-            min=self.kwargs.get('lut_vmin'),
-            max=self.kwargs.get('lut_vmax'),
-        )
-        try:
-            # RGBA (N,4) float array — far cheaper downstream than an object column.
-            return cmap(norm(np.asarray(vals, dtype=float)))
-        except Exception as e:
-            raise PlottingError(
-                f"Error applying quantitative colormap: '{cmap}' to data: {e}")
+            # Map one color per track onto every spot via run-length repeat.
+            self._colors = c
+            self._single_color = None
 
 
     def _plot_coords(self, *, polar: bool = False):
