@@ -158,7 +158,7 @@ class Stats:
     ])
 
     # Class-level defaults for stat categories
-    _DESCR = ['min', 'max', 'mean', 'median', 'q25', 'q75']
+    _DESCR_STATS = ['min', 'max', 'mean', 'median', 'q25', 'q75']
     _DESCR_ERR = ['std']
     _INFER_ERR = ['sem']
 
@@ -204,7 +204,7 @@ class Stats:
         self.cat_infer_err = cat_infer_err
 
         # Create per-instance copies to avoid shared mutable state
-        self.DESCR: List[str] = list(self._DESCR) if cat_descr else []
+        self.DESCR: List[str] = list(self._DESCR_STATS) if cat_descr else []
         self.DESCR_ERR: List[str] = list(self._DESCR_ERR) if cat_descr_err else []
         self.INFER_ERR: List[str] = []
 
@@ -401,65 +401,10 @@ class Stats:
 
         return reg
 
-    # def get_all(
-    #     self, df: pd.DataFrame,
-    #     **kwargs
-    # ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    #     """
-    #     Compute trajectory data at all levels of aggregation
-    #     (`spots`, `tracks`, `frames`, `time_intervals`) from input spot data.
-
-    #     Parameters
-    #     ----------
-    #     df : pd.DataFrame
-    #         Input DataFrame must contain these columns:
-    #         - *`condition`*
-    #         - *`replicate`*
-    #         - `track_id`
-    #         - `x_coordinate`
-    #         - `y_coordinate`
-    #         - `time_point`
-
-    #     ignore_categories : bool, optional
-    #         If True, the `condition` and `replicate` columns will be ignored in the computation, and all data will be treated as a single group.
-    #         If not specified, the default value is taken from the package settings.
-    #         To change the default configuration and behavior throughout all computations, use `peregrin.settings(ignore_categories=...)`
-
-    #     Returns
-    #     -------
-    #     tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame] : `stats.Spots_df`, `stats.Tracks_df`, `stats.Frames_df` and `stats.TimeIntervals_df` DataFrames.
-
-    #     See also
-    #     --------
-    #     `stats.spots()`-
-    #     computes per-trajectory-point statistics, both local (previous -> current position) and cumulative (start -> current position).
-
-    #     `stats.tracks()`-
-    #     computes per-whole-trajectory statistics from the Spots_df.
-
-    #     `stats.frames()`-
-    #     computes per-time-point statistics from the Spots_df.
-
-    #     `stats.time_intervals()`-
-    #     computes per-time-interval statistics from the Spots_df.
-
-    #     Documentation
-    #     -------------
-    #     links..
-
-    #     """
-
-    #     # self.Input = df
-    #     spots_df = self.spots(df, **kwargs)
-
-    #     return spots_df, self.tracks(spots_df, **kwargs), self.frames(spots_df, **kwargs), self.time_intervals(spots_df, **kwargs)
-
 
     def spots(
         self,
         df: pd.DataFrame,
-        *,
-        to_disk: bool = ...,
         **kwargs
     ) -> pd.DataFrame:
         """ Computes per-trajectory-point statistics, both local (previous -> current position) and cumulative (start -> current position).
@@ -2037,6 +1982,9 @@ class Summarize:
             "distinct": int(series.nunique(dropna=True)),
             "highest": [(idx, round(val * 100, 1)) for idx, val in value_counts.items()],
         }
+
+
+
 
 
 

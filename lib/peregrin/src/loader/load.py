@@ -1,10 +1,11 @@
 import re
+from sys import path
 import traceback
 import warnings
 import pandas as pd
 import numpy as np
 import os.path as op
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from os import PathLike
 
 
@@ -39,7 +40,6 @@ class DataLoader:
             'x':  'POSITION_X', 
             'y':  'POSITION_Y'
         }, 
-        t_unit: str = 's',
         *,
         retain: Optional[list[str]] = None,
         **kwargs
@@ -152,7 +152,6 @@ class DataLoader:
         self.y_col  = colnames['y']
 
         # Time / transform options (wired as kwargs)
-        self.t_unit = t_unit
         self.time_conversion = kwargs.get('time_conversion', None)
         self.mirror_y = kwargs.get('mirror_y', False)
         self.mirror_x = kwargs.get('mirror_x', False)
@@ -177,7 +176,8 @@ class DataLoader:
 
         records = []
         for labels, filepath in leaves:
-            df = self._read_file(filepath)
+            df, metadata = self._read_file(filepath)
+            _load_metadata(metadata)
             df = self._extract(df)
 
             for cat, label in zip(used_categories, labels):
@@ -368,26 +368,13 @@ class DataLoader:
             current = [item for d in current for item in d.values()]
 
         return [f for group in current for f in group]
-            
 
-            
-    def _read_file(self, filepath: str) -> pd.DataFrame:
-        
-        _, ext = op.splitext(filepath.lower())
 
-        match ext:
-            case '.csv':
-                return self._read_csv(filepath)
-            case '.xls' | '.xlsx':
-                return pd.read_excel(filepath)
-            case '.xml':
-                return pd.read_xml(filepath)
-            case '.parquet':
-                return pd.read_parquet(filepath)
-            case '.json':
-                return pd.read_json(filepath)
-            case _:
-                raise FileFormatError(f"{ext} is not supported. Supported formats include: .csv, .xls, .xlsx, .xml., .json, .parquet")
+    def _load_metadata(self, metadata: Dict[str, any]) -> None:
+            """
+            Load metadata from a dictionary into the global object.
+            """
+            ...
             
 
     def _extract(
@@ -456,6 +443,93 @@ class DataLoader:
         return df
 
 
+    def _read_file(self, filepath: str) -> pd.DataFrame:
+            
+        _, ext = op.splitext(filepath.lower())
+
+        match ext:
+            case '.xml':
+                return pd.read_xml(filepath)
+            case '.csv' | '.xls' | '.xlsx':
+                return self._read_table(filepath, ext)
+            case _:
+                raise FileFormatError(f"{ext} is not supported. Supported formats include: .csv, .xls, .xlsx, .xml")
+
+
+    def _read_trackmate_xml(self, path) -> Tuple[pd.DataFrame, dict]: ...
+            
+
+    def _read_table(self, path, ext, *, units_row_index=2, skiprows=4, encodings=("utf-8", "cp1252", "latin1", "iso8859_15"), **kwargs) -> Tuple[pd.DataFrame, dict]:
+        try:
+            if ext in ('.xls', '.xlsx'):
+                column_names, units_row, df = self._read_excel_parts(
+                    path, units_row_index, skiprows
+                )
+                units = self._build_units(column_names, units_row)
+                return df, units
+
+            # CSV path: try multiple encodings
+            for enc in encodings:
+                try:
+                    column_names = pd.read_csv(path, nrows=0, encoding=enc).columns.tolist()
+
+                    units_row = None
+                    if units_row_index is not None:
+                        units_row = pd.read_csv(
+                            path, skiprows=units_row_index, nrows=1, encoding=enc
+                        ).iloc[0].tolist()
+
+                    units = self._build_units(column_names, units_row)
+
+                    df = pd.read_csv(
+                        path, names=column_names, skiprows=skiprows,
+                        encoding=enc, low_memory=False
+                    )
+                    return df, units
+
+                except UnicodeDecodeError:
+                    continue
+
+            raise FileFormatError(
+                f"Failed to decode CSV file: {path}. Tried encodings: {encodings}."
+            )
+
+        except Exception as e:
+            raise FileFormatError(f"{str(e)} -> Failed to read file: {path}.")
+
+
+    def _read_excel_parts(self, path, units_row_index, skiprows) -> Tuple[List[str], Optional[List[str]], pd.DataFrame]:
+        """Read header, units row, and data body from an Excel file."""
+        column_names = pd.read_excel(path, nrows=0).columns.tolist()
+
+        units_row = None
+        if units_row_index is not None:
+            units_row = pd.read_excel(
+                path, skiprows=units_row_index, nrows=1, header=None
+            ).iloc[0].tolist()
+
+        df = pd.read_excel(path, names=column_names, skiprows=skiprows, header=None)
+        return column_names, units_row, df
+
+
+    def _build_units(self, column_names, units_row) -> Dict[str, Optional[str]]:
+        """Build a {column: unit} mapping from a raw units row."""
+        units = {}
+        if units_row is None:
+            return {col: None for col in column_names}
+
+        for col, u in zip(column_names, units_row):
+            if isinstance(u, str):
+                u = u.strip()
+                if u.startswith('(') and u.endswith(')'):
+                    u = u[1:-1]
+            else:
+                u = None
+            units[col] = u
+        return units
+    
+
+
     def get_columns(self, path: str) -> List[str]:
         """
         Returns a list of column names from the DataFrame.
@@ -511,17 +585,6 @@ class DataLoader:
             self.rep_multiplicates = True
         
         return data
-
-
-    def _read_csv(self, path, encodings=("utf-8", "cp1252", "latin1", "iso8859_15"), **kwargs) -> pd.DataFrame:
-        try:
-            for enc in encodings:
-                try:
-                    return pd.read_csv(path, encoding=enc, low_memory=False)
-                except UnicodeDecodeError:
-                    continue
-        except Exception as e:
-            raise FileFormatError(f"{str(e)} -> Failed to read CSV file: {path}. Tried encodings: {encodings}.")
     
     
     def _py_numeric_df(self, df: pd.DataFrame) -> None:

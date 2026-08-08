@@ -5,10 +5,10 @@ import pandas as pd
 
 # Works both as package module and as direct script
 try:
-    from ..src.io.load import load_data
+    from ..src.loader.load import load_data
 except ImportError:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from peregrin.src.io.load import load_data
+    from peregrin.src.loader.load import load_data
 
 DATA_DIR = Path(__file__).resolve().parent
 
