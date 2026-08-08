@@ -13,7 +13,7 @@ from os import PathLike
 
 from .._pckg_exceptions._pckg_errors import *
 from .._pckg_exceptions._pckg_warnings import *
-from ..compute.object import input_metadata
+
 from ..compute.stats import stats
 from ..various import get_aliases
 
@@ -181,7 +181,7 @@ class DataLoader:
         records = []
         for labels, filepath in leaves:
             df, metadata = self._read_file(filepath)
-            input_metadata.update(metadata)
+            stats.input_metadata.update(metadata)
             df = self._extract(df)
 
             for cat, label in zip(used_categories, labels):
@@ -189,7 +189,7 @@ class DataLoader:
 
             records.append(df)
 
-        input_metadata.check()
+        stats.input_metadata.check()
 
         return self._merge(records, used_categories)
 
@@ -444,7 +444,7 @@ class DataLoader:
             'TIME': timeunits, 'VELOCITY': f'{spatialunits}/{timeunits}',
             'RATE': f'1/{timeunits}', 'ANGLE_RATE': f'rad/{timeunits}',
             'INTENSITY': 'counts', 'ANGLE': 'rad',
-            'QUALITY': None, 'NONE': None, 'COST': None, 'STRING': None,
+            'QUALITY': 'quality', 'NONE': '', 'COST': '', 'STRING': '',
         }
 
         # feature -> unit, from <FeatureDeclarations>
@@ -502,7 +502,7 @@ class DataLoader:
                 column_names, units_row, df = self._read_excel_parts(
                     filepath, metadata_row_index, skiprows
                 )
-                metadata = {str(filepath.split(op.sep)[-1]): self._build_metadata(column_names, units_row)}
+                metadata = {str(filepath.split(op.sep)[-1]): self._build_metadata(df, column_names, units_row)}
                 return df, metadata
 
             # CSV path: try multiple encodings
@@ -516,12 +516,13 @@ class DataLoader:
                             filepath, skiprows=metadata_row_index, nrows=1, encoding=enc
                         ).iloc[0].tolist()
 
-                    metadata = {str(filepath.split(op.sep)[-1]): self._build_metadata(df, column_names, metadata_row)}
-
                     df = pd.read_csv(
                         filepath, names=column_names, skiprows=skiprows,
                         encoding=enc, low_memory=False
                     )
+
+                    metadata = {str(filepath.split(op.sep)[-1]): self._build_metadata(df, column_names, metadata_row)}
+
                     return df, metadata
 
                 except UnicodeDecodeError:
@@ -561,11 +562,11 @@ class DataLoader:
                 if u.startswith('(') and u.endswith(')'):
                     u = u[1:-1]
             else:
-                u = None
+                u = ''
             metadata[col] = u
 
-        metadata['spatialunits'] = metadata.get(self.x_col, None)
-        metadata['timeunits'] = metadata.get(self.t_col, None)
+        metadata['spatialunits'] = metadata.get(self.x_col, '')
+        metadata['timeunits'] = metadata.get(self.t_col, '')
         metadata['timeinterval'] = self._calculate_time_interval(df)
         metadata['nframes'] = df[self.t_col].nunique()
 
@@ -622,7 +623,7 @@ class DataLoader:
 
         # Normalize columns for matching
         normalized_columns = [
-            (col, str(col).replace('_', ' ').strip().lower() if col is not None else '') for col in columns
+            (col, str(col).replace('', ' ').strip().lower() if col is not None else '') for col in columns
         ]
         # Try exact matches first
         for col, norm_col in normalized_columns:
@@ -680,28 +681,6 @@ class DataLoader:
     
 
     def _convert_time(self, df: pd.DataFrame) -> pd.DataFrame:
-        unit_aliases = {
-            "ms": "ms",
-            "millisecond": "ms",
-            "milliseconds": "ms",
-            "milisecond": "ms",   # misspelling
-            "miliseconds": "ms",  # misspelling
-            "s": "s",
-            "sec": "s",
-            "second": "s",
-            "seconds": "s",
-            "min": "min",
-            "minute": "min",
-            "minutes": "min",
-            "h": "h",
-            "hr": "h",
-            "hour": "h",
-            "hours": "h",
-            "day": "day",
-            "days": "day",
-            "d": "day",
-        }
-
         unit_to_seconds = {
             "ms": 1e-3,
             "s": 1.0,
@@ -712,7 +691,7 @@ class DataLoader:
 
         temp_args = get_aliases(
             {'from': self.timeunit, 'to': self.convert_time_to},
-            input_metadata.UNIT_ALIASES
+            stats.input_metadata.UNIT_ALIASES
         )
         from_unit = temp_args['from']
         to_unit = temp_args['to']
@@ -731,9 +710,9 @@ class DataLoader:
         factor = unit_to_seconds[from_unit] / unit_to_seconds[to_unit]
 
         df["time_point"] = df["time_point"] * factor
-        
-        input_metadata['timeinterval'] = self.timeinterval * factor
-        input_metadata['timeunits'] = to_unit
+
+        stats.input_metadata['timeinterval'] = self.timeinterval * factor
+        stats.input_metadata['timeunits'] = to_unit
 
         return df
 
