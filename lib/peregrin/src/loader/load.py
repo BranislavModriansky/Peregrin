@@ -2,6 +2,8 @@ import re
 from sys import path
 import traceback
 import warnings
+
+import xml.etree.ElementTree as ET
 import pandas as pd
 import numpy as np
 import os.path as op
@@ -11,7 +13,9 @@ from os import PathLike
 
 from .._pckg_exceptions._pckg_errors import *
 from .._pckg_exceptions._pckg_warnings import *
+from ..compute.object import input_metadata
 from ..compute.stats import stats
+from ..various import get_aliases
 
 
 class DataLoader:
@@ -105,7 +109,7 @@ class DataLoader:
             A list of column names from the original input data to be retained. If None, only the essential columns 
             (track_id, time_point, x_coordinate, y_coordinate) are extracted, while all other columns are discarded.
 
-        time_conversion : str, optional, default None
+        convert_time_to : str, optional, default None
             If provided, time will be converted from the input unit `t_unit` to the specified target unit. 
             Supported units include: 'ms', 's', 'min', 'h', 'day'.
 
@@ -152,7 +156,7 @@ class DataLoader:
         self.y_col  = colnames['y']
 
         # Time / transform options (wired as kwargs)
-        self.time_conversion = kwargs.get('time_conversion', None)
+        self.convert_time_to = kwargs.get('convert_time_to', None)
         self.mirror_y = kwargs.get('mirror_y', False)
         self.mirror_x = kwargs.get('mirror_x', False)
         self.merge = kwargs.get('merge', 'all')
@@ -177,13 +181,15 @@ class DataLoader:
         records = []
         for labels, filepath in leaves:
             df, metadata = self._read_file(filepath)
-            _load_metadata(metadata)
+            input_metadata.update(metadata)
             df = self._extract(df)
 
             for cat, label in zip(used_categories, labels):
                 df[cat] = label
 
             records.append(df)
+
+        input_metadata.check()
 
         return self._merge(records, used_categories)
 
@@ -238,7 +244,7 @@ class DataLoader:
         # How many of the available (bottom-up) categories to key on.
         full_order = ['set', 'subset', 'group', 'subgroup', 'subsubgroup']
         # index of the deepest keying category within full_order
-        deepest_idx = target - 1
+        
         # only keep categories that actually exist in the data
         key_cats = [c for c in full_order[:target] if c in used_categories]
 
@@ -294,7 +300,7 @@ class DataLoader:
         if depth == 1:
             # This dict maps filename -> filepath, OR is a list of paths
             if isinstance(tree, dict):
-                for name, path in tree.items():
+                for _, path in tree.items():
                     yield labels + (self._subsubgroup_label(path),), path
             else:  # list of file paths
                 for path in tree:
@@ -402,42 +408,11 @@ class DataLoader:
         if self.mirror_x:
             x_mid = (df[self.x_col].min() + df[self.x_col].max()) / 2
             df[self.x_col] = 2 * x_mid - df[self.x_col]
-
-        df.sort_values(self.t_col, inplace=True)
-        t_steps = np.diff(df[self.t_col].unique())
-
-        if t_steps.size == 0:
-            self.t_step = float('nan')
-        else:
-            # Base step = smallest positive interval (one frame).
-            positive = t_steps[t_steps > 0]
-            base = float(positive.min()) if positive.size else float(t_steps.min())
-
-            if base > 0:
-                ratios = t_steps / base
-                # Uniform if every gap is an (near-)integer multiple of the base step
-                # -> tolerates dropped frames (e.g. a single 120 among 60s).
-                is_regular = np.all(np.isclose(ratios, np.round(ratios), atol=1e-6))
-            else:
-                is_regular = False
-
-            if is_regular:
-                self.t_step = base
-            else:
-                self.t_step = float(np.median(t_steps))
-                warnings.warn(
-                    message=(
-                        f"Non-uniformly spaced time point data -> will probably lead to incorrect data computation.\n"
-                        f"Observed time steps:\n{t_steps}\nUsing: {self.t_step}"
-                    ),
-                    category=LabelWarning,
-                    stacklevel=2
-                )
             
         df = self._standname(df, self.id_col, self.t_col, self.x_col, self.y_col)
 
         # run time conversion for any requested target unit handled by _convert_time
-        if self.time_conversion not in (None, ""):
+        if self.convert_time_to not in (None, ""):
             df = self._convert_time(df)
          
         return df
@@ -449,92 +424,190 @@ class DataLoader:
 
         match ext:
             case '.xml':
-                return pd.read_xml(filepath)
+                return self._read_trackmate_xml(filepath)
             case '.csv' | '.xls' | '.xlsx':
                 return self._read_table(filepath, ext)
             case _:
                 raise FileFormatError(f"{ext} is not supported. Supported formats include: .csv, .xls, .xlsx, .xml")
 
 
-    def _read_trackmate_xml(self, path) -> Tuple[pd.DataFrame, dict]: ...
+    def _read_trackmate_xml(self, filepath):
+        """Parse a TrackMate project XML and return spots and a merged metadata dict."""
+        root = ET.parse(filepath).getroot()
+        model = root.find('Model')
+
+        spatialunits = model.attrib.get('spatialunits')
+        timeunits = model.attrib.get('timeunits')
+
+        dim_to_unit = {
+            'POSITION': spatialunits, 'LENGTH': spatialunits,
+            'TIME': timeunits, 'VELOCITY': f'{spatialunits}/{timeunits}',
+            'RATE': f'1/{timeunits}', 'ANGLE_RATE': f'rad/{timeunits}',
+            'INTENSITY': 'counts', 'ANGLE': 'rad',
+            'QUALITY': None, 'NONE': None, 'COST': None, 'STRING': None,
+        }
+
+        # feature -> unit, from <FeatureDeclarations>
+        metadata = {}
+        for category in model.find('FeatureDeclarations'):
+            for feat in category:
+                metadata[feat.attrib['feature']] = dim_to_unit.get(feat.attrib.get('dimension'))
+
+        # spots
+        df = pd.DataFrame([
+            spot.attrib
+            for frame in model.find('AllSpots')
+            for spot in frame
+        ])
+        df['ID'] = df['ID'].astype(np.int64)
+        num_cols = [c for c in df.columns if c != 'name']
+        df[num_cols] = df[num_cols].apply(pd.to_numeric, errors='coerce')
+
+        # tag each spot with its TRACK_ID via the tracks (single pass, vectorized map)
+        src_ids, trk_ids = [], []
+        for track in model.find('AllTracks'):
+            tid = int(track.attrib['TRACK_ID'])
+            for edge in track:
+                a = edge.attrib
+                src_ids += [a['SPOT_SOURCE_ID'], a['SPOT_TARGET_ID']]
+                trk_ids += [tid, tid]
+
+        mapping = pd.Series(
+            np.asarray(trk_ids, dtype=np.int64),
+            index=np.asarray(src_ids, dtype=np.int64),
+        )
+        mapping = mapping[~mapping.index.duplicated()]
+        df['TRACK_ID'] = mapping.reindex(df['ID'].values).values
+
+        # move TRACK_ID to the first column
+        df.insert(0, 'TRACK_ID', df.pop('TRACK_ID'))
+
+
+        # merge image calibration into the same metadata dict
+        metadata.update(root.find('Settings/ImageData').attrib)
+        metadata['spatialunits'] = spatialunits
+        metadata['timeunits'] = timeunits
+
+        self.timeunit = timeunits
+        self.timeinterval = metadata['timeinterval']
+
+        metadata = {str(filepath.split(op.sep)[-1]): metadata}
+
+        return df, metadata
             
 
-    def _read_table(self, path, ext, *, units_row_index=2, skiprows=4, encodings=("utf-8", "cp1252", "latin1", "iso8859_15"), **kwargs) -> Tuple[pd.DataFrame, dict]:
+    def _read_table(self, filepath, ext, *, metadata_row_index=2, skiprows=4, encodings=("utf-8", "cp1252", "latin1", "iso8859_15"), **kwargs) -> Tuple[pd.DataFrame, dict]:
         try:
             if ext in ('.xls', '.xlsx'):
                 column_names, units_row, df = self._read_excel_parts(
-                    path, units_row_index, skiprows
+                    filepath, metadata_row_index, skiprows
                 )
-                units = self._build_units(column_names, units_row)
-                return df, units
+                metadata = {str(filepath.split(op.sep)[-1]): self._build_metadata(column_names, units_row)}
+                return df, metadata
 
             # CSV path: try multiple encodings
             for enc in encodings:
                 try:
-                    column_names = pd.read_csv(path, nrows=0, encoding=enc).columns.tolist()
+                    column_names = pd.read_csv(filepath, nrows=0, encoding=enc).columns.tolist()
 
-                    units_row = None
-                    if units_row_index is not None:
-                        units_row = pd.read_csv(
-                            path, skiprows=units_row_index, nrows=1, encoding=enc
+                    metadata_row = None
+                    if metadata_row_index is not None:
+                        metadata_row = pd.read_csv(
+                            filepath, skiprows=metadata_row_index, nrows=1, encoding=enc
                         ).iloc[0].tolist()
 
-                    units = self._build_units(column_names, units_row)
+                    metadata = {str(filepath.split(op.sep)[-1]): self._build_metadata(df, column_names, metadata_row)}
 
                     df = pd.read_csv(
-                        path, names=column_names, skiprows=skiprows,
+                        filepath, names=column_names, skiprows=skiprows,
                         encoding=enc, low_memory=False
                     )
-                    return df, units
+                    return df, metadata
 
                 except UnicodeDecodeError:
                     continue
 
             raise FileFormatError(
-                f"Failed to decode CSV file: {path}. Tried encodings: {encodings}."
+                f"Failed to decode CSV file: {filepath}. Tried encodings: {encodings}."
             )
 
         except Exception as e:
-            raise FileFormatError(f"{str(e)} -> Failed to read file: {path}.")
+            raise FileFormatError(f"{str(e)} -> Failed to read file: {filepath}.")
 
 
-    def _read_excel_parts(self, path, units_row_index, skiprows) -> Tuple[List[str], Optional[List[str]], pd.DataFrame]:
+    def _read_excel_parts(self, filepath, metadata_row_index, skiprows) -> Tuple[List[str], Optional[List[str]], pd.DataFrame]:
         """Read header, units row, and data body from an Excel file."""
-        column_names = pd.read_excel(path, nrows=0).columns.tolist()
+        column_names = pd.read_excel(filepath, nrows=0).columns.tolist()
 
-        units_row = None
-        if units_row_index is not None:
-            units_row = pd.read_excel(
-                path, skiprows=units_row_index, nrows=1, header=None
+        metadata_row = None
+        if metadata_row_index is not None:
+            metadata_row = pd.read_excel(
+                filepath, skiprows=metadata_row_index, nrows=1, header=None
             ).iloc[0].tolist()
 
-        df = pd.read_excel(path, names=column_names, skiprows=skiprows, header=None)
-        return column_names, units_row, df
+        df = pd.read_excel(filepath, names=column_names, skiprows=skiprows, header=None)
+        return column_names, metadata_row, df
 
 
-    def _build_units(self, column_names, units_row) -> Dict[str, Optional[str]]:
-        """Build a {column: unit} mapping from a raw units row."""
-        units = {}
-        if units_row is None:
+    def _build_metadata(self, df, column_names, metadata_row) -> Dict[str, Optional[str]]:
+        """Build a {column: unit} mapping from a raw metadata row."""
+        metadata = {}
+        if metadata_row is None:
             return {col: None for col in column_names}
 
-        for col, u in zip(column_names, units_row):
+        for col, u in zip(column_names, metadata_row):
             if isinstance(u, str):
                 u = u.strip()
                 if u.startswith('(') and u.endswith(')'):
                     u = u[1:-1]
             else:
                 u = None
-            units[col] = u
-        return units
-    
+            metadata[col] = u
+
+        metadata['spatialunits'] = metadata.get(self.x_col, None)
+        metadata['timeunits'] = metadata.get(self.t_col, None)
+        metadata['timeinterval'] = self._calculate_time_interval(df)
+        metadata['nframes'] = df[self.t_col].nunique()
+
+        self.timeunit = metadata['timeunits']
+        self.timeinterval = metadata['timeinterval']
+
+        return metadata
+
+
+    def _calculate_time_interval(self, df: pd.DataFrame) -> Optional[float]:
+        df.sort_values(self.t_col, inplace=True)
+        timeintervals = np.diff(df[self.t_col].unique())
+
+        if timeintervals.size == 0:
+            return float('nan')
+        else:
+            # Base step = smallest positive interval (one frame).
+            positive = timeintervals[timeintervals > 0]
+            base = float(positive.min()) if positive.size else float(timeintervals.min())
+
+            if base > 0:
+                ratios = timeintervals / base
+                # Uniform if every gap is an (near-)integer multiple of the base step
+                # -> tolerates dropped frames (e.g. a single 120 among 60s).
+                is_regular = np.all(np.isclose(ratios, np.round(ratios), atol=1e-6))
+            else:
+                is_regular = False
+
+            if is_regular:
+                return base
+            else:
+                result = float(np.median(timeintervals))
+                warnings.warn((f"Non-uniformly spaced time point data -> will probably lead to incorrect data computation.\n"
+                               f"Observed time steps:\n{timeintervals}\nUsing: {result}"), InputWarning, 2)
+                return result
 
 
     def get_columns(self, path: str) -> List[str]:
         """
         Returns a list of column names from the DataFrame.
         """
-        df = self._read_file(path)  # or pd.read_excel(path), depending on file type
+        df, _ = self._read_file(path)  # or pd.read_excel(path), depending on file type
         return df.columns.tolist()
     
 
@@ -637,12 +710,16 @@ class DataLoader:
             "day": 86400.0,
         }
 
-        from_unit = unit_aliases.get(str(self.t_unit).strip().lower())
-        to_unit = unit_aliases.get(str(self.time_conversion).strip().lower())
+        temp_args = get_aliases(
+            {'from': self.timeunit, 'to': self.convert_time_to},
+            input_metadata.UNIT_ALIASES
+        )
+        from_unit = temp_args['from']
+        to_unit = temp_args['to']
 
         if from_unit is None or to_unit is None:
             warnings.warn(
-                message=f"Unsupported time conversion: {self.t_unit} -> {self.time_conversion}. Skipping conversion.",
+                message=f"Unsupported time conversion: {self.timeunit} -> {self.convert_time_to}. Skipping conversion.",
                 category=LabelWarning,
                 stacklevel=2
             )
@@ -654,10 +731,9 @@ class DataLoader:
         factor = unit_to_seconds[from_unit] / unit_to_seconds[to_unit]
 
         df["time_point"] = df["time_point"] * factor
-        try:
-            stats.t_step = float(stats.t_step) * factor
-        except Exception:
-            pass
+        
+        input_metadata['timeinterval'] = self.timeinterval * factor
+        input_metadata['timeunits'] = to_unit
 
         return df
 

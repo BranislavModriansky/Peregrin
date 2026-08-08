@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from warnings import warn
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
@@ -7,6 +8,7 @@ import pandas as pd
 
 from .stats import stats
 from .._pckg_exceptions._pckg_warnings import *
+from .._pckg_exceptions._pckg_errors import *
 
 
 @dataclass
@@ -30,11 +32,24 @@ class InputMetadata:
 
     input_metadata: Dict[str, dict] = field(default_factory=dict)
 
+    UNIT_ALIASES = {
+        'ms': ['ms', 'millisecond', 'milliseconds'],
+        's': ['s', 'sec', 'second', 'seconds'],
+        'min': ['m', 'min', 'minute', 'minutes'],
+        'h': ['h', 'hr', 'hour', 'hours'],
+        'd': ['d', 'day', 'days'],
+        'px': ['px', 'pixel', 'pixels'],
+        'μm': ['μm', 'um', 'micron', 'microns', 'micrometer', 'micrometers'],
+        'mm': ['mm', 'millimeter', 'millimeters'],
+        'cm': ['cm', 'centimeter', 'centimeters'],
+    }
+
     def __init__(self, input_metadata: Optional[Dict[str, dict]] = None):
         if input_metadata is not None:
             self.input_metadata = input_metadata
 
     def update(self, metadata: Dict[str, dict]):
+            
         self.input_metadata.update(metadata)
 
     def get(self, file_name: str) -> Optional[dict]:
@@ -46,18 +61,20 @@ class InputMetadata:
         all_n_frames = set()
         all_time_intervals = set()
 
-        for file_name, metadata in self.input_metadata.items(): 
+        for _, metadata in self.input_metadata.items(): 
+            all_time_units.add(metadata.get("timeunits"))
+            all_spatial_units.add(metadata.get("spatialunits"))
+            all_n_frames.add(metadata.get("nframes"))
+            all_time_intervals.add(metadata.get("timeinterval"))
 
-            all_time_units.add(metadata.get("time_units"))
-            all_spatial_units.add(metadata.get("spatial_units"))
-            all_n_frames.add(metadata.get("n_frames"))
-            all_time_intervals.add(metadata.get("time_interval"))
-
-        print("All time units:", all_time_units)
-        print("All spatial units:", all_spatial_units)
-        print("All n_frames:", all_n_frames)
-        print("All time intervals:", all_time_intervals)
-        
+        if len(all_time_units) > 1:
+            warn("Inconsistent time units across input files.", InputWarning, stacklevel=2)
+        if len(all_spatial_units) > 1:
+            warn("Inconsistent spatial units across input files.", InputWarning, stacklevel=2)
+        if len(all_n_frames) > 1:
+            warn("Inconsistent number of frames across input files.", InputWarning, stacklevel=2)
+        if len(all_time_intervals) > 1:
+            raise InputError("Inconsistent time intervals across input files. Please ensure that all input files have the same time interval.")
 
 
 
@@ -108,3 +125,9 @@ class SpotsObject:
 @dataclass
 class TracksObject(SpotsObject): ...
 
+
+
+
+
+
+input_metadata = InputMetadata()
