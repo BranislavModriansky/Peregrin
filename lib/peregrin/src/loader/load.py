@@ -10,12 +10,112 @@ import os.path as op
 from typing import Dict, List, Optional, Tuple
 from os import PathLike
 
-
+from warnings import warn
 from .._pckg_exceptions._pckg_errors import *
 from .._pckg_exceptions._pckg_warnings import *
 
-from ..compute.stats import stats
+
 from ..various import get_aliases
+
+
+
+
+
+class Input(pd.DataFrame):
+    """A pandas DataFrame that carries a `.metadata` (InputMetadata) attribute."""
+
+    _metadata = ['metadata']  # propagate through pandas operations
+
+    @property
+    def _constructor(self):
+        return Input
+
+
+class InputMetadata:
+    """
+    Input metadata container:
+    -------------------------
+
+    A dictionary mapping metadata to file names:
+
+        {
+            "file1.csv": {
+                "spatial_units": str,
+                "time_units": str, 
+                "time_interval": float,
+                "n_frames": int,
+            },
+            "file2.csv": ...,
+        }
+    """
+
+    input_metadata: Dict[str, dict] = {}
+
+    UNIT_ALIASES = {
+        'μm': ['μm', 'um', 'micron', 'microns', 'micrometer', 'micrometers'],
+        's': ['s', 'sec', 'second', 'seconds'],
+        'min': ['m', 'min', 'minute', 'minutes'],
+        'ms': ['ms', 'millisecond', 'milliseconds'],
+        'h': ['h', 'hr', 'hour', 'hours'],
+        'd': ['d', 'day', 'days'],
+        'px': ['px', 'pixel', 'pixels'],
+        'mm': ['mm', 'millimeter', 'millimeters'],
+        'cm': ['cm', 'centimeter', 'centimeters'],
+    }
+
+    def __init__(self):
+        self.input_metadata = {}
+
+    def __getitem__(self, key):
+        return self.input_metadata[key]
+
+    def __setitem__(self, key, value):
+        self.input_metadata[key] = value
+
+    def update(self, metadata: Dict[str, dict]):
+        for key, item in metadata.items():
+            for sub_key, sub_item in item.items():
+                for unit, aliases in self.UNIT_ALIASES.items():
+                    if sub_item in aliases:
+                        metadata[key][sub_key] = unit
+                        break
+
+        self.input_metadata.update(metadata)
+
+    def get(self, file_name: Optional[str] = None, metadata_keys: Optional[List[str]] = None) -> Optional[dict]:
+
+        if file_name is None:
+            return self.input_metadata
+        
+        metadata = self.input_metadata.get(file_name)
+        if metadata is None:
+            return None
+        if metadata_keys is None:
+            return metadata
+        return {key: metadata.get(key) for key in metadata_keys}
+
+    def check(self) -> None:
+        all_time_units = set()
+        all_spatial_units = set()
+        all_n_frames = set()
+        all_time_intervals = set()
+
+        for _, metadata in self.input_metadata.items(): 
+            all_time_units.add(metadata.get("timeunits"))
+            all_spatial_units.add(metadata.get("spatialunits"))
+            all_n_frames.add(metadata.get("nframes"))
+            all_time_intervals.add(metadata.get("timeinterval"))
+
+        if len(all_time_units) > 1:
+            warn(f"Inconsistent time units across input files -> found {all_time_units}.", InputWarning, stacklevel=2)
+        if len(all_spatial_units) > 1:
+            warn(f"Inconsistent spatial units across input files -> found {all_spatial_units}.", InputWarning, stacklevel=2)
+        if len(all_n_frames) > 1:
+            warn(f"Inconsistent number of frames across input files -> found {all_n_frames}.", InputWarning, stacklevel=2)
+        if len(all_time_intervals) > 1:
+            raise InputError(f"Inconsistent time intervals across input files -> found {all_time_intervals}. Please ensure that all input files have the same time interval.")
+
+
 
 
 class DataLoader:
@@ -150,6 +250,9 @@ class DataLoader:
         self.retain = retain
         self.kwargs = kwargs
 
+        # Per-load metadata container
+        self.metadata = InputMetadata()
+
         self.id_col = colnames['id']
         self.t_col  = colnames['t']
         self.x_col  = colnames['x']
@@ -181,7 +284,7 @@ class DataLoader:
         records = []
         for labels, filepath in leaves:
             df, metadata = self._read_file(filepath)
-            stats.input_metadata.update(metadata)
+            self.metadata.update(metadata)
             df = self._extract(df)
 
             for cat, label in zip(used_categories, labels):
@@ -189,10 +292,30 @@ class DataLoader:
 
             records.append(df)
 
-        stats.input_metadata.check()
+        self.metadata.check()
 
-        return self._merge(records, used_categories)
+        result = self._merge(records, used_categories)
 
+        return self._attach_metadata(result)
+
+
+    def _attach_metadata(self, result):
+        """Attach the per-load Metadata object to the merged result."""
+        if isinstance(result, pd.DataFrame):
+            result = Input(result)
+            result.metadata = self.metadata
+        elif isinstance(result, dict):
+            self._attach_metadata_dict(result)
+        return result
+
+    def _attach_metadata_dict(self, node):
+        for key, val in node.items():
+            if isinstance(val, pd.DataFrame):
+                val = Input(val)
+                val.metadata = self.metadata
+                node[key] = val
+            elif isinstance(val, dict):
+                self._attach_metadata_dict(val)
 
 
     def merge_leaf_lists(tree, depth):
@@ -691,7 +814,7 @@ class DataLoader:
 
         temp_args = get_aliases(
             {'from': self.timeunit, 'to': self.convert_time_to},
-            stats.input_metadata.UNIT_ALIASES
+            self.metadata.UNIT_ALIASES
         )
         from_unit = temp_args['from']
         to_unit = temp_args['to']
@@ -711,8 +834,8 @@ class DataLoader:
 
         df["time_point"] = df["time_point"] * factor
 
-        stats.input_metadata['timeinterval'] = self.timeinterval * factor
-        stats.input_metadata['timeunits'] = to_unit
+        self.metadata['timeinterval'] = self.timeinterval * factor
+        self.metadata['timeunits'] = to_unit
 
         return df
 

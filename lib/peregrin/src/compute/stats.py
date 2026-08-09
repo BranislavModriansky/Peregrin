@@ -19,96 +19,6 @@ from .._pckg_exceptions._pckg_warnings import *
 
 
 
-# class Input:
-#     """
-#     Base class for input data containers.
-#     """
-
-#     data: ...
-
-#     def __init__(self):
-#         pass
-
-
-class InputMetadata():
-    """
-    Input metadata container:
-    -------------------------
-
-    A dictionary mapping metadata to file names:
-
-        {
-            "file1.csv": {
-                "spatial_units": str,
-                "time_units": str, 
-                "time_interval": float,
-                "n_frames": int,
-            },
-            "file2.csv": ...,
-        }
-    """
-
-    input_metadata: Dict[str, dict] = {}
-
-    UNIT_ALIASES = {
-        'μm': ['μm', 'um', 'micron', 'microns', 'micrometer', 'micrometers'],
-        's': ['s', 'sec', 'second', 'seconds'],
-        'min': ['m', 'min', 'minute', 'minutes'],
-        'ms': ['ms', 'millisecond', 'milliseconds'],
-        'h': ['h', 'hr', 'hour', 'hours'],
-        'd': ['d', 'day', 'days'],
-        'px': ['px', 'pixel', 'pixels'],
-        'mm': ['mm', 'millimeter', 'millimeters'],
-        'cm': ['cm', 'centimeter', 'centimeters'],
-    }
-
-    def __init__(self):
-        self.input_metadata = {}
-
-    def update(self, metadata: Dict[str, dict]):
-        for key, item in metadata.items():
-            for sub_key, sub_item in item.items():
-                for unit, aliases in self.UNIT_ALIASES.items():
-                    if sub_item in aliases:
-                        metadata[key][sub_key] = unit
-                        break
-
-        self.input_metadata.update(metadata)
-
-    def get(self, file_name: Optional[str] = None, metadata_keys: Optional[List[str]] = None) -> Optional[dict]:
-
-        if file_name is None:
-            return self.input_metadata
-        
-        metadata = self.input_metadata.get(file_name)
-        if metadata is None:
-            return None
-        if metadata_keys is None:
-            return metadata
-        return {key: metadata.get(key) for key in metadata_keys}
-
-    def check(self) -> None:
-        all_time_units = set()
-        all_spatial_units = set()
-        all_n_frames = set()
-        all_time_intervals = set()
-
-        for _, metadata in self.input_metadata.items(): 
-            all_time_units.add(metadata.get("timeunits"))
-            all_spatial_units.add(metadata.get("spatialunits"))
-            all_n_frames.add(metadata.get("nframes"))
-            all_time_intervals.add(metadata.get("timeinterval"))
-
-        if len(all_time_units) > 1:
-            warn(f"Inconsistent time units across input files -> found {all_time_units}.", InputWarning, stacklevel=2)
-        if len(all_spatial_units) > 1:
-            warn(f"Inconsistent spatial units across input files -> found {all_spatial_units}.", InputWarning, stacklevel=2)
-        if len(all_n_frames) > 1:
-            warn(f"Inconsistent number of frames across input files -> found {all_n_frames}.", InputWarning, stacklevel=2)
-        if len(all_time_intervals) > 1:
-            raise InputError(f"Inconsistent time intervals across input files -> found {all_time_intervals}. Please ensure that all input files have the same time interval.")
-
-
 
 
 @dataclass
@@ -2113,14 +2023,12 @@ class Summarize:
 
 
 class Stats(
-    InputMetadata,
     SpotsObject,
     TracksObject,
     Calc
 ):
 
     def __init__(self):
-        self.input_metadata = InputMetadata()
         self.calc = Calc()
 
 
