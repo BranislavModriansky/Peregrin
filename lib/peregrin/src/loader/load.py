@@ -284,7 +284,7 @@ class DataLoader:
         records = []
         for labels, filepath in leaves:
             df, metadata = self._read_file(filepath)
-            self.metadata.update(metadata)
+            self.metadata.update(self._filter_metadata(metadata))
             df = self._extract(df)
 
             for cat, label in zip(used_categories, labels):
@@ -838,6 +838,27 @@ class DataLoader:
         self.metadata['timeunits'] = to_unit
 
         return df
+
+
+    def _filter_metadata(self, metadata: Dict[str, dict]) -> Dict[str, dict]:
+        """
+        Keep only the essential column units (id/t/x/y) plus any `retain`
+        columns, alongside the special summary keys.
+        """
+        keep_cols = [self.id_col, self.t_col, self.x_col, self.y_col]
+        if self.retain:
+            keep_cols += list(self.retain)
+
+        special_keys = ['spatialunits', 'timeunits', 'timeinterval', 'nframes']
+
+        filtered = {}
+        for file_name, meta in metadata.items():
+            new_meta = {col: meta[col] for col in keep_cols if col in meta}
+            for k in special_keys:
+                if k in meta:
+                    new_meta[k] = meta[k]
+            filtered[file_name] = new_meta
+        return filtered
 
 
 load_data = DataLoader().load_data
