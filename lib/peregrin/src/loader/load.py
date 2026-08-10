@@ -36,7 +36,7 @@ class InputMetadata:
     Input metadata container:
     -------------------------
 
-    A dictionary mapping metadata to file names:
+    Keeps a dictionary (1) mapping metadata to files:
 
         {
             "file1.csv": {
@@ -47,9 +47,12 @@ class InputMetadata:
             },
             "file2.csv": ...,
         }
+
+    and a dictionary (2) of the metadata unified across all files.
     """
 
-    input_metadata: Dict[str, dict] = {}
+    input_metadata_unified: Dict[str, str] = {}
+    input_metadata_separate: Dict[str, dict] = {}
 
     UNIT_ALIASES = {
         'μm': ['μm', 'um', 'micron', 'microns', 'micrometer', 'micrometers'],
@@ -64,13 +67,19 @@ class InputMetadata:
     }
 
     def __init__(self):
-        self.input_metadata = {}
+        self.input_metadata_unified = {
+            "spatialunits": '',
+            "timeunits": '',
+            "timeinterval": '',
+            "nframes": '',
+        }
+        self.input_metadata_separate = {}
 
     def __getitem__(self, key):
-        return self.input_metadata[key]
+        return self.input_metadata_separate[key]
 
     def __setitem__(self, key, value):
-        self.input_metadata[key] = value
+        self.input_metadata_separate[key] = value
 
     def update(self, metadata: Dict[str, dict]):
         for key, item in metadata.items():
@@ -80,37 +89,57 @@ class InputMetadata:
                         metadata[key][sub_key] = unit
                         break
 
-        self.input_metadata.update(metadata)
+        self.input_metadata_separate.update(metadata)
+        self._check()
 
-    def get(self, file_name: Optional[str] = None, metadata_keys: Optional[List[str]] = None) -> Optional[dict]:
+    def get(self, metadata_key: str = None) -> Dict[str, str] | str:
+        if metadata_key is not None:
+            return self.input_metadata_unified.get(metadata_key)
+        return self.input_metadata_unified
 
+    def get_each(self, file_name: Optional[str] = None, metadata_keys: Optional[List[str]] = None) -> Optional[dict]:
         if file_name is None:
-            return self.input_metadata
-        
-        metadata = self.input_metadata.get(file_name)
-        if metadata is None:
-            return None
-        if metadata_keys is None:
-            return metadata
-        return {key: metadata.get(key) for key in metadata_keys}
+            if metadata_keys is not None:
+                return {file: {
+                    key: metadata.get(key) for key in metadata_keys
+                } for file, metadata in self.input_metadata_separate.items()}
+            return self.input_metadata_separate
+        else:
+            if metadata_keys is not None:
+                return {key: self.input_metadata_separate[file_name].get(key) for key in metadata_keys}
+            return self.input_metadata_separate[file_name]
 
-    def check(self) -> None:
+    def _check(self) -> None:
         all_time_units = set()
         all_spatial_units = set()
         all_n_frames = set()
         all_time_intervals = set()
 
-        for _, metadata in self.input_metadata.items(): 
+        for _, metadata in self.input_metadata_separate.items(): 
             all_time_units.add(metadata.get("timeunits"))
             all_spatial_units.add(metadata.get("spatialunits"))
             all_n_frames.add(metadata.get("nframes"))
             all_time_intervals.add(metadata.get("timeinterval"))
 
+        first_metadata = next(iter(self.input_metadata_separate.values()))
+        self.input_metadata_unified["timeunits"] = first_metadata.get("timeunits")
+        self.input_metadata_unified["spatialunits"] = first_metadata.get("spatialunits")
+        self.input_metadata_unified["nframes"] = first_metadata.get("nframes")
+        self.input_metadata_unified["timeinterval"] = first_metadata.get("timeinterval")
+
+        if self.input_metadata_unified.get("timeunits") is None or self.input_metadata_unified.get("timeunits") == '':
+            warn("No time units found in input files.\n Please specify the time units using <load_data result>.metadata.update({\"timeunits\": \"<unit>\"})", InputWarning, stacklevel=2)
+        if self.input_metadata_unified.get("spatialunits") is None or self.input_metadata_unified.get("spatialunits") == '':
+            warn("No spatial units found in input files.\n Please specify the spatial units using <load_data result>.metadata.update({\"spatialunits\": \"<unit>\"})", InputWarning, stacklevel=2)
+        
         if len(all_time_units) > 1:
+            self.input_metadata_unified["timeunits"] = ''
             warn(f"Inconsistent time units across input files -> found {all_time_units}.", InputWarning, stacklevel=2)
         if len(all_spatial_units) > 1:
+            self.input_metadata_unified["spatialunits"] = ''
             warn(f"Inconsistent spatial units across input files -> found {all_spatial_units}.", InputWarning, stacklevel=2)
         if len(all_n_frames) > 1:
+            self.input_metadata_unified["nframes"] = ''
             warn(f"Inconsistent number of frames across input files -> found {all_n_frames}.", InputWarning, stacklevel=2)
         if len(all_time_intervals) > 1:
             raise InputError(f"Inconsistent time intervals across input files -> found {all_time_intervals}. Please ensure that all input files have the same time interval.")
@@ -140,9 +169,9 @@ class DataLoader:
         files: PathLike[str] | list | dict = None,
         colnames: dict = {
             'id': 'TRACK_ID', 
-            't':  'POSITION_T', 
-            'x':  'POSITION_X', 
-            'y':  'POSITION_Y'
+            't': 'POSITION_T', 
+            'x': 'POSITION_X', 
+            'y': 'POSITION_Y'
         }, 
         *,
         retain: Optional[list[str]] = None,
@@ -291,8 +320,6 @@ class DataLoader:
                 df[cat] = label
 
             records.append(df)
-
-        self.metadata.check()
 
         result = self._merge(records, used_categories)
 
