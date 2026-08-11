@@ -36,7 +36,16 @@ class InputMetadata:
     Input metadata container:
     -------------------------
 
-    Keeps a dictionary (1) mapping metadata to files:
+    Keeps a dictionary (1) of the metadata unified across all files.
+
+        {
+            "spatial_units": str,
+            "time_units": str, 
+            "time_interval": float,
+            "n_frames": int,
+        }
+
+    and a dictionary (2) mapping metadata to files:
 
         {
             "file1.csv": {
@@ -46,9 +55,7 @@ class InputMetadata:
                 "n_frames": int,
             },
             "file2.csv": ...,
-        }
-
-    and a dictionary (2) of the metadata unified across all files.
+        } 
     """
 
     input_metadata_unified: Dict[str, str] = {}
@@ -109,6 +116,18 @@ class InputMetadata:
                 return {key: self.input_metadata_separate[file_name].get(key) for key in metadata_keys}
             return self.input_metadata_separate[file_name]
 
+    def write(self, *, spatialunits = None, timeunits = None, timeinterval = None, nframes = None):
+        self.input_metadata_unified["spatialunits"] = self._get_alias(spatialunits) if spatialunits is not None else self.input_metadata_unified["spatialunits"]
+        self.input_metadata_unified["timeunits"] = self._get_alias(timeunits) if timeunits is not None else self.input_metadata_unified["timeunits"]
+        self.input_metadata_unified["timeinterval"] = timeinterval if timeinterval is not None else self.input_metadata_unified["timeinterval"]
+        self.input_metadata_unified["nframes"] = nframes if nframes is not None else self.input_metadata_unified["nframes"]
+
+    def _get_alias(self, unit: str) -> str:
+        for alias, aliases in self.UNIT_ALIASES.items():
+            if unit in aliases:
+                return alias
+        raise ValueError(f"Unit '{unit}' is not recognized. Please use one of the following units: {list(self.UNIT_ALIASES.keys())}")
+
     def _check(self) -> None:
         all_time_units = set()
         all_spatial_units = set()
@@ -128,9 +147,9 @@ class InputMetadata:
         self.input_metadata_unified["timeinterval"] = first_metadata.get("timeinterval")
 
         if self.input_metadata_unified.get("timeunits") is None or self.input_metadata_unified.get("timeunits") == '':
-            warn("No time units found in input files.\n Please specify the time units using <load_data result>.metadata.update({\"timeunits\": \"<unit>\"})", InputWarning, stacklevel=2)
+            warn("No time units found in input files.\n Please specify the time units using <load_data result>.metadata.write(timeunits=\"<unit>\")", InputWarning, stacklevel=2)
         if self.input_metadata_unified.get("spatialunits") is None or self.input_metadata_unified.get("spatialunits") == '':
-            warn("No spatial units found in input files.\n Please specify the spatial units using <load_data result>.metadata.update({\"spatialunits\": \"<unit>\"})", InputWarning, stacklevel=2)
+            warn("No spatial units found in input files.\n Please specify the spatial units using <load_data result>.metadata.write(spatialunits=\"<unit>\")", InputWarning, stacklevel=2)
         
         if len(all_time_units) > 1:
             self.input_metadata_unified["timeunits"] = ''
