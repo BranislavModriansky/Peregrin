@@ -149,9 +149,9 @@ class InputMetadata:
         self.input_metadata_unified["timeinterval"] = first_metadata.get("timeinterval")
 
         if self.input_metadata_unified.get("timeunits") is None or self.input_metadata_unified.get("timeunits") == '':
-            warn("No time units found in input files.\n Please specify the time units using <load_data result>.metadata.write(timeunits=\"<unit>\")", InputWarning, stacklevel=2)
+            warn("No time units found in input files.\n Please specify the time units using <load_data result>.metadata.write(time_unit=\"<unit>\")", InputWarning, stacklevel=2)
         if self.input_metadata_unified.get("spatialunits") is None or self.input_metadata_unified.get("spatialunits") == '':
-            warn("No spatial units found in input files.\n Please specify the spatial units using <load_data result>.metadata.write(spatialunits=\"<unit>\")", InputWarning, stacklevel=2)
+            warn("No spatial units found in input files.\n Please specify the spatial units using <load_data result>.metadata.write(spatial_unit=\"<unit>\")", InputWarning, stacklevel=2)
         
         if len(all_time_units) > 1:
             self.input_metadata_unified["timeunits"] = ''

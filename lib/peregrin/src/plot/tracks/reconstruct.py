@@ -20,7 +20,7 @@ from ..._pckg_exceptions._pckg_warnings import *
 from ...categorizer import categorize
 from ..painter import paint
 from ...various import Values, get_aliases, is_empty, clock
-from ...compute.stats import Stats
+# from ...compute.stats import stats
 
 
 class AnimateTracks:
@@ -480,8 +480,22 @@ class ReconstructTracks:
         if self.categories is not None:
             self.spot_data = categorize(self.spot_data, self.categories, **self.kwargs)
 
+        # Promote an index-based track_uid to a real column, or derive one
+        # from track_id (+ category columns) for raw input data. Never use
+        # the plain row index: that makes every row its own "track".
         if 'track_uid' not in self.spot_data.columns:
-            self.spot_data['track_uid'] = self.spot_data.index
+            if self.spot_data.index.name == 'track_uid' or 'track_uid' in (self.spot_data.index.names or []):
+                self.spot_data = self.spot_data.reset_index()
+            elif 'track_id' in self.spot_data.columns:
+                cat_cols = [c for c in ('set', 'subset', 'group', 'subgroup', 'subsubgroup')
+                            if c in self.spot_data.columns]
+                self.spot_data['track_uid'] = (
+                    self.spot_data.groupby(cat_cols + ['track_id'], sort=False).ngroup()
+                )
+            else:
+                raise ColumnsNotFoundError(
+                    "Cannot determine track identity: no 'track_uid' or 'track_id' found."
+                )
 
         self.spot_data = (
             self.spot_data

@@ -15,29 +15,7 @@ from warnings import warn
 from .._pckg_exceptions._pckg_errors import *
 from .._pckg_exceptions._pckg_warnings import *
 
-
-
-
-
-
-
-@dataclass
-class SpotsObject: 
-
-    units = {
-
-    }
-
-@dataclass
-class TracksObject: ...
-
-
-
-
-
-
-
-
+from ..plot.tracks.reconstruct import reconstruct
 
 
 
@@ -566,6 +544,7 @@ class Calc:
     def spots(
         self,
         df: pd.DataFrame,
+        subset: list[str] = None,
         **kwargs
     ) -> pd.DataFrame:
         """ Computes per-trajectory-point statistics, both local (previous -> current position) and cumulative (start -> current position).
@@ -578,6 +557,12 @@ class Calc:
             - `x_coordinate`
             - `y_coordinate`
             - `time_point`
+
+        subset : list[str], optional
+            If provided, only the listed metric columns are returned. The returned
+            DataFrame still includes the grouping/category columns as well as
+            `track_id`, `track_uid`, `time_point`, and `frame`. If None (default),
+            all spot metrics are returned.
 
         ignore_categories : bool, optional
             If True, the `condition` and `replicate` columns will be ignored in the computation, and all data will be treated as a single group.
@@ -678,9 +663,13 @@ class Calc:
         grouping_cols = [col for col in self.DEFAULT_CATEGORIES if col in df.columns]
 
         # Create a unique track identifier (track_uid) based on the grouping columns
-        df = self._assign_track_uid(df)
+        df = self.assign_track_uid(df)
 
-        df.sort_values(grouping_cols + ['time_point'], inplace=True)
+        # Sort so that each track's rows are contiguous and time-ordered.
+        # Including track_uid here (before time_point) is essential: sorting
+        # only by grouping_cols + time_point interleaves rows of different
+        # tracks that share the same category values.
+        df.sort_values(grouping_cols + ['track_uid', 'time_point'], inplace=True)
 
         if self.t_step is None:
             _t = df.copy()
@@ -701,9 +690,21 @@ class Calc:
 
         df['frame'] = grp['time_point'].rank(method='dense').astype('Int64') - 1
 
-        bad = df.groupby(grouping_cols + ['time_point'], sort=False)['frame'].nunique(dropna=True).max()
+        # Validate per TRACK: within a single track, one time_point must map
+        # to exactly one frame. (Across tracks, the same time_point may
+        # legitimately map to different frames, since frames are ranked
+        # per-track and tracks can start at different times.)
+        bad = (
+            df.groupby([df.index.get_level_values('track_uid'), 'time_point'], sort=False)['frame']
+            .nunique(dropna=True)
+            .max()
+        )
         if bad and bad > 1:
-            raise TimePointError(f"Multiple frames assigned to the same {grouping_cols} × time_point combination. Multiplicates of time_point values within the data. Max frames per time point: {bad}.")
+            raise TimePointError(
+                f"Multiple frames assigned to the same track_uid × time_point "
+                f"combination. Duplicate time_point values within a track. "
+                f"Max frames per time point: {bad}."
+            )
 
         # distance between the previous and the current position
         df['distance'] = np.hypot(
@@ -786,6 +787,17 @@ class Calc:
 
         # Drop all-NaN columns (if any are present)
         df.dropna(how='all', axis='columns', inplace=True)
+
+        # If a subset of metrics was requested, keep only those columns
+        # (always retaining the identifier/index columns).
+        if subset is not None:
+            _always_keep = ['track_id', 'track_uid', 'time_point', 'frame']
+            requested = set(subset)
+            keep = [
+                col for col in df.columns
+                if col in _always_keep or col in requested
+            ]
+            df = df[keep]
 
         if self.significant_figures:
             df = self.signify(df)
@@ -918,7 +930,7 @@ class Calc:
 
         grouping_cols = [col for col in self.DEFAULT_CATEGORIES if col in df.columns]
 
-        df = self._assign_track_uid(df)
+        df = self.assign_track_uid(df)
 
         if self.t_step is None:
             _t = df.copy()
@@ -1087,7 +1099,7 @@ class Calc:
             grouping_cols = self._get_grouping_level(df.columns, grouping_level, exclude='track_uid')
             grouping_set = [grouping_cols]
 
-        df = self._assign_track_uid(df)
+        df = self.assign_track_uid(df)
 
         # Resolve which metric columns to compute once (respecting subset & flags).
         wanted = self._frames_registry.resolve(
@@ -1354,7 +1366,7 @@ class Calc:
             if df.index.name == 'track_uid':
                 df = df.reset_index(drop=False)
             else:
-                df = self._assign_track_uid(df).reset_index(drop=False)
+                df = self.assign_track_uid(df).reset_index(drop=False)
 
         # Unique time points
         t_unique = np.sort(df['time_point'].unique())
@@ -1568,22 +1580,32 @@ class Calc:
 
 
 
-    def _assign_track_uid(
+    def assign_track_uid(
         self,
         df: pd.DataFrame
     ) -> pd.DataFrame:
-        """ Creates a unique track identifier `track_uid` by combining the default category columns (`self.DEFAULT_CATEGORIES`) present in the DataFrame. """
+        """ Creates a unique track identifier `track_uid` by combining the category
+        columns present in the DataFrame with `track_id`, so each physical track
+        gets its own uid. """
 
-        if 'track_uid' not in df.columns:
-            grouping_columns = [col for col in self.DEFAULT_CATEGORIES if col in df.columns]
-            if not all(col in df.columns for col in grouping_columns):
-                missing_cols = [col for col in grouping_columns if col not in df.columns]
-                raise ColumnsNotFoundError(f"Missing required columns for track_uid creation: {missing_cols}")
+        if 'track_uid' not in df.columns and df.index.name != 'track_uid':
+            grouping_cols = [c for c in self.DEFAULT_CATEGORIES
+                             if c in df.columns and c != 'track_uid']
 
-            # Create a unique track identifier by assigning a unique integer to each combination of the grouping columns
-            df['track_uid'] = df.groupby(grouping_columns, sort=False).ngroup()
+            # track_id MUST be part of the uid key, otherwise all tracks that
+            # share the same category values collapse into a single uid.
+            if 'track_id' in df.columns:
+                grouping_cols = grouping_cols + ['track_id']
 
-        df.set_index(['track_uid'], drop=True, append=False, inplace=True, verify_integrity=False)
+            if not grouping_cols:
+                raise ColumnsNotFoundError(
+                    "Cannot create track_uid: no category columns or 'track_id' found."
+                )
+
+            df['track_uid'] = df.groupby(grouping_cols, sort=False).ngroup()
+
+        if df.index.name != 'track_uid':
+            df.set_index(['track_uid'], drop=True, append=False, inplace=True, verify_integrity=False)
         return df
 
 
@@ -2183,8 +2205,6 @@ class Stats(Calc):
     def __call__(
         self,
         df: pd.DataFrame,
-        *,
-        categories: Optional[dict] = None,
         **kwargs,
     ) -> "Stats":
         """Compute per-spot statistics from raw spot data and store them.
@@ -2194,10 +2214,10 @@ class Stats(Calc):
         >>> stats = Stats()
         >>> stats = stats(loaded_df)
         """
-        if categories is not None:
-            from ..categorizer import categorize
-            df = categorize(df, categories, **kwargs)
-            self._categories = categories
+        # if categories is not None:
+        #     from ..categorizer import categorize
+        #     df = categorize(df, categories, **kwargs)
+        #     self._categories = categories
 
         self.spots_df = self.spots(df, **kwargs)
 
@@ -2211,25 +2231,25 @@ class Stats(Calc):
     # -----------------------------------------------------------------------
     # Internal: resolve which spot data to operate on
     # -----------------------------------------------------------------------
-    def _resolve_spots(self, df: Optional[pd.DataFrame]) -> pd.DataFrame:
-        if df is not None:
-            return df
-        if self.spots_df is None:
-            raise ValueError(
-                "No spot data available. Call the Stats instance with a "
-                "DataFrame first, e.g. `stats = stats(df)`, or pass `df=...`."
-            )
-        return self.spots_df
+    # def _resolve_spots(self, df: Optional[pd.DataFrame]) -> pd.DataFrame:
+    #     if df is not None:
+    #         return df
+    #     if self.spots_df is None:
+    #         raise ValueError(
+    #             "No spot data available. Call the Stats instance with a "
+    #             "DataFrame first, e.g. `stats = stats(df)`, or pass `df=...`."
+    #         )
+    #     return self.spots_df
 
     # -----------------------------------------------------------------------
     # Compute wrappers (store results on the instance)
     # -----------------------------------------------------------------------
-    def compute_spots(self, df: Optional[pd.DataFrame] = None, **kwargs) -> pd.DataFrame:
+    def compute_spots(self, df: Optional[pd.DataFrame] = None, subset: Optional[list[str]] = None, **kwargs) -> pd.DataFrame:
         """Compute (and store) per-spot statistics."""
         source = df if df is not None else self.spots_df
         if source is None:
             raise ValueError("No input DataFrame provided for compute_spots().")
-        self.spots_df = self.spots(source, **kwargs)
+        self.spots_df = self.spots(source, subset=subset, **kwargs)
         return self.spots_df
 
     def compute_tracks(
@@ -2296,20 +2316,17 @@ class Stats(Calc):
     # -----------------------------------------------------------------------
     def plot_tracks(
         self,
-        *,
-        track_data: Optional[pd.DataFrame] = None,
-        align_at_start: bool = False,
         **kwargs,
     ):
         """Reconstruct and plot trajectories from the stored Spots_df."""
-        from ..plot.tracks.reconstruct import ReconstructTracks
-
-        source = self._resolve_spots(None)
-        return ReconstructTracks().reconstruct(
+        source = self.spots_df
+        if source is not None and 'track_uid' not in source.columns:
+            # Calc.spots() leaves track_uid as the index; promote it so the
+            # reconstructor sees contiguous, correctly-labelled tracks.
+            if source.index.name == 'track_uid' or 'track_uid' in (source.index.names or []):
+                source = source.reset_index()
+        return reconstruct(
             source,
-            track_data=track_data,
-            align_at_start=align_at_start,
-            categories=self._categories,
             **kwargs,
         )
 
