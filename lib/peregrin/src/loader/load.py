@@ -1,7 +1,6 @@
 import re
 from sys import path
 import traceback
-import warnings
 
 import xml.etree.ElementTree as ET
 import pandas as pd
@@ -16,6 +15,7 @@ from .._pckg_exceptions._pckg_warnings import *
 
 
 from ..various import get_aliases
+from ..compute.stats import calc
 
 
 
@@ -62,6 +62,7 @@ class InputMetadata:
     input_metadata_separate: Dict[str, dict] = {}
 
     UNIT_ALIASES = {
+        'nm': ['nm', 'nanometer', 'nanometers'],
         'μm': ['μm', 'um', 'micron', 'microns', 'micrometer', 'micrometers'],
         's': ['s', 'sec', 'second', 'seconds'],
         'min': ['m', 'min', 'minute', 'minutes'],
@@ -71,6 +72,7 @@ class InputMetadata:
         'px': ['px', 'pixel', 'pixels'],
         'mm': ['mm', 'millimeter', 'millimeters'],
         'cm': ['cm', 'centimeter', 'centimeters'],
+        'm': ['m', 'meter', 'meters'],
     }
 
     def __init__(self):
@@ -168,10 +170,6 @@ class InputMetadata:
 
 class DataLoader:
 
-    ALIASES = {
-        
-    }
-
     CATEGORIES = {
         'set': 5,
         'subset': 4,
@@ -180,8 +178,8 @@ class DataLoader:
         'subsubgroup': 1
     }
 
-    def __init__(self): ...
-
+    def __init__(self):
+        pass
 
     def load_data(
         self, 
@@ -249,17 +247,24 @@ class DataLoader:
             A dictionary specifying the column names for track identifiers, time points, and x/y coordinates. 
             With the default {'id': None, 't': None, 'x': None, 'y': None}, the method will NOT attempt to 
             automatically detect these columns.
-
-        t_unit : str, optional, default 's'
-            The unit of time used in the input data. Supported units include: 'ms', 's', 'min', 'h', 'day'.
         
         retain : list[str], optional, default None
             A list of column names from the original input data to be retained. If None, only the essential columns 
             (track_id, time_point, x_coordinate, y_coordinate) are extracted, while all other columns are discarded.
 
         convert_time_to : str, optional, default None
-            If provided, time will be converted from the input unit `t_unit` to the specified target unit. 
+            If provided, time will be converted from the input time units to the specified target unit.
+            If the metadata do not contain time unit information and the time unit is not passed to the function by `time_unit="<value>"`, the method will be skipped.
             Supported units include: 'ms', 's', 'min', 'h', 'day'.
+
+        convert_spatial_to : str, optional, default None
+            If provided, spatial coordinates will be converted from the input unit `spatial_unit` to the specified target unit. 
+            If the metadata does not contain spatial unit information and the spatial unit is not passed to the function by `spatial_unit="<value>"`, the method will be skipped.
+            If the input units cannot be converted from nor to 'px', the conversion will be skipped.
+            Supported units include: 'nm', 'μm', 'mm', 'cm', 'm'.
+
+        ignore_matadata : bool, optional, default False
+            If True, the method will ignore any metadata found in the input files. This is useful when the user wants to manually specify metadata or when the input files contain inconsistent or incorrect metadata.
 
         mirror_y : bool, optional, default False
             If True, the method will mirror the y-coordinates across their midpoint - useful for correcting mirrored y-coordinates in exported data.
@@ -307,7 +312,6 @@ class DataLoader:
         self.y_col  = colnames['y']
 
         # Time / transform options (wired as kwargs)
-        self.convert_time_to = kwargs.get('convert_time_to', None)
         self.mirror_y = kwargs.get('mirror_y', False)
         self.mirror_x = kwargs.get('mirror_x', False)
         self.merge = kwargs.get('merge', 'all')
@@ -332,7 +336,8 @@ class DataLoader:
         records = []
         for labels, filepath in leaves:
             df, metadata = self._read_file(filepath)
-            self.metadata.update(self._filter_metadata(metadata))
+            if not self.kwargs.get('ignore_metadata', False):
+                self.metadata.update(self._filter_metadata(metadata))
             df = self._extract(df)
 
             for cat, label in zip(used_categories, labels):
@@ -543,13 +548,6 @@ class DataLoader:
             current = [item for d in current for item in d.values()]
 
         return [f for group in current for f in group]
-
-
-    def _load_metadata(self, metadata: Dict[str, any]) -> None:
-            """
-            Load metadata from a dictionary into the global object.
-            """
-            ...
             
 
     def _extract(
@@ -580,8 +578,10 @@ class DataLoader:
             
         df = self._standname(df, self.id_col, self.t_col, self.x_col, self.y_col)
 
-        # run time conversion for any requested target unit handled by _convert_time
-        if self.convert_time_to not in (None, ""):
+        # run time conversion for any requested target
+        if self.kwargs.get('convert_spatial_to', None) not in (None, ""):
+            df = self._convert_spatial(df)
+        if self.kwargs.get('convert_time_to', None) not in (None, ""):
             df = self._convert_time(df)
          
         return df
@@ -654,10 +654,11 @@ class DataLoader:
 
         # merge image calibration into the same metadata dict
         metadata.update(root.find('Settings/ImageData').attrib)
-        metadata['spatialunits'] = spatialunits
-        metadata['timeunits'] = timeunits
+        metadata['spatialunits'] = spatialunits if self.kwargs.get('spatial_unit', None) is None else self.kwargs.get('spatial_unit')
+        metadata['timeunits'] = timeunits if self.kwargs.get('time_unit', None) is None else self.kwargs.get('time_unit')
 
-        self.timeunit = timeunits
+        self.timeunit = metadata['timeunits']
+        self.spatialunit = metadata['spatialunits']
         self.timeinterval = metadata['timeinterval']
 
         metadata = {str(filepath.split(op.sep)[-1]): metadata}
@@ -734,12 +735,13 @@ class DataLoader:
                 u = ''
             metadata[col] = u
 
-        metadata['spatialunits'] = metadata.get(self.x_col, '')
-        metadata['timeunits'] = metadata.get(self.t_col, '')
+        metadata['spatialunits'] = metadata.get(self.x_col, '') if self.kwargs.get('spatial_unit', None) is None else self.kwargs.get('spatial_unit')
+        metadata['timeunits'] = metadata.get(self.t_col, '') if self.kwargs.get('time_unit', None) is None else self.kwargs.get('time_unit')
         metadata['timeinterval'] = self._calculate_time_interval(df)
         metadata['nframes'] = df[self.t_col].nunique()
 
         self.timeunit = metadata['timeunits']
+        self.spatialunit = metadata['spatialunits']
         self.timeinterval = metadata['timeinterval']
 
         return metadata
@@ -768,7 +770,7 @@ class DataLoader:
                 return base
             else:
                 result = float(np.median(timeintervals))
-                warnings.warn((f"Non-uniformly spaced time point data -> will probably lead to incorrect data computation.\n"
+                warn((f"Non-uniformly spaced time point data -> will probably lead to incorrect data computation.\n"
                                f"Observed time steps:\n{timeintervals}\nUsing: {result}"), InputWarning, 2)
                 return result
 
@@ -821,7 +823,7 @@ class DataLoader:
             count = _rep_guard_list.count(rep_lbl)
             data['track_id'] = data['track_id'].apply(lambda x: f"{count}_{x}")
 
-            warnings.warn(message=f"Multiple ({count+1}) replicate labels: '{rep_lbl}' \n-> adding prefix: {count} to replicate label: {rep_lbl}\nFile info: {file_info}",
+            warn(message=f"Multiple ({count+1}) replicate labels: '{rep_lbl}' \n-> adding prefix: {count} to replicate label: {rep_lbl}\nFile info: {file_info}",
                           category=LabelWarning,
                           stacklevel=2)
             
@@ -847,36 +849,74 @@ class DataLoader:
 
     def _standname(self, df, id_col: str, t_col: str, x_col: str, y_col: str) -> pd.DataFrame:
         return df.rename(columns={id_col: 'track_id', t_col: 'time_point', x_col: 'x_coordinate', y_col: 'y_coordinate'})
-    
 
-    def _convert_time(self, df: pd.DataFrame) -> pd.DataFrame:
-        unit_to_seconds = {
-            "ms": 1e-3,
-            "s": 1.0,
-            "min": 60.0,
-            "h": 3600.0,
-            "day": 86400.0,
-        }
 
+    def _convert_spatial(self, df: pd.DataFrame) -> pd.DataFrame:
+        if self.spatialunit in (None, ""):
+            warn('No spatial units found in input files.\n Please specify the spatial units using `spatial_unit="<unit>"`.', InputWarning, stacklevel=2)
+            return df
+        
         temp_args = get_aliases(
-            {'from': self.timeunit, 'to': self.convert_time_to},
+            {'from': self.spatialunit, 'to': self.kwargs.get('convert_spatial_to')},
             self.metadata.UNIT_ALIASES
         )
         from_unit = temp_args['from']
         to_unit = temp_args['to']
 
         if from_unit is None or to_unit is None:
-            warnings.warn(
-                message=f"Unsupported time conversion: {self.timeunit} -> {self.convert_time_to}. Skipping conversion.",
+            warn(
+                message=f"Unsupported spatial conversion: {self.spatialunit} -> {self.kwargs.get('convert_spatial_to')}. Skipping conversion.",
                 category=LabelWarning,
                 stacklevel=2
             )
             return df
 
+        # Normalize to canonical unit keys used by the lookup tables.
+        from_unit = self.metadata._get_alias(from_unit)
+        to_unit = self.metadata._get_alias(to_unit)
+
         if from_unit == to_unit:
             return df
 
-        factor = unit_to_seconds[from_unit] / unit_to_seconds[to_unit]
+        factor = calc.UNIT_TO_MICRONS[from_unit] / calc.UNIT_TO_MICRONS[to_unit]
+
+        df["x_coordinate"] = df["x_coordinate"] * factor
+        df["y_coordinate"] = df["y_coordinate"] * factor
+
+        self.metadata['spatialunits'] = to_unit
+
+        return df
+    
+
+    def _convert_time(self, df: pd.DataFrame) -> pd.DataFrame:
+
+        if self.timeunit in (None, ""):
+            warn('No time units found in input files.\n Please specify the time units using `time_unit="<unit>"`.', InputWarning, stacklevel=2)
+            return df
+        
+        temp_args = get_aliases(
+            {'from': self.timeunit, 'to': self.kwargs.get('convert_time_to')},
+            self.metadata.UNIT_ALIASES
+        )
+        from_unit = temp_args['from']
+        to_unit = temp_args['to']
+
+        if from_unit is None or to_unit is None:
+            warn(
+                message=f"Unsupported time conversion: {self.timeunit} -> {self.kwargs.get('convert_time_to')}. Skipping conversion.",
+                category=LabelWarning,
+                stacklevel=2
+            )
+            return df
+
+        # Normalize to canonical unit keys used by the lookup tables.
+        from_unit = self.metadata._get_alias(from_unit)
+        to_unit = self.metadata._get_alias(to_unit)
+
+        if from_unit == to_unit:
+            return df
+
+        factor = calc.UNIT_TO_SECONDS[from_unit] / calc.UNIT_TO_SECONDS[to_unit]
 
         df["time_point"] = df["time_point"] * factor
 
@@ -884,7 +924,7 @@ class DataLoader:
         self.metadata['timeunits'] = to_unit
 
         return df
-
+    
 
     def _filter_metadata(self, metadata: Dict[str, dict]) -> Dict[str, dict]:
         """

@@ -215,6 +215,23 @@ class Calc:
         'TIMEINTERVALS': ['condition', 'replicate', 'time_lag', 'frame_lag']
     }
 
+    UNIT_TO_SECONDS = {
+        "ms": 1e-3,
+        "s": 1.0,
+        "min": 60.0,
+        "h": 3600.0,
+        "d": 86400.0,
+    }
+
+    UNIT_TO_MICRONS = {
+        "nm": 1e-3,
+        "μm": 1.0,   # U+03BC (matches InputMetadata.UNIT_ALIASES)
+        "µm": 1.0,   # U+00B5 (micro sign, kept for safety)
+        "mm": 1e3,
+        "cm": 1e4,
+        "m": 1e6,
+    }
+
     def __init__(
         self,
         *,
@@ -264,10 +281,125 @@ class Calc:
         # Build metric registries once per instance.
         self._frames_registry = self._build_frames_registry()
         self._ti_registry = self._build_time_intervals_registry()
+        self._tracks_registry = self._build_tracks_registry()
 
     # -----------------------------------------------------------------------
     # Registry builders
     # -----------------------------------------------------------------------
+    def _build_tracks_registry(self) -> MetricRegistry:
+        """Register one computer per TRACKS output column.
+
+        Each computer receives a shared context dict built in `tracks()`:
+            ctx['grp']    -> DataFrameGroupBy over track_uid
+            ctx['t_step'] -> the resolved time step
+            ctx['cache']  -> dict for memoizing intermediate results
+        """
+        reg = MetricRegistry()
+
+        # --- Speed statistics (distance-based, scaled by t_step) ------------
+        def _speed(agg: str) -> Callable:
+            def _fn(ctx: dict) -> pd.Series:
+                s = getattr(ctx['grp']['distance'], agg)()
+                return s / ctx['t_step']
+            return _fn
+
+        def _speed_sd(ctx: dict) -> pd.Series:
+            return ctx['grp']['distance'].std() / ctx['t_step']
+
+        reg.add('speed_min', _speed('min'), gate='always')
+        reg.add('speed_max', _speed('max'), gate='always')
+        reg.add('speed_mean', _speed('mean'), gate='always')
+        reg.add('speed_sd', _speed_sd, gate='always')
+        reg.add('speed_median', _speed('median'), gate='always')
+
+        # --- Track length ---------------------------------------------------
+        reg.add('track_length', lambda ctx: ctx['grp']['distance'].sum(), gate='always')
+
+        # --- Location (mean position) --------------------------------------
+        reg.add('x_location', lambda ctx: ctx['grp']['x_coordinate'].mean(), gate='always')
+        reg.add('y_location', lambda ctx: ctx['grp']['y_coordinate'].mean(), gate='always')
+
+        # --- Max distance reached ------------------------------------------
+        reg.add(
+            'max_distance_reached',
+            lambda ctx: ctx['grp']['cum_track_displacement'].max(),
+            gate='always',
+        )
+
+        # --- Start/end frames ----------------------------------------------
+        reg.add('track_start_frame', lambda ctx: ctx['grp']['frame'].min(), gate='always')
+        reg.add('track_end_frame', lambda ctx: ctx['grp']['frame'].max(), gate='always')
+
+        # --- Straight-line speed & linearity (last cumulative value) --------
+        reg.add(
+            'mean_straight_line_speed',
+            lambda ctx: ctx['grp']['cum_mean_straight_line_speed'].last(),
+            gate='always',
+        )
+        reg.add(
+            'forward_progression_linearity',
+            lambda ctx: ctx['grp']['cum_forward_progression_linearity'].last(),
+            gate='always',
+        )
+
+        # --- Directional statistics (last cumulative value) -----------------
+        reg.add(
+            'direction_mean',
+            lambda ctx: ctx['grp']['cum_direction_mean'].last(),
+            gate='always',
+        )
+        reg.add(
+            'direction_var',
+            lambda ctx: ctx['grp']['cum_direction_var'].last(),
+            gate='always',
+        )
+        reg.add(
+            'mean_directional_change',
+            lambda ctx: ctx['grp']['cum_mean_directional_change'].last(),
+            gate='always',
+        )
+        reg.add(
+            'mean_directional_change_rate',
+            lambda ctx: ctx['grp']['cum_mean_directional_change_rate'].last(),
+            gate='always',
+        )
+
+        # --- Track point count ---------------------------------------------
+        reg.add('track_points', lambda ctx: ctx['grp'].size(), gate='always')
+
+        # --- Displacement & straightness (depend on first/last coords) ------
+        def _coords(ctx: dict) -> dict:
+            cache = ctx['cache']
+            if 'coords' not in cache:
+                grp = ctx['grp']
+                cache['coords'] = {
+                    'start_x': grp['x_coordinate'].first(),
+                    'end_x':   grp['x_coordinate'].last(),
+                    'start_y': grp['y_coordinate'].first(),
+                    'end_y':   grp['y_coordinate'].last(),
+                }
+            return cache['coords']
+
+        def _displacement(ctx: dict) -> pd.Series:
+            cache = ctx['cache']
+            if 'displacement' not in cache:
+                c = _coords(ctx)
+                cache['displacement'] = pd.Series(
+                    np.hypot(c['end_x'] - c['start_x'], c['end_y'] - c['start_y']),
+                    index=c['start_x'].index,
+                )
+            return cache['displacement']
+
+        def _straightness(ctx: dict) -> pd.Series:
+            disp = _displacement(ctx)
+            length = ctx['grp']['distance'].sum()
+            return disp / length
+
+        reg.add('track_displacement', _displacement, gate='always')
+        reg.add('straightness_ratio', _straightness, gate='always')
+
+        return reg
+
     def _build_frames_registry(self) -> MetricRegistry:
         """Register one computer per FRAMES output column."""
         reg = MetricRegistry()
@@ -317,8 +449,8 @@ class Calc:
             if 'ci' in self.INFER_ERR:
                 low = f'{mout}_{self.CI_STATISTIC}_ci{self.CONFIDENCE_LEVEL}_low'
                 high = f'{mout}_{self.CI_STATISTIC}_ci{self.CONFIDENCE_LEVEL}_high'
-                reg.add(low, _make_ci(src, 0), gate='infer_err')
-                reg.add(high, _make_ci(src, 1), gate='infer_err')
+                reg.add(low, _make_ci(0), gate='infer_err')
+                reg.add(high, _make_ci(1), gate='infer_err')
 
         # --- Circular statistics --------------------------------------------
         def _circ(kind: str) -> Callable:
@@ -474,7 +606,7 @@ class Calc:
             - `cum_track_displacement` =
             euclidean distance from the starting position of the track to the current position
 
-            - `cum_straightness_ratio =
+            - `cum_straightness_ratio` =
             cum_track_displacement / cum_track_length`
 
             - `cum_speed_mean` =
@@ -666,6 +798,7 @@ class Calc:
     def tracks(
         self,
         df: pd.DataFrame,
+        subset: list[str] = None,
         *,
         to_disk: bool = ...,
         **kwargs
@@ -684,6 +817,12 @@ class Calc:
             - `distance`
             - `cum_track_displacement`
             - `direction`
+
+        subset : list[str], optional
+            If provided, only the listed metric columns are computed. The returned
+            DataFrame still includes the grouping/category columns as well as
+            `track_id` and `track_uid`. If None (default), all track metrics are
+            computed.
 
         ignore_categories : bool, optional
             If True, the `condition` and `replicate` columns will be ignored in the computation, and all data will be treated as a single group.
@@ -801,46 +940,22 @@ class Calc:
 
         grp = df.groupby(level='track_uid', sort=False)
 
-        speed_agg_spec = {
-            'speed_min':    lambda x: x.min() / t_step,
-            'speed_max':    lambda x: x.max() / t_step,
-            'speed_mean':   lambda x: x.mean() / t_step,
-            'speed_sd':     lambda x: x.std() / t_step,
-            'speed_median': lambda x: x.median() / t_step,
+        # Resolve which metric columns to compute (respecting subset).
+        # Track metrics are always enabled; gating flags do not apply here.
+        wanted = self._tracks_registry.resolve(
+            subset,
+            descr=True,
+            descr_err=True,
+            infer_err=True,
+        )
+
+        ctx = {
+            'grp': grp,
+            't_step': t_step,
+            'cache': {},
         }
 
-        # Build the named agg dict: each entry is (column, func)
-        agg_spec = {
-            'track_length': ('distance', 'sum'),
-        }
-        for label, func in speed_agg_spec.items():
-            agg_spec[label] = ('distance', func)
-
-        # Add coordinates first/last for displacement calculation
-        agg_spec['start_x'] = ('x_coordinate', 'first')
-        agg_spec['end_x']   = ('x_coordinate', 'last')
-        agg_spec['start_y'] = ('y_coordinate', 'first')
-        agg_spec['end_y']   = ('y_coordinate', 'last')
-
-        agg_spec['x_location'] = ('x_coordinate', 'mean')
-        agg_spec['y_location'] = ('y_coordinate', 'mean')
-
-        agg_spec['max_distance_reached'] = ('cum_track_displacement', 'max')
-
-        agg_spec['track_start_frame'] = ('frame', 'min')
-        agg_spec['track_start_time'] = ('time_point', 'min')
-        agg_spec['track_end_frame'] = ('frame', 'max')
-        agg_spec['track_end_time'] = ('time_point', 'max')
-
-        agg_spec['mean_straight_line_speed'] = ('cum_mean_straight_line_speed', 'last')
-        agg_spec['forward_progression_linearity'] = ('cum_forward_progression_linearity', 'last')
-
-        agg_spec['direction_mean'] = ('cum_direction_mean', 'last')
-        agg_spec['direction_var'] = ('cum_direction_var', 'last')
-        agg_spec['mean_directional_change'] = ('cum_mean_directional_change', 'last')
-        agg_spec['mean_directional_change_rate'] = ('cum_mean_directional_change_rate', 'last')
-
-        agg = grp.agg(**agg_spec)
+        agg = self._tracks_registry.compute(wanted, ctx)
 
         # If colors were assigned, carry them over
         for col in df.columns:
@@ -848,14 +963,6 @@ class Calc:
                 colors = grp[col].first()
                 agg = agg.merge(colors, left_index=True, right_index=True)
 
-        # Displacement and straightness
-        agg['track_displacement'] = np.hypot(agg['end_x'] - agg['start_x'], agg['end_y'] - agg['start_y'])
-        agg['straightness_ratio'] = (agg['track_displacement'] / agg['track_length'])
-        agg = agg.drop(columns=['start_x','end_x','start_y','end_y'])
-
-        # Points/ per track
-        n = grp.size().rename('track_points')
-        agg = agg.merge(n, left_index=True, right_index=True)
         df = df.merge(agg, left_index=True, right_index=True, how='right')
         df = df.drop(grouping_cols, axis=1, errors='ignore')
 
@@ -2022,18 +2129,224 @@ class Summarize:
 
 
 
-class Stats(
-    SpotsObject,
-    TracksObject,
-    Calc
-):
+class Stats(Calc):
+    """
+    A stateful, callable interface over :class:`Calc`.
 
-    def __init__(self):
-        self.calc = Calc()
+    Usage
+    -----
+    >>> stats = Stats()
+    >>> stats = stats(spot_df)                 # computes & stores Spots_df
+    >>> tracks_df = stats.compute_tracks()     # per-track statistics
+    >>> frames_df = stats.compute_frames()     # per-time-point statistics
+    >>> ti_df = stats.compute_time_intervals() # per-time-interval statistics
+    >>> stats.plot_tracks()                    # reconstruct trajectories
+    >>> stats.plot_msd(band='sem')             # MSD plot
 
+    Calling the instance with a DataFrame runs :meth:`Calc.spots` and stores the
+    result on the instance. Subsequent ``compute_*`` / ``plot_*`` methods operate
+    on that stored Spots_df unless another DataFrame is passed explicitly.
+    """
 
+    def __init__(
+        self,
+        *,
+        cat_descr: bool = True,
+        cat_descr_err: bool = True,
+        cat_infer_err: bool = False,
+        bootstrap_ci: bool = False,
+        **kwargs,
+    ) -> None:
+        super().__init__(
+            cat_descr=cat_descr,
+            cat_descr_err=cat_descr_err,
+            cat_infer_err=cat_infer_err,
+            bootstrap_ci=bootstrap_ci,
+            **kwargs,
+        )
 
+        # Stored results.
+        self.spots_df: Optional[pd.DataFrame] = None
+        self.tracks_df: Optional[pd.DataFrame] = None
+        self.frames_df: Optional[pd.DataFrame] = None
+        self.time_intervals_df: Optional[pd.DataFrame] = None
 
+        self._categories: Optional[dict] = None
+
+    def __repr__(self) -> str:
+        n = None if self.spots_df is None else len(self.spots_df)
+        return f"<Stats object: spots_rows={n}>"
+
+    # -----------------------------------------------------------------------
+    # Callable entry point: compute & store Spots_df
+    # -----------------------------------------------------------------------
+    def __call__(
+        self,
+        df: pd.DataFrame,
+        *,
+        categories: Optional[dict] = None,
+        **kwargs,
+    ) -> "Stats":
+        """Compute per-spot statistics from raw spot data and store them.
+
+        Returns ``self`` so the call can be chained/re-bound:
+
+        >>> stats = Stats()
+        >>> stats = stats(loaded_df)
+        """
+        if categories is not None:
+            from ..categorizer import categorize
+            df = categorize(df, categories, **kwargs)
+            self._categories = categories
+
+        self.spots_df = self.spots(df, **kwargs)
+
+        # Invalidate downstream caches on new input.
+        self.tracks_df = None
+        self.frames_df = None
+        self.time_intervals_df = None
+
+        return self
+
+    # -----------------------------------------------------------------------
+    # Internal: resolve which spot data to operate on
+    # -----------------------------------------------------------------------
+    def _resolve_spots(self, df: Optional[pd.DataFrame]) -> pd.DataFrame:
+        if df is not None:
+            return df
+        if self.spots_df is None:
+            raise ValueError(
+                "No spot data available. Call the Stats instance with a "
+                "DataFrame first, e.g. `stats = stats(df)`, or pass `df=...`."
+            )
+        return self.spots_df
+
+    # -----------------------------------------------------------------------
+    # Compute wrappers (store results on the instance)
+    # -----------------------------------------------------------------------
+    def compute_spots(self, df: Optional[pd.DataFrame] = None, **kwargs) -> pd.DataFrame:
+        """Compute (and store) per-spot statistics."""
+        source = df if df is not None else self.spots_df
+        if source is None:
+            raise ValueError("No input DataFrame provided for compute_spots().")
+        self.spots_df = self.spots(source, **kwargs)
+        return self.spots_df
+
+    def compute_tracks(
+        self,
+        df: Optional[pd.DataFrame] = None,
+        subset: Optional[list[str]] = None,
+        **kwargs,
+    ) -> pd.DataFrame:
+        """Compute (and store) per-track statistics from the stored Spots_df."""
+        source = self._resolve_spots(df)
+        self.tracks_df = self.tracks(source, subset=subset, **kwargs)
+        return self.tracks_df
+
+    def compute_frames(
+        self,
+        df: Optional[pd.DataFrame] = None,
+        subset: Optional[list[str]] = None,
+        *,
+        grouping_level: Any = 'highest',
+        **kwargs,
+    ) -> pd.DataFrame:
+        """Compute (and store) per-time-point statistics from the stored Spots_df."""
+        source = self._resolve_spots(df)
+        self.frames_df = self.frames(
+            source, subset=subset, grouping_level=grouping_level, **kwargs
+        )
+        return self.frames_df
+
+    def compute_time_intervals(
+        self,
+        df: Optional[pd.DataFrame] = None,
+        subset: Optional[list[str]] = None,
+        *,
+        grouping_level: Any = 'highest',
+        **kwargs,
+    ) -> pd.DataFrame:
+        """Compute (and store) per-time-interval statistics from the stored Spots_df."""
+        source = self._resolve_spots(df)
+        self.time_intervals_df = self.time_intervals(
+            source, subset=subset, grouping_level=grouping_level, **kwargs
+        )
+        return self.time_intervals_df
+
+    def compute_all(
+        self,
+        df: Optional[pd.DataFrame] = None,
+        **kwargs,
+    ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        """Compute and store all four statistics DataFrames."""
+        source = self._resolve_spots(df)
+        self.spots_df = source
+        self.compute_tracks()
+        self.compute_frames(**kwargs)
+        self.compute_time_intervals(**kwargs)
+        return (
+            self.spots_df,
+            self.tracks_df,
+            self.frames_df,
+            self.time_intervals_df,
+        )
+
+    # -----------------------------------------------------------------------
+    # Plotting wrappers (lazy imports avoid circular deps)
+    # -----------------------------------------------------------------------
+    def plot_tracks(
+        self,
+        *,
+        track_data: Optional[pd.DataFrame] = None,
+        align_at_start: bool = False,
+        **kwargs,
+    ):
+        """Reconstruct and plot trajectories from the stored Spots_df."""
+        from ..plot.tracks.reconstruct import ReconstructTracks
+
+        source = self._resolve_spots(None)
+        return ReconstructTracks().reconstruct(
+            source,
+            track_data=track_data,
+            align_at_start=align_at_start,
+            categories=self._categories,
+            **kwargs,
+        )
+
+    def plot_msd(
+        self,
+        band: Optional[str] = None,
+        *,
+        grouping_level: Any = 'highest',
+        **kwargs,
+    ):
+        """Plot MSD from the stored Spots_df."""
+        from ..plot.time.lags import MSD
+
+        source = self._resolve_spots(None)
+        return MSD().plot(
+            source,
+            band=band,
+            categories=self._categories,
+            grouping_level=grouping_level,
+            **kwargs,
+        )
+
+    def plot_turn_angles_heatmap(
+        self,
+        *,
+        grouping_level: Any = 'highest',
+        **kwargs,
+    ):
+        """Plot the turning-angle heatmap from the stored Spots_df."""
+        from ..plot.time.lags import TurnAnglesHeatmap
+
+        source = self._resolve_spots(None)
+        return TurnAnglesHeatmap(
+            source,
+            grouping_level=grouping_level,
+            **kwargs,
+        )
 
 
 # input_metadata = InputMetadata()
