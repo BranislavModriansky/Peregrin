@@ -17,6 +17,14 @@ class Parameters:
 
     ignore_categories: bool = False
 
+    # colors: dict[int, str] = {
+    #     0: '#477fc2',
+    #     1: '#39383f',
+    #     2: '#a1b6ca',
+    #     3: '#c9cd6a',
+    #     4: '#3b5575'
+    # }
+
     def settings(self, **kwargs: Any) -> None:
         """ Update package settings. """
 

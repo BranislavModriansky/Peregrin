@@ -1,444 +1,557 @@
-import time
-import traceback
-from dataclasses import dataclass, field
-from unittest import case
+import itertools
 
-import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
 import numpy as np
-from typing import Any, Literal
-from pandas.api.types import is_object_dtype
-from math import floor, ceil
+import pandas as pd
 
-from .._pckg_exceptions._pckg_errors import FilteringError
-from ..various import clock, is_empty
-from .stats import Stats
-
-
-# TODO: fix reindexing so that data is then later on plotted correctly.
+from matplotlib.path import Path as MplPath
+from matplotlib.widgets import PolygonSelector, SpanSelector, Cursor
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+from scipy.stats import gaussian_kde
 
 
-
-@dataclass
-class Inventory2D:
-
-    id = np.array([1])
-    idx_x = np.array([])
-    idx_y = np.array([])
-    property_x = np.array([])
-    property_y = np.array([])
-    series_x = np.array([])
-    series_y = np.array([])
-    threshold_x = np.array(["Literal"])
-    threshold_y = np.array(["Literal"])
+class InvalidParameterValueError(ValueError): ...
 
 
+# ============================================================================
+# Base selector
+# ============================================================================
+class _BaseSelector:
+    """Common plumbing: id, styling, selection state, df access."""
 
-@dataclass
-class Inventory1D:
-    id_idx = np.array([0])
-    property = np.array([None])
+    _ids = itertools.count(1)
 
-    filter = [None]
-    selection = [None]
-    mask = [None]
-    series = [None]
-    ambit = [None]
+    # shared style
+    ACCENT = "#002fff"
+    ACCENT_SOFT = "#002fff4b"
+    SPAN_FACE = "#7E7EE9"
+    BG = "#e3e4e7"
+    GREY_OUT = "darkgrey"
 
-    spot_data = pd.DataFrame()
-    track_data = pd.DataFrame()
+    def __init__(self, df: pd.DataFrame, limits=None, **kwargs):
+        self.id = next(self._ids)
+        self.df = df
+        self.kwargs = kwargs
+        self.cmap = plt.get_cmap(kwargs.get("cmap", "magma"))
+        self.selection = {"mask": None, "df": None}
+        self.fig = None
+        self.ax = None
+        if limits is not None:
+            self._check_limits(limits)
 
+    def _check_limits(self, limits):
+        if len(limits) == 2:
+            if not isinstance(limits[0], (int, float)) or not isinstance(limits[1], (int, float)):
+                raise InvalidParameterValueError(f"limits must be a pair of numeric values; got {limits!r}")
+            self.selection.update({"min": limits[0], "max": limits[1]})
+            if self.selection["min"] > self.selection["max"]:
+                self.selection["min"], self.selection["max"] = self.selection["max"], self.selection["min"]
+        else:
+            for i in limits:
+                if not len(i) == 2:
+                    raise InvalidParameterValueError(f"limits must be a list of numeric pairs; got {i!r}")
+                if not isinstance(i[0], (int, float)) or not isinstance(i[1], (int, float)):
+                    raise InvalidParameterValueError(f"limits must be numeric values; got {i!r}")
+            self.selection.update({"verts": limits})
 
-class Filter1D:
-
-    noticequeue: Any = None
-
-    def __init__(self, eps: float = 1e-12):
-        self.EPS = eps
+    # ---- helpers -----------------------------------------------------------
+    def _style_ax(self, ax, grid_axis="both"):
+        for side in ["top", "right"]:
+            ax.spines[side].set_visible(False)
+        ax.tick_params(axis="both", which="both", length=0)
+        ax.set_facecolor(self.BG)
+        ax.grid(True, axis=grid_axis, which="major", color="white", linewidth=0.5, zorder=0)
+        ax.grid(True, axis=grid_axis, which="minor", color="white", linewidth=0.25, zorder=0, alpha=0.75)
 
     @staticmethod
-    def clamp_range(min: int | float, max: int | float) -> tuple[int, int]:
-        """
-        Clamps given min and max values to whole numbers.
-        """
+    def _validate_log(*flags):
+        for f in flags:
+            if not isinstance(f, bool):
+                raise InvalidParameterValueError(f"{f!r} is not a valid log value; must be boolean")
 
-        if min is None or not isinstance(min, int | float | np.number):
-            min = 0
-        if max is None or not isinstance(max, int | float | np.number):
-            max = 100
-        if min > max:
-            min, max = max, min
+    def _label_kwargs(self, **overrides):
+        kw = dict(color=self.ACCENT, fontsize=10, fontstyle="italic",
+                  ha="center", va="bottom", zorder=100000, clip_on=False)
+        kw.update(overrides)
+        return kw
 
-        min = floor(min)
-        max = ceil(max)
+    def _sample(self, df: pd.DataFrame, n: int = 10000, frac: float = None, **kw) -> pd.DataFrame:
+        _random_state = kw.get("random_state", 42)
+        if frac is not None:
+            if not isinstance(frac, float) or not (0 < frac <= 1):
+                raise InvalidParameterValueError(f"sample_fraction must be a float between 0 and 1; got {frac!r}")
+            return df.sample(frac=frac, random_state=_random_state).reset_index(drop=True)
+        elif len(df) > n:
+            return df.sample(n=n, random_state=_random_state).reset_index(drop=True)
+        else:
+            return df
 
-        return min, max
+    def _filter_verts(self, df: pd.DataFrame = None) -> pd.DataFrame:
+        """Apply the selected polygon gate to the *full* dataframe."""
+        verts = self.selection.get("verts")
+        source = self.df if df is None else df
+        if verts is None:
+            return source.reset_index(drop=True)
+
+        xv = source[self._x].to_numpy(float)
+        yv = source[self._y].to_numpy(float)
+
+        finite = np.isfinite(xv) & np.isfinite(yv)
+        if self._log_x:
+            finite &= xv > 0
+        if self._log_y:
+            finite &= yv > 0
+
+        inside = np.zeros(len(source), dtype=bool)
+        inside[finite] = MplPath(verts).contains_points(
+            np.column_stack([xv[finite], yv[finite]])
+        )
+        return source.loc[inside].reset_index(drop=True)
+
+    def _filter_minmax(self, df: pd.DataFrame = None) -> pd.DataFrame:
+        """Apply the selected min/max range to the *full* dataframe."""
+        source = self.df if df is None else df
+        min_val, max_val = self.selection.get("min"), self.selection.get("max")
+        if min_val is None or max_val is None:
+            return source.reset_index(drop=True)
+        mask = (source[self._metric] >= min_val) & (source[self._metric] <= max_val)
+        return source.loc[mask].reset_index(drop=True)
+
+    # ---- public API --------------------------------------------------------
+    @property
+    def result(self) -> dict:
+        """Filtered dataframe (raises if nothing selected yet)."""
+        return self.selection
+
+    @property
+    def mask(self) -> np.ndarray:
+        return self.selection["mask"]
+
+    @property
+    def limits(self) -> dict:
+        if self.selection.get("verts", None) is not None:
+            return {"verts": self.selection["verts"]}
+        elif self.selection.get("min", None) is not None and self.selection.get("max", None) is not None:
+            return {"min": self.selection.get("min", None), "max": self.selection.get("max", None)}
+        else:
+            return {}
+
+    def __repr__(self):
+        return f"{type(self).__name__}(id={self.id})"
 
 
-    def Apply(self, **kwargs) -> pd.DataFrame:
-        """
-        Returns:
-            tuple: (spotstats, trackstats, framestats, tintervalstats)
-        """
+# ============================================================================
+# 2D polygon gate
+# ============================================================================
+class GateSelector(_BaseSelector):
+    """2D density scatter with polygon gating."""
 
-        spotstats = Stats.Spots.copy()
-        trackstats = Stats.Tracks.copy()
-        framestats = Stats.Frames.copy()
-        tintervalstats = Stats.TimeIntervals.copy()
+    def show(self, x: str, y: str, *, log: bool = False, **kwargs):
+        kw = {**self.kwargs, **kwargs}
+        log_x, log_y = kw.get("log_x", log), kw.get("log_y", log)
+        self._validate_log(log_x, log_y)
 
-        # Return empty dataframes if any input is empty
-        if any(is_empty(df) for df in [spotstats, trackstats, framestats, tintervalstats]):
-            return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-        
-        # Get the mask and ensure it's valid
-        mask = Inventory1D.mask[-1]
-        if mask is None or len(mask) == 0:
-            return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+        # remember gate geometry so we can filter the FULL df on the backend
+        self._x, self._y = x, y
+        self._log_x, self._log_y = log_x, log_y
 
-        # Normalize mask labels (drop NaN/None, dedupe)
-        valid_ids = pd.Index(np.asarray(mask).ravel())
-        if valid_ids.empty:
-            return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-        valid_ids = valid_ids[~valid_ids.isna()].unique()
-        if valid_ids.empty:
-            return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+        df = self._sample(self.df, **kw)
 
-        # Important: avoid .loc[listlike] on non-unique index (Pyodide/pandas bug path)
-        spotstats = spotstats.loc[spotstats.index.isin(valid_ids)]
-        trackstats = trackstats.loc[trackstats.index.isin(valid_ids)]
+        xdata, ydata = df[x].to_numpy(float), df[y].to_numpy(float)
+        finite = np.isfinite(xdata) & np.isfinite(ydata)
+        if log_x: finite &= xdata > 0
+        if log_y: finite &= ydata > 0
+        df = df.loc[finite].reset_index(drop=True)
+        xs, ys = xdata[finite], ydata[finite]
 
-        stats = Stats(
-            noticequeue=self.noticequeue,
-            cat_infer_err=kwargs.get("cat_infer_err", False),
-            bootstrap_ci=kwargs.get("bootstrap_ci", False)
+        xk = np.log(xs) if log_x else xs
+        yk = np.log(ys) if log_y else ys
+
+        bw = kw.get("kde_bw", "scott")
+        dens = gaussian_kde(np.vstack([xk, yk]), bw_method=bw)(np.vstack([xk, yk]))
+
+        self.fig, self.ax = plt.subplots(figsize=kw.get("figsize", (7, 7)))
+        fig, ax = self.fig, self.ax
+        pts = ax.scatter(xs, ys, c=dens, s=0.85, cmap=self.cmap, zorder=3)
+        ax.set_xlabel(x); ax.set_ylabel(y)
+        if log_x: ax.set_xscale("log", nonpositive="clip")
+        if log_y: ax.set_yscale("log", nonpositive="clip")
+        self._style_ax(ax)
+
+        # marginal KDEs
+        divider = make_axes_locatable(ax)
+        for side, vals, is_log in [("top", xk, log_x), ("right", yk, log_y)]:
+            m_ax = divider.append_axes(side, size="7%", pad=0,
+                                       sharex=ax if side == "top" else None,
+                                       sharey=ax if side == "right" else None)
+            grid = np.linspace(vals.min(), vals.max(), 400)
+            d = gaussian_kde(vals, bw_method=bw)(grid)
+            g = np.exp(grid) if is_log else grid
+            m_ax.plot(*((g, d) if side == "top" else (d, g)), color="grey", lw=1)
+            m_ax.set_axis_off()
+
+        base_colors = pts.get_facecolors().copy()
+        # ensure one color per point (scatter may collapse to a single row)
+        if len(base_colors) == 1 and len(xs) > 1:
+            base_colors = np.repeat(base_colors, len(xs), axis=0)
+
+        # preserve any predefined verts passed via `limits`
+        preset_verts = self.selection.get("verts")
+        self.selection = {"mask": None, "verts": preset_verts, "df": None}
+
+        fig._cursor = Cursor(ax, useblit=True, color=self.ACCENT_SOFT,
+                             linewidth=1, horizOn=True, vertOn=True)
+
+        # Overlay axes in linear [0, 1] display space so the polygon selector
+        # moves/stretches uniformly in pixels regardless of log scaling on `ax`.
+        ax_sel = fig.add_axes(ax.get_position(), frameon=False)
+        ax_sel.set_axes_locator(ax.get_axes_locator())
+        ax_sel.set_xlim(0, 1)
+        ax_sel.set_ylim(0, 1)
+        ax_sel.set_navigate(False)
+        ax_sel.set_axis_off()
+
+        def _sel_to_data(verts):
+            """axes-fraction [0,1] verts on ax_sel -> data coords on ax."""
+            disp = ax_sel.transAxes.transform(verts)
+            return ax.transData.inverted().transform(disp)
+
+        def on_select(verts):
+            data_verts = _sel_to_data(verts)
+            inside = MplPath(data_verts).contains_points(np.column_stack([xs, ys]))
+            colors = base_colors.copy()
+            colors[~inside] = mcolors.to_rgba(self.GREY_OUT)
+            pts.set_facecolors(colors)
+            fig.canvas.draw_idle()
+            # store verts; visualized df reflects the sampled subset, but
+            # `apply()` re-runs the gate on the full dataframe
+            self.selection.update(mask=inside, verts=data_verts,
+                                  df=df.loc[inside].reset_index(drop=True))
+
+        fig._poly_selector = PolygonSelector(
+            ax_sel, on_select, useblit=True,
+            props=dict(color=self.ACCENT, lw=1.25, zorder=99999),
+            handle_props=dict(markeredgecolor=self.ACCENT, markerfacecolor="white",
+                              marker="h", alpha=1, zorder=99999),
         )
 
-        stats.CI_STATISTIC = kwargs.get("ci_statistic", "mean")
-        stats.CONFIDENCE_LEVEL = kwargs.get("confidence_level", 0.95)
-        stats.BOOTSTRAP_RESAMPLES = kwargs.get("bootstrap_resamples", 1000)
-        stats.t_unit = kwargs.get("t_unit", "s")
+        # if verts were provided up front, draw them and apply the gate visually
+        if preset_verts is not None:
+            data_verts = [tuple(v) for v in preset_verts]
+            disp = ax.transData.transform(data_verts)
+            sel_verts = ax_sel.transAxes.inverted().transform(disp)
+            fig._poly_selector.verts = [tuple(v) for v in sel_verts]
 
-        framestats = stats.Frames(spotstats)
-        tintervalstats = stats.TimeIntervals(spotstats)
+            inside = MplPath(data_verts).contains_points(np.column_stack([xs, ys]))
+            colors = base_colors.copy()
+            colors[~inside] = mcolors.to_rgba(self.GREY_OUT)
+            pts.set_facecolors(colors)
+            self.selection.update(mask=inside, verts=data_verts,
+                                  df=df.loc[inside].reset_index(drop=True))
+            fig.canvas.draw_idle()
 
-        return spotstats, trackstats, framestats, tintervalstats
+        plt.show()
+        return self
 
-    def Initialize(self):
-        """
-        Initializes the filter inventory.
-        """
-
-        data = Inventory1D.track_data
-
-        if is_empty(data):
-            return
-
-        Inventory1D.selection = [None]
-        Inventory1D.ambit = [None]
-        Inventory1D.mask = [None]
-        Inventory1D.series = [None]
-
-        self._stream(0, data)
-        Inventory1D.selection[0] = Inventory1D.ambit[0][:2]
+    def apply(self, df: pd.DataFrame = None) -> pd.DataFrame:
+        """Apply the selected gate to the *full* dataframe (not just the sampled subset)."""
+        return self._filter_verts(df=df)
 
 
-    def Downstream(self, start: int):
-        """
-        Passes data downstream.
-        """
-        for idx in Inventory1D.id_idx[:-1]:
-            if idx < start:
-                continue
+# ============================================================================
+# 1D histogram threshold
+# ============================================================================
+class ThresholdSelector(_BaseSelector):
+    """Histogram with a horizontal SpanSelector for range thresholding (log-aware)."""
 
-            def missing_inventory():
-                return (
-                    len(Inventory1D.property) <= idx
-                    or len(Inventory1D.filter) <= idx
-                    or len(Inventory1D.selection) <= idx
-                )
+    def show(self, metric: str, *, log: bool = False, **kwargs):
+        kw = {**self.kwargs, **kwargs}
+        self._validate_log(log)
+        df = self.df
+        self._metric = metric
 
-            if missing_inventory():
+        raw = df[metric].to_numpy(float)
+        finite = np.isfinite(raw)
+        if log:
+            finite &= raw > 0
+        data = raw[finite]
+
+        self.fig, self.ax = plt.subplots(figsize=kw.get("figsize", (7, 4)))
+        fig, ax = self.fig, self.ax
+
+        # log-spaced bins when requested so bars are visually uniform
+        bins_arg = kw.get("bins", "auto")
+        if log and isinstance(bins_arg, int):
+            bins_arg = np.logspace(np.log10(data.min()), np.log10(data.max()), bins_arg + 1)
+
+        counts, bins, patches = ax.hist(data, bins=bins_arg,
+                                        edgecolor="white", linewidth=0.5, zorder=3)
+        norm = plt.Normalize(0, counts.max() * kw.get("density_factor", 1.05))
+        base_fc = [self.cmap(norm(c)) for c in counts]
+        for p, fc in zip(patches, base_fc):
+            p.set_facecolor(fc)
+
+        ax.set_xlabel(metric); ax.set_ylabel("Count")
+        if log:
+            ax.set_xscale("log", nonpositive="clip")
+        self._style_ax(ax)
+
+        # linear proxy axis so span width stays uniform in pixels (log-aware)
+        ax_sel = ax.twiny()
+        ax_sel.set_axes_locator(ax.get_axes_locator())
+        ax_sel.set_navigate(False); ax_sel.set_axis_off()
+        to_data = (lambda v: np.exp(v)) if log else (lambda v: v)
+        to_sel = (lambda v: np.log(v)) if log else (lambda v: v)
+
+        def _sync():
+            lo, hi = ax.get_xlim()
+            ax_sel.set_xlim(to_sel(lo), to_sel(hi))
+        _sync()
+        ax.callbacks.connect("xlim_changed", lambda *_: _sync())
+
+        # preserve any predefined min/max passed via `limits`
+        preset_min = self.selection.get("min")
+        preset_max = self.selection.get("max")
+        self.selection = {"min": None, "max": None, "mask": None, "df": None}
+        min_lbl = ax.text(0, 0, "", **self._label_kwargs(visible=False))
+        max_lbl = ax.text(0, 0, "", **self._label_kwargs(visible=False))
+
+        def onselect(vmin, vmax):
+            if vmin > vmax:
+                vmin, vmax = vmax, vmin
+            xmin, xmax = to_data(vmin), to_data(vmax)
+
+            if xmin == xmax:
+                self.selection.update(min=None, max=None, mask=None, df=None)
+                for p, fc in zip(patches, base_fc):
+                    p.set_facecolor(fc)
+                min_lbl.set_visible(False); max_lbl.set_visible(False)
+                fig.canvas.draw_idle()
                 return
 
-            data = self._choose_data(idx)
+            for p, fc, lo, hi in zip(patches, base_fc, bins[:-1], bins[1:]):
+                p.set_facecolor(fc if xmin <= 0.5 * (lo + hi) <= xmax else self.GREY_OUT)
 
-            if is_empty(data):
+            mask = (raw >= xmin) & (raw <= xmax)
+            self.selection.update(min=xmin, max=xmax, mask=mask,
+                                  df=df.loc[mask].reset_index(drop=True))
+
+            y_top = ax.get_ylim()[1]
+            for lbl, v in [(min_lbl, xmin), (max_lbl, xmax)]:
+                lbl.set_position((v, y_top)); lbl.set_text(f"{v:.4g}"); lbl.set_visible(True)
+
+            fig.canvas.draw_idle()
+
+        fig._span_selector = SpanSelector(
+            ax_sel, onselect, "horizontal", useblit=True, interactive=True,
+            drag_from_anywhere=True,
+            props=dict(alpha=0.2, facecolor=self.SPAN_FACE, zorder=2),
+            handle_props=dict(lw=1.25, color=self.ACCENT, zorder=99999),
+        )
+
+        # if limits were provided up front, draw the span and trigger selection
+        if preset_min is not None and preset_max is not None:
+            fig._span_selector.extents = (to_sel(preset_min), to_sel(preset_max))
+            onselect(to_sel(preset_min), to_sel(preset_max))
+
+        plt.show()
+        return self
+
+    def apply(self, df: pd.DataFrame = None) -> pd.DataFrame:
+        """Apply the selected min/max range to the *full* dataframe (not just the sampled subset)."""
+        return self._filter_minmax(df=df)
+
+
+# ============================================================================
+# 1D jitter strip
+# ============================================================================
+class JitterSelector(_BaseSelector):
+    """Jittered strip plot with vertical SpanSelector (log-aware)."""
+
+    def show(self, metric: str, *, log: bool = False, **kwargs):
+        kw = {**self.kwargs, **kwargs}
+        self._validate_log(log)
+        df = self.df
+        self._metric = metric
+
+        raw = df[metric].to_numpy(float)
+        finite = np.isfinite(raw)
+        if log: finite &= raw > 0
+        data = raw[finite]
+        kde_vals = np.log(data) if log else data
+
+        bw = kw.get("kde_bw", 0.2)
+        x_center = 1.0
+
+        density = gaussian_kde(kde_vals, bw_method=bw)(kde_vals)
+        dnorm = plt.Normalize(density.min(), density.max() * kw.get("density_factor", 1.05))
+        base_colors = self.cmap(dnorm(density))
+
+        self.fig, self.ax = plt.subplots(figsize=kw.get("figsize", (4, 7)))
+        fig, ax = self.fig, self.ax
+
+        jitter = (np.random.rand(len(data)) - 0.5) * kw.get("jitter_width", 1)
+        pts = ax.scatter(np.full(len(data), x_center) + jitter, data, s=4, marker="o",
+                         c=base_colors, alpha=kw.get("scatter_alpha", 1.0),
+                         zorder=10, edgecolors="none")
+
+        ax.set_ylabel(metric)
+        ax.set_xticks([x_center]); ax.set_xticklabels([metric])
+        ax.set_xlim(x_center - 0.55, x_center + 0.55)
+        if log: ax.set_yscale("log", nonpositive="clip")
+        self._style_ax(ax, grid_axis="y")
+
+        # right marginal KDE
+        divider = make_axes_locatable(ax)
+        ax_right = divider.append_axes("right", size="15%", pad=0, sharey=ax)
+        kde_y = gaussian_kde(kde_vals, bw_method=bw)
+        grid = np.linspace(kde_vals.min(), kde_vals.max(), 400)
+        y_dens = kde_y(grid)
+        y_grid = np.exp(grid) if log else grid
+        ax_right.plot(y_dens, y_grid, color="grey", lw=1, zorder=0, alpha=0.25)
+        kde_line, = ax_right.plot(y_dens, y_grid, color="grey", lw=1, zorder=2)
+        ax_right.set_axis_off()
+
+        # linear proxy axis for uniform dragging in log space
+        ax_sel = ax.twinx()
+        ax_sel.set_axes_locator(ax.get_axes_locator())
+        ax_sel.set_navigate(False); ax_sel.set_axis_off()
+        to_data = (lambda v: np.exp(v)) if log else (lambda v: v)
+        to_sel = (lambda v: np.log(v)) if log else (lambda v: v)
+
+        def _sync():
+            lo, hi = ax.get_ylim()
+            ax_sel.set_ylim(to_sel(lo), to_sel(hi))
+        _sync()
+        ax.callbacks.connect("ylim_changed", lambda *_: _sync())
+
+        # preserve any predefined min/max passed via `limits`
+        preset_min = self.selection.get("min")
+        preset_max = self.selection.get("max")
+        self.selection = {"min": None, "max": None, "mask": None, "df": None}
+        min_lbl = ax.text(0, 0, "", **self._label_kwargs(ha="left", va="top", visible=False))
+        max_lbl = ax.text(0, 0, "", **self._label_kwargs(ha="left", va="bottom", visible=False))
+
+        def onselect(vmin, vmax):
+            if vmin > vmax:
+                vmin, vmax = vmax, vmin
+            ymin, ymax = to_data(vmin), to_data(vmax)
+
+            if ymin == ymax:
+                self.selection.update(min=None, max=None, mask=None, df=None)
+                pts.set_facecolors(base_colors)
+                kde_line.set_data(y_dens, y_grid)
+                min_lbl.set_visible(False); max_lbl.set_visible(False)
+                fig.canvas.draw_idle()
                 return
-            
-            self._stream(idx, data)
-    
 
-    def PopLast(self):
-        """
-        Removes the last threshold from the inventory.
-        """
+            local_mask = (data >= ymin) & (data <= ymax)
+            colors = base_colors.copy()
+            colors[~local_mask] = mcolors.to_rgba(self.GREY_OUT, alpha=kw.get("scatter_alpha", 1.0))
+            pts.set_facecolors(colors)
 
-        Inventory1D.id_idx = Inventory1D.id_idx[:-1]
-        Inventory1D.property = Inventory1D.property[:-1]
-        Inventory1D.filter = Inventory1D.filter[:-1]
-        Inventory1D.selection = Inventory1D.selection[:-1]
-        Inventory1D.mask = Inventory1D.mask[:-1]
-        Inventory1D.series = Inventory1D.series[:-1]
-        Inventory1D.ambit = Inventory1D.ambit[:-1]
-
-        if len(Inventory1D.id_idx) == 1:
-            self._safe_end(0)
-        else:
-            self._safe_end(Inventory1D.id_idx[-2])
-        
-
-
-    def _stream(self, idx: int, data: pd.DataFrame):
-
-        if idx == 0:
-            Inventory1D.mask[idx] = data.index.to_numpy()
-            Inventory1D.series[idx] = self._get_series(idx, data)
-
-        else:
-            Inventory1D.mask[idx] = self._get_mask(idx)
-            Inventory1D.series[idx] = self._get_series(idx, data)
-            
-        Inventory1D.ambit[idx] = self._ambit(idx)
-
-        if idx == Inventory1D.id_idx[-2]:
-            self._safe_end(idx)
-
-   
-
-    def _safe_end(self, idx: int) -> None:
-        """
-        Sets the inventory at idx to None/empty.
-        """
-        new = idx + 1
-
-        try:
-            Inventory1D.property[new] = Inventory1D.property[idx]
-            Inventory1D.filter[new] = Inventory1D.filter[idx]
-            Inventory1D.selection[new] = Inventory1D.ambit[idx][:2]
-            Inventory1D.mask[new] = self._get_mask(new)
-            Inventory1D.series[new] = Inventory1D.series[idx]
-            Inventory1D.ambit[new] = Inventory1D.ambit[idx]
-
-        except Exception:
-            Inventory1D.property.append(Inventory1D.property[idx])
-            Inventory1D.filter.append(Inventory1D.filter[idx])
-            Inventory1D.selection.append(Inventory1D.ambit[idx][:2])
-            Inventory1D.mask.append(self._get_mask(new))
-            Inventory1D.series.append(Inventory1D.series[idx])
-            Inventory1D.ambit.append(Inventory1D.ambit[idx])
-
-
-    def _choose_data(self, idx: int) -> pd.DataFrame:
-        """
-        Chooses between spot and track data for the given threshold index.
-        """
-
-        if Inventory1D.property[idx] in Inventory1D.track_data.columns.tolist():
-            return Inventory1D.track_data
-        elif Inventory1D.property[idx] in Inventory1D.spot_data.columns.tolist():
-            return Inventory1D.spot_data
-        else:
-            return pd.DataFrame()
-
-
-    def _get_mask(self, idx: int) -> np.ndarray:
-        """
-        Creates a mask from the previous threshold.
-        """
-
-        prev_mask = Inventory1D.mask[idx - 1]
-        prev_series = Inventory1D.series[idx - 1]
-        selected = Inventory1D.selection[idx - 1]
-        prev_filter = Inventory1D.filter[idx - 1]
-
-        if not isinstance(selected, (list, tuple)) or len(selected) != 2:
-            return prev_mask
-
-        if not isinstance(prev_series, pd.Series) or prev_series.empty:
-            return prev_mask
-
-        # Get valid indices that exist in the series
-        valid_mask = prev_series.index.intersection(prev_mask)
-
-        if valid_mask.empty:
-            return np.array([], dtype=prev_mask.dtype)
-
-        low, high = selected[0], selected[1]
-
-        # Convert percentile bounds to actual data values
-        if isinstance(prev_filter, (list, tuple)) and prev_filter[0] == "Percentile":
-            vals = prev_series.loc[valid_mask]
-            low = np.clip(low, 0, 100)
-            high = np.clip(high, 0, 100)
-            low = np.percentile(vals, low) if len(vals) > 0 else low
-            high = np.percentile(vals, high) if len(vals) > 0 else high
-
-        # Convert relative bounds to absolute range around reference
-        elif isinstance(prev_filter, (list, tuple)) and prev_filter[0] == "Relative to...":
-            ref = prev_filter[1]
-            if isinstance(ref, (int, float)):
-                low_abs, high_abs = sorted([abs(low), abs(high)])
-                low = ref - high_abs
-                high = ref + high_abs
-
-        new_mask = prev_series.loc[valid_mask][
-            (prev_series.loc[valid_mask] >= low) 
-            & (prev_series.loc[valid_mask] <= high)
-        ].index.to_numpy()
-
-        return new_mask
-
-
-    def _get_series(self, idx: int, data: pd.DataFrame) -> pd.Series:
-        """
-        Extracts a pandas series for the given threshold based on its mask.
-        """
-    
-        mask = Inventory1D.mask[idx]
-        if mask is None:
-            return pd.Series(dtype=float)
-
-        # Use intersection to avoid KeyError if some labels are not present in this df
-        idxs = data.index.intersection(mask)
-        if idxs.empty or Inventory1D.property[idx] not in data.columns:
-            return pd.Series(dtype=float)
-
-        series = data.loc[idxs, Inventory1D.property[idx]].dropna()
-        min, max = series.min(), series.max()
-
-        if Inventory1D.filter[idx][0] == "Normalized 0-1":
-            if min == max:
-                series = pd.Series(0.0, index=series.index)
+            # highlight selected KDE segment with interpolated edges
+            gm = (y_grid >= ymin) & (y_grid <= ymax)
+            edges = kde_y(np.log([ymin, ymax]) if log else np.array([ymin, ymax]))
+            if gm.any():
+                kde_line.set_data(np.concatenate(([edges[0]], y_dens[gm], [edges[1]])),
+                                  np.concatenate(([ymin], y_grid[gm], [ymax])))
             else:
-                series = series.apply(lambda v: (v - min) / (max - min))
+                kde_line.set_data(edges, [ymin, ymax])
 
-        return series
+            mask = (raw >= ymin) & (raw <= ymax)
+            self.selection.update(min=ymin, max=ymax, mask=mask,
+                                  df=df.loc[mask].reset_index(drop=True))
+
+            y0, y1 = ax.get_ylim()
+            off_min = ymin * 0.02 if log else 0.01 * (y1 - y0)
+            off_max = ymax * 0.02 if log else 0.01 * (y1 - y0)
+            x_right = ax.get_xlim()[1]
+            max_lbl.set_position((x_right, ymax + off_max)); max_lbl.set_text(f"{ymax:.4g}"); max_lbl.set_visible(True)
+            min_lbl.set_position((x_right, ymin - off_min)); min_lbl.set_text(f"{ymin:.4g}"); min_lbl.set_visible(True)
+
+            fig.canvas.draw_idle()
+
+        fig._span_selector = SpanSelector(
+            ax_sel, onselect, "vertical", useblit=True, interactive=True,
+            drag_from_anywhere=True,
+            props=dict(alpha=0.2, facecolor=self.SPAN_FACE, zorder=4),
+            handle_props=dict(lw=1.25, color=self.ACCENT, zorder=99999),
+        )
+
+        # if limits were provided up front, draw the span and trigger selection
+        if preset_min is not None and preset_max is not None:
+            fig._span_selector.extents = (to_sel(preset_min), to_sel(preset_max))
+            onselect(to_sel(preset_min), to_sel(preset_max))
+
+        plt.show()
+        return self
+
+    def apply(self, df: pd.DataFrame = None) -> pd.DataFrame:
+        """Apply the selected min/max range to the *full* dataframe (not just the sampled subset)."""
+        return self._filter_minmax(df=df)
 
 
-    def _ambit(self, idx: int) -> tuple[int | float, int | float, int | float]:
+# ============================================================================
+# Facade / registry
+# ============================================================================
+class DataFilter:
+    """
+    Facade holding a dataframe and a registry of interactive selectors.
+
+    Usage:
+        f = DataFilter(df)
+        g = f.gate(df, x="Track length", y="Straightness index", log_x=True)
+        t = f.threshold(df, "Track points", bins=50)
+        j = f.jitter(df, "Speed mean", log=True)
+    """
+
+    def __init__(self, df: pd.DataFrame = pd.DataFrame(), seed: int = 42, **default_kwargs):
+        np.random.seed(seed)
+        self.df = df
+        self.default_kwargs = default_kwargs
+        self.selectors: dict[int, _BaseSelector] = {}
+
+    def _register(self, sel: _BaseSelector) -> _BaseSelector:
+        self.selectors[sel.id] = sel
+        return sel
+
+    # ---- factory methods ---------------------------------------------------
+    def gate(self, df: pd.DataFrame, x: str, y: str, *, limits: list = None, **kw) -> GateSelector:
         """
-        Returns min, max and step size.
+        Create a 2D polygon gate selector for the given x/y columns of `df`.
+
+        limits : list, optional
+            Predefined polygon vertices to initialize and draw the gate.
+        ```
+        [[x1, y1],
+         [x2, y2],
+         [x3, y3], ...]
+        ```
         """
-        
-        if not isinstance(Inventory1D.property[idx], str):
-            return (0, 100, 1)
-        
-        if not isinstance(Inventory1D.filter[idx], (list, tuple)):
-            return (0, 100, 1)
+        sel = GateSelector(df, limits, **{**self.default_kwargs, **kw})
+        return self._register(sel.show(x, y, **kw))
 
-        match Inventory1D.filter[idx][0]:
-
-            case "Literal":
-                min, max = self._get_range(idx)
-                step = self._get_steps(max)
-            
-            case "Normalized 0-1":
-                min, max, step = 0, 1, 0.01
-
-            case "Percentile":
-                min, max = 0, 100
-                step = 100/float(Inventory1D.filter[idx][1])
-
-            case "Relative to...":
-                reference = Inventory1D.filter[idx][1]
-                min, max = self._reference_delta(idx, reference)
-                step = self._get_steps(max)
-
-            case _:
-                min, max = 0, 100
-                step = 1
-
-        return (min, max, step)
-    
-
-    def _get_range(self, idx: int) -> tuple[int, int]:
+    def threshold(self, df: pd.DataFrame, metric: str, *, limits: list = None, **kw) -> ThresholdSelector:
         """
-        Gets the min and max values for a given data property.
+        Create a 1D histogram threshold selector for the given metric column of `df`.
+
+        limits : list, optional
+            Predefined min/max limits to initialize and draw the threshold: [min, max].
         """
-        
-        if Inventory1D.series[idx] is not None and not Inventory1D.series[idx].empty:
-            min, max = Inventory1D.series[idx].min(), Inventory1D.series[idx].max()
-            if max > 1:
-                min, max = self.clamp_range(min, max)
-            else:
-                min, max = round(min, 2), round(max, 2)
-                
-        else:
-            min, max = 0, 100
+        sel = ThresholdSelector(df, limits, **{**self.default_kwargs, **kw})
+        return self._register(sel.show(metric, **kw))
 
-        return (min, max)
-    
-    
-
-    def _get_steps(self, max: int | float) -> int | float:
+    def jitter(self, df: pd.DataFrame, metric: str, *, limits: list = None, **kw) -> JitterSelector:
         """
-        Finds the adequate step size based on the highest value of the range.
+        Create a 1D jitter strip selector for the given metric column of `df`.
+
+        limits : list, optional
+            Predefined min/max limits to initialize and draw the threshold: [min, max].
         """
-        
-        if max < 0.01:
-            step = 0.0001
-        elif 0.01 <= max < 0.1:
-            step = 0.001
-        elif 0.1 <= max < 1:
-            step = 0.01
-        elif 1 <= max < 10:
-            step = 0.1
-        elif 10 <= max < 1000:
-            step = 1
-        elif 1000 <= max < 100000:
-            step = 10
-        elif 100000 < max:
-            step = 100
-        else:
-            step = 1
-        return step
+        sel = JitterSelector(df, limits, **{**self.default_kwargs, **kw})
+        return self._register(sel.show(metric, **kw))
 
 
-    def _reference_delta(self, idx: int, reference: str | int | float):
-        """
-        Returns (min_delta, max_delta) for the 'Relative to...' mode.
-        max_delta is the farthest absolute distance from reference to any data point.
-        """
-
-        series = Inventory1D.series[idx]
-        if series.empty:
-            return 0.0, 1.0
-        
-        try:
-            match reference:
-                case "Mean":
-                    ref = np.mean(series)
-                case "Median":
-                    ref = np.median(series)
-                case _:
-                    ref = reference if isinstance(reference, (int, float)) else np.mean(series)
-
-            max_delta = ceil(np.max(np.abs(series - ref)))
-            ref = round(ref, 2)
-            
-            Inventory1D.filter[idx] = [Inventory1D.filter[idx][0], ref]  # store computed reference value
-
-            return 0.0, max_delta
-        
-        except Exception as e:
-            raise FilteringError(f"Error computing reference and span: {e}. Traceback:\n{traceback.format_exc()}")
-
-            return 0.0, 1.0
-
-
-
-    @staticmethod
-    def intersects_symmetric(i, bins, bottom, top, reference) -> bool:
-        # interval A: [-b, -a], interval B: [a, b]
-        left_hit  = (bins[i+1] >= reference - top) and (bins[i] <= reference - bottom) # far left to near left
-        right_hit = (bins[i+1] >= reference + bottom) and (bins[i] <= reference + top) # near right to far right
-        return left_hit or right_hit
-
-    @staticmethod
-    def bin_bounds(i, bins, bottom, top):
-        return not(bins[i] < bottom or bins[i+1] > top)
-
-
-
-class Filter2D:
-    ...
-
+filter = DataFilter()

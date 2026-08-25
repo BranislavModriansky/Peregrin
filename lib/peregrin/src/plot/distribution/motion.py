@@ -6,7 +6,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 
-from ..categorizer import Categorizer, Painter
+from ...categorizer import Categorizer, Painter
 from ...various import is_empty
 from ...compute.stats import Stats
 
