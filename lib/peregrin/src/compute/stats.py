@@ -15,8 +15,6 @@ from warnings import warn
 from .._pckg_exceptions._pckg_errors import *
 from .._pckg_exceptions._pckg_warnings import *
 
-from ..plot.tracks.reconstruct import reconstruct
-
 
 
 
@@ -2214,12 +2212,14 @@ class Stats(Calc):
         >>> stats = Stats()
         >>> stats = stats(loaded_df)
         """
-        # if categories is not None:
-        #     from ..categorizer import categorize
-        #     df = categorize(df, categories, **kwargs)
-        #     self._categories = categories
 
         self.spots_df = self.spots(df, **kwargs)
+
+        if self.spots_df is not None and 'track_uid' not in self.spots_df.columns:
+            # Calc.spots() leaves track_uid as the index; promote it so the
+            # reconstructor sees contiguous, correctly-labelled tracks.
+            if self.spots_df.index.name == 'track_uid' or 'track_uid' in (self.spots_df.index.names or []):
+                self.spots_df = self.spots_df.reset_index()
 
         # Invalidate downstream caches on new input.
         self.tracks_df = None
@@ -2228,18 +2228,6 @@ class Stats(Calc):
 
         return self
 
-    # -----------------------------------------------------------------------
-    # Internal: resolve which spot data to operate on
-    # -----------------------------------------------------------------------
-    # def _resolve_spots(self, df: Optional[pd.DataFrame]) -> pd.DataFrame:
-    #     if df is not None:
-    #         return df
-    #     if self.spots_df is None:
-    #         raise ValueError(
-    #             "No spot data available. Call the Stats instance with a "
-    #             "DataFrame first, e.g. `stats = stats(df)`, or pass `df=...`."
-    #         )
-    #     return self.spots_df
 
     # -----------------------------------------------------------------------
     # Compute wrappers (store results on the instance)
@@ -2310,23 +2298,21 @@ class Stats(Calc):
             self.frames_df,
             self.time_intervals_df,
         )
+    
 
     # -----------------------------------------------------------------------
     # Plotting wrappers (lazy imports avoid circular deps)
     # -----------------------------------------------------------------------
+
     def plot_tracks(
         self,
         **kwargs,
     ):
         """Reconstruct and plot trajectories from the stored Spots_df."""
-        source = self.spots_df
-        if source is not None and 'track_uid' not in source.columns:
-            # Calc.spots() leaves track_uid as the index; promote it so the
-            # reconstructor sees contiguous, correctly-labelled tracks.
-            if source.index.name == 'track_uid' or 'track_uid' in (source.index.names or []):
-                source = source.reset_index()
+        from ..plot.tracks.reconstruct import reconstruct
+
         return reconstruct(
-            source,
+            self.spots_df,
             **kwargs,
         )
 
@@ -2338,29 +2324,27 @@ class Stats(Calc):
         **kwargs,
     ):
         """Plot MSD from the stored Spots_df."""
-        from ..plot.time.lags import MSD
-
-        source = self._resolve_spots(None)
-        return MSD().plot(
-            source,
+        from ..plot.time.lags import msd
+        
+        return msd(
+            self.spots_df,
             band=band,
             categories=self._categories,
             grouping_level=grouping_level,
             **kwargs,
         )
 
-    def plot_turn_angles_heatmap(
+    def plot_turn_angles(
         self,
         *,
         grouping_level: Any = 'highest',
         **kwargs,
     ):
         """Plot the turning-angle heatmap from the stored Spots_df."""
-        from ..plot.time.lags import TurnAnglesHeatmap
 
-        source = self._resolve_spots(None)
-        return TurnAnglesHeatmap(
-            source,
+        from ..plot.time.lags import turn_angles
+        return turn_angles(
+            self.spots_df,
             grouping_level=grouping_level,
             **kwargs,
         )

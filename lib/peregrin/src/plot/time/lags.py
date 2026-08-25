@@ -10,8 +10,8 @@ from ..._pckg_exceptions._pckg_errors import *
 from ..._pckg_exceptions._pckg_warnings import *
 
 from ...various import is_empty, get_aliases
-from ...compute.stats import Stats, stats
 from ..painter import paint
+from ...compute.stats import Stats
 from ...categorizer import categorize
 
 
@@ -413,7 +413,7 @@ class MSD:
             pass
 
 
-def TurnAnglesHeatmap(
+def turn_angles(
     data: pd.DataFrame,
     *,
     grouping_level: Literal['highest', 'lowest'] | str | int = 'highest',
@@ -431,10 +431,10 @@ def TurnAnglesHeatmap(
 
     fig, ax = plt.subplots(figsize=kwargs.get('figsize', (6, 6)))
 
-    if is_empty(data):
-        warnings.warn("No data available for plotting.",
-                      category=PlottingWarning, stacklevel=2)
-        return None
+    # if is_empty(data):
+    #     warnings.warn("No data available for plotting.",
+    #                   category=PlottingWarning, stacklevel=2)
+    #     return None
 
     engine = Stats(cat_descr=True, cat_descr_err=True, cat_infer_err=False)
     data = engine.time_intervals(
@@ -496,6 +496,5 @@ def TurnAnglesHeatmap(
     return fig
 
 
-import warnings  # placed at bottom to avoid clutter above; standard-lib import
 
 msd = MSD().plot
