@@ -3,19 +3,15 @@ from __future__ import annotations
 import traceback
 import warnings
 import numpy as np
-import pandas as pd
+import polars as pl
 from scipy import stats
-from dataclasses import dataclass, field
-from typing import Any, Callable, Literal, Optional, Tuple, Dict, List, Union
+from typing import Any, Callable, Literal, Optional, Dict, List
 
 from ..various import Values, is_empty
 from ..settings import params
 
-from warnings import warn
 from .._pckg_exceptions._pckg_errors import *
 from .._pckg_exceptions._pckg_warnings import *
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -23,11 +19,13 @@ from .._pckg_exceptions._pckg_warnings import *
 # ---------------------------------------------------------------------------
 class MetricRegistry:
     """
-    Maps an output column name -> a callable that computes that single column.
+    Maps an output column name -> a callable that builds that single column.
 
-    The driver groups the source data once, builds a shared context dict, then
-    invokes only the requested computers. This removes the need for per-column
-    conditional statements at compute time.
+    Computers receive a shared context dict and may return either:
+      - a `pl.Expr` aggregation expression (collected into ONE group_by().agg()
+        call -> single pass over the data), or
+      - a post-processing callable `(out_df, ctx) -> out_df` for metrics that
+        cannot be expressed as a polars aggregation (e.g. bootstrap CIs).
 
     A `gate` classifies each column so that, when `subset` is None, only the
     columns enabled by the current statistical flags are computed.
@@ -42,7 +40,6 @@ class MetricRegistry:
     def __init__(self) -> None:
         self._computers: Dict[str, Callable] = {}
         self._gate: Dict[str, str] = {}
-        # Preserve registration order for deterministic column ordering.
         self._order: List[str] = []
 
     def register(self, column: str, *, gate: str = 'always') -> Callable:
@@ -59,7 +56,6 @@ class MetricRegistry:
         self.register(column, gate=gate)(fn)
 
     def all_columns(self, *, descr: bool, descr_err: bool, infer_err: bool) -> List[str]:
-        """All columns enabled by the given statistical flags (subset=None case)."""
         allowed = {'always'}
         if descr:
             allowed.add('descr')
@@ -80,16 +76,44 @@ class MetricRegistry:
         """Determine which registered columns to compute."""
         if subset is None:
             return self.all_columns(descr=descr, descr_err=descr_err, infer_err=infer_err)
-        # Keep only requested columns that are registered, preserving registry order.
         requested = set(subset)
         return [c for c in self._order if c in requested and c in self._computers]
 
-    def compute(self, wanted: List[str], ctx: dict) -> pd.DataFrame:
-        """Run the requested computers against a shared context."""
-        out: Dict[str, Any] = {}
+    def compute(self, wanted: List[str], ctx: dict) -> pl.DataFrame:
+        """Run the requested computers against a shared context.
+
+        `ctx['source']` -> the source pl.DataFrame
+        `ctx['by']`     -> grouping column names (list)
+        """
+        exprs: List[pl.Expr] = []
+        posts: List[Callable] = []
+
         for col in wanted:
-            out[col] = self._computers[col](ctx)
-        return pd.DataFrame(out)
+            result = self._computers[col](ctx)
+            if isinstance(result, pl.Expr):
+                exprs.append(result.alias(col))
+            elif callable(result):
+                posts.append(result)
+
+        # Extra list-aggregations requested by post-processors (e.g. CI sources)
+        for name, expr in ctx.get('extra_exprs', {}).items():
+            exprs.append(expr.alias(name))
+
+        out = (
+            ctx['source']
+            .group_by(ctx['by'], maintain_order=True)
+            .agg(exprs)
+        )
+
+        for post in posts:
+            out = post(out, ctx)
+
+        # Drop helper list columns
+        helper = [c for c in out.columns if c.startswith('__list_')]
+        if helper:
+            out = out.drop(helper)
+
+        return out
 
 
 class Calc:
@@ -97,8 +121,6 @@ class Calc:
     A class with methods for computing trajectory statistics at various levels of aggregation:
     spots (per-trajectory-point), tracks (per-whole-trajectory), frames (per-time-point),
     time intervals (per-time-interval).
-
-    Calling this method initializes statistical configuration.
 
     Parameters
     ----------
@@ -117,26 +139,8 @@ class Calc:
 
     Attributes
     ----------
-    significant_figures : int, optional
-        *If specified, all values are going to be rounded to the given number of significant figures.*
-
-    decimal_places : int, optional
-        *If specified, all floating-point values are going to be rounded to the given number of decimal places.*
-
-    BOOTSTRAP_RESAMPLES : int, default 1000
-        *A number of resamples to perform when calculating bootstrap confidence intervals.*
-
-    CONFIDENCE_LEVEL : int, default 95
-        *Confidence level (%) to use when calculating confidence intervals.*
-
-    CI_STATISTIC : str, default 'mean'
-        *Statistic to calculate confidence intervals for (e.g. 'mean', 'median').*
-
-
-    Methods
-    -------
-    GetAllData(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]
-
+    significant_figures, decimal_places, BOOTSTRAP_RESAMPLES, CONFIDENCE_LEVEL,
+    CI_STATISTIC : see original documentation.
     """
 
     ignore_categories: bool = params.ignore_categories
@@ -153,16 +157,15 @@ class Calc:
     CI_STATISTIC: str = 'mean'
     _ci_method_used: str = 'BCa'
 
-    _PANDAS_BUILTINS = frozenset({
+    _POLARS_BUILTINS = frozenset({
         'mean', 'median', 'std', 'count', 'sum', 'min', 'max',
-        'first', 'last', 'var', 'prod', 'size', 'nunique',
+        'first', 'last', 'var', 'product', 'len', 'n_unique',
     })
 
     _EXCLUDE_SUFFIXES = set([
         'track_id', 'track_uid', 'time_point', 'frame', 'time_lag', 'frame_lag', 'sd', 'var', 'sem', 'q25', 'q75'
     ])
 
-    # Class-level defaults for stat categories
     _DESCR_STATS = ['min', 'max', 'mean', 'median', 'q25', 'q75']
     _DESCR_ERR = ['std']
     _INFER_ERR = ['sem']
@@ -218,14 +221,12 @@ class Calc:
         **kwargs
     ) -> None:
 
-        # self.tier: List[str] = ['set', 'subset', 'group', 'subgroup', 'subsubgroup']
         self.tier = None
 
         self.cat_descr = cat_descr
         self.cat_descr_err = cat_descr_err
         self.cat_infer_err = cat_infer_err
 
-        # Create per-instance copies to avoid shared mutable state
         self.DESCR: List[str] = list(self._DESCR_STATS) if cat_descr else []
         self.DESCR_ERR: List[str] = list(self._DESCR_ERR) if cat_descr_err else []
         self.INFER_ERR: List[str] = []
@@ -237,24 +238,21 @@ class Calc:
         else:
             self.INFER_ERR = []
 
-        # Custom aggregation functions
-        self.CUSTOM_AGG_FUNCTIONS: Dict[str, Callable] = {
-            'q25': self._q25,
-            'q75': self._q75,
-            'ci': self.ci,
-            'sem': self.sem,
-            'circ_mean': self._circ_mean,
-            'circ_var': self._circ_var,
+        # Custom aggregation expression builders (column name -> pl.Expr)
+        self.CUSTOM_AGG_FUNCTIONS: Dict[str, Callable[[str], pl.Expr]] = {
+            'q25': lambda c: pl.col(c).quantile(0.25, interpolation='linear'),
+            'q75': lambda c: pl.col(c).quantile(0.75, interpolation='linear'),
+            'sem': lambda c: pl.col(c).std(ddof=1) / pl.col(c).count().cast(pl.Float64).sqrt(),
+            'circ_mean': lambda c: pl.arctan2(pl.col(c).sin().mean(), pl.col(c).cos().mean()),
+            'circ_var': lambda c: 1.0 - (pl.col(c).sin().mean().pow(2) + pl.col(c).cos().mean().pow(2)).sqrt(),
         }
 
-        # Validate CI_STATISTIC
         if self.CI_STATISTIC not in ['mean', 'median']:
             raise Warning(
                 f"CI_STATISTIC '{self.CI_STATISTIC}' may not be meaningful; "
                 f"consider using 'mean' or 'median'."
             )
 
-        # Build metric registries once per instance.
         self._frames_registry = self._build_frames_registry()
         self._ti_registry = self._build_time_intervals_registry()
         self._tracks_registry = self._build_tracks_registry()
@@ -263,124 +261,55 @@ class Calc:
     # Registry builders
     # -----------------------------------------------------------------------
     def _build_tracks_registry(self) -> MetricRegistry:
-        """Register one computer per TRACKS output column.
+        """One aggregation expression per TRACKS output column.
 
-        Each computer receives a shared context dict built in `tracks()`:
-            ctx['grp']    -> DataFrameGroupBy over track_uid
-            ctx['t_step'] -> the resolved time step
-            ctx['cache']  -> dict for memoizing intermediate results
+        ctx['t_step'] -> the resolved time step
         """
         reg = MetricRegistry()
 
-        # --- Speed statistics (distance-based, scaled by t_step) ------------
         def _speed(agg: str) -> Callable:
-            def _fn(ctx: dict) -> pd.Series:
-                s = getattr(ctx['grp']['distance'], agg)()
-                return s / ctx['t_step']
-            return _fn
+            return lambda ctx: getattr(pl.col('distance'), agg)() / ctx['t_step']
 
-        def _speed_sd(ctx: dict) -> pd.Series:
-            return ctx['grp']['distance'].std() / ctx['t_step']
+        reg.add('speed_min', _speed('min'))
+        reg.add('speed_max', _speed('max'))
+        reg.add('speed_mean', _speed('mean'))
+        reg.add('speed_sd', lambda ctx: pl.col('distance').std(ddof=1) / ctx['t_step'])
+        reg.add('speed_median', _speed('median'))
 
-        reg.add('speed_min', _speed('min'), gate='always')
-        reg.add('speed_max', _speed('max'), gate='always')
-        reg.add('speed_mean', _speed('mean'), gate='always')
-        reg.add('speed_sd', _speed_sd, gate='always')
-        reg.add('speed_median', _speed('median'), gate='always')
+        reg.add('track_length', lambda ctx: pl.col('distance').sum())
 
-        # --- Track length ---------------------------------------------------
-        reg.add('track_length', lambda ctx: ctx['grp']['distance'].sum(), gate='always')
+        reg.add('x_location', lambda ctx: pl.col('x_coordinate').mean())
+        reg.add('y_location', lambda ctx: pl.col('y_coordinate').mean())
 
-        # --- Location (mean position) --------------------------------------
-        reg.add('x_location', lambda ctx: ctx['grp']['x_coordinate'].mean(), gate='always')
-        reg.add('y_location', lambda ctx: ctx['grp']['y_coordinate'].mean(), gate='always')
+        reg.add('max_distance_reached', lambda ctx: pl.col('cum_track_displacement').max())
 
-        # --- Max distance reached ------------------------------------------
-        reg.add(
-            'max_distance_reached',
-            lambda ctx: ctx['grp']['cum_track_displacement'].max(),
-            gate='always',
-        )
+        reg.add('track_start_frame', lambda ctx: pl.col('frame').min())
+        reg.add('track_end_frame', lambda ctx: pl.col('frame').max())
 
-        # --- Start/end frames ----------------------------------------------
-        reg.add('track_start_frame', lambda ctx: ctx['grp']['frame'].min(), gate='always')
-        reg.add('track_end_frame', lambda ctx: ctx['grp']['frame'].max(), gate='always')
+        reg.add('mean_straight_line_speed', lambda ctx: pl.col('cum_mean_straight_line_speed').last())
+        reg.add('forward_progression_linearity', lambda ctx: pl.col('cum_forward_progression_linearity').last())
 
-        # --- Straight-line speed & linearity (last cumulative value) --------
-        reg.add(
-            'mean_straight_line_speed',
-            lambda ctx: ctx['grp']['cum_mean_straight_line_speed'].last(),
-            gate='always',
-        )
-        reg.add(
-            'forward_progression_linearity',
-            lambda ctx: ctx['grp']['cum_forward_progression_linearity'].last(),
-            gate='always',
-        )
+        reg.add('direction_mean', lambda ctx: pl.col('cum_direction_mean').last())
+        reg.add('direction_var', lambda ctx: pl.col('cum_direction_var').last())
+        reg.add('mean_directional_change', lambda ctx: pl.col('cum_mean_directional_change').last())
+        reg.add('mean_directional_change_rate', lambda ctx: pl.col('cum_mean_directional_change_rate').last())
 
-        # --- Directional statistics (last cumulative value) -----------------
-        reg.add(
-            'direction_mean',
-            lambda ctx: ctx['grp']['cum_direction_mean'].last(),
-            gate='always',
-        )
-        reg.add(
-            'direction_var',
-            lambda ctx: ctx['grp']['cum_direction_var'].last(),
-            gate='always',
-        )
-        reg.add(
-            'mean_directional_change',
-            lambda ctx: ctx['grp']['cum_mean_directional_change'].last(),
-            gate='always',
-        )
-        reg.add(
-            'mean_directional_change_rate',
-            lambda ctx: ctx['grp']['cum_mean_directional_change_rate'].last(),
-            gate='always',
-        )
+        reg.add('track_points', lambda ctx: pl.len())
 
-        # --- Track point count ---------------------------------------------
-        reg.add('track_points', lambda ctx: ctx['grp'].size(), gate='always')
+        _disp = (
+            (pl.col('x_coordinate').last() - pl.col('x_coordinate').first()).pow(2)
+            + (pl.col('y_coordinate').last() - pl.col('y_coordinate').first()).pow(2)
+        ).sqrt()
 
-        # --- Displacement & straightness (depend on first/last coords) ------
-        def _coords(ctx: dict) -> dict:
-            cache = ctx['cache']
-            if 'coords' not in cache:
-                grp = ctx['grp']
-                cache['coords'] = {
-                    'start_x': grp['x_coordinate'].first(),
-                    'end_x':   grp['x_coordinate'].last(),
-                    'start_y': grp['y_coordinate'].first(),
-                    'end_y':   grp['y_coordinate'].last(),
-                }
-            return cache['coords']
-
-        def _displacement(ctx: dict) -> pd.Series:
-            cache = ctx['cache']
-            if 'displacement' not in cache:
-                c = _coords(ctx)
-                cache['displacement'] = pd.Series(
-                    np.hypot(c['end_x'] - c['start_x'], c['end_y'] - c['start_y']),
-                    index=c['start_x'].index,
-                )
-            return cache['displacement']
-
-        def _straightness(ctx: dict) -> pd.Series:
-            disp = _displacement(ctx)
-            length = ctx['grp']['distance'].sum()
-            return disp / length
-
-        reg.add('track_displacement', _displacement, gate='always')
-        reg.add('straightness_ratio', _straightness, gate='always')
+        reg.add('track_displacement', lambda ctx: _disp)
+        reg.add('straightness_ratio', lambda ctx: _disp / pl.col('distance').sum())
 
         return reg
 
     def _build_frames_registry(self) -> MetricRegistry:
-        """Register one computer per FRAMES output column."""
+        """One computer per FRAMES output column."""
         reg = MetricRegistry()
 
-        # Input metric label -> output metric label.
         metric_out = {
             'cum_track_length': 'cum_track_length',
             'cum_track_displacement': 'cum_track_displacement',
@@ -393,309 +322,206 @@ class Calc:
             'cum_mean_directional_change': 'cum_mean_directional_change',
         }
 
-        # --- Scalar statistic factories -------------------------------------
-        def _make_scalar(src_col: str, agg: str) -> Callable:
-            return lambda ctx: getattr(ctx['grp'][src_col], agg)()
+        def _scalar(src: str, agg: str) -> Callable:
+            return lambda ctx: getattr(pl.col(src), agg)()
 
-        def _make_std(src_col: str) -> Callable:
-            return lambda ctx: ctx['grp'][src_col].std(ddof=1)
+        def _std(src: str) -> Callable:
+            return lambda ctx: pl.col(src).std(ddof=1)
 
-        def _make_sem(src_col: str) -> Callable:
-            return lambda ctx: ctx['grp'][src_col].agg(self.sem)
+        def _sem(src: str) -> Callable:
+            return lambda ctx: self.CUSTOM_AGG_FUNCTIONS['sem'](src)
 
-        def _make_ci(src_col: str, which: int) -> Callable:
-            def _fn(ctx: dict) -> pd.Series:
-                cache = ctx['ci_cache']
-                if src_col not in cache:
-                    s = ctx['grp'][src_col].agg(self.ci)
-                    cache[src_col] = pd.DataFrame(
-                        s.tolist(), index=s.index, columns=['low', 'high']
+        def _ci(src: str, low_name: str, high_name: str) -> Callable:
+            """Bootstrap CI cannot be expressed as a polars aggregation;
+            aggregate the raw values as a list and post-process once."""
+            def _computer(ctx: dict) -> Callable:
+                ctx.setdefault('extra_exprs', {})['__list_sq_disp'] = pl.col('sq_disp')
+
+                def _post(out: pl.DataFrame, _ctx: dict) -> pl.DataFrame:
+                    if low_name in out.columns:
+                        return out
+                    bounds = [
+                        self.ci(np.asarray(v, dtype=float))
+                        for v in out['__list_sq_disp'].to_list()
+                    ]
+                    return out.with_columns(
+                        pl.Series(low_name, [b[0] for b in bounds], dtype=pl.Float64),
+                        pl.Series(high_name, [b[1] for b in bounds], dtype=pl.Float64),
                     )
-                return cache[src_col].iloc[:, which]
-            return _fn
+                return _post
+            return _computer
 
         for src, mout in metric_out.items():
-            reg.add(f'{mout}_min', _make_scalar(src, 'min'), gate='descr')
-            reg.add(f'{mout}_max', _make_scalar(src, 'max'), gate='descr')
-            reg.add(f'{mout}_mean', _make_scalar(src, 'mean'), gate='descr')
-            reg.add(f'{mout}_median', _make_scalar(src, 'median'), gate='descr')
-            reg.add(f'{mout}_sd', _make_std(src), gate='descr_err')
-            reg.add(f'{mout}_sem', _make_sem(src), gate='infer_err')
+            reg.add(f'{mout}_min', _scalar(src, 'min'), gate='descr')
+            reg.add(f'{mout}_max', _scalar(src, 'max'), gate='descr')
+            reg.add(f'{mout}_mean', _scalar(src, 'mean'), gate='descr')
+            reg.add(f'{mout}_median', _scalar(src, 'median'), gate='descr')
+            reg.add(f'{mout}_sd', _std(src), gate='descr_err')
+            reg.add(f'{mout}_sem', _sem(src), gate='infer_err')
 
             if 'ci' in self.INFER_ERR:
                 low = f'{mout}_{self.CI_STATISTIC}_ci{self.CONFIDENCE_LEVEL}_low'
                 high = f'{mout}_{self.CI_STATISTIC}_ci{self.CONFIDENCE_LEVEL}_high'
-                reg.add(low, _make_ci(0), gate='infer_err')
-                reg.add(high, _make_ci(1), gate='infer_err')
+                reg.add(low, _ci(src, low, high), gate='infer_err')
+                reg.add(high, _ci(src, low, high), gate='infer_err')
 
-        # --- Circular statistics --------------------------------------------
-        def _circ(kind: str) -> Callable:
-            def _fn(ctx: dict) -> pd.Series:
-                c = ctx['circ']
-                if kind == 'inst_mean':
-                    return np.arctan2(c['sin_dir'], c['cos_dir'])
-                if kind == 'inst_var':
-                    return 1.0 - np.hypot(c['sin_dir'], c['cos_dir'])
-                if kind == 'cum_mean':
-                    return np.arctan2(c['sin_cum'], c['cos_cum'])
-                if kind == 'cum_var':
-                    return 1.0 - np.hypot(c['sin_cum'], c['cos_cum'])
-            return _fn
-
-        reg.add('instantaneous_direction_mean', _circ('inst_mean'), gate='descr')
-        reg.add('instantaneous_direction_var', _circ('inst_var'), gate='descr')
-        reg.add('cum_direction_mean', _circ('cum_mean'), gate='descr')
-        reg.add('cum_direction_var', _circ('cum_var'), gate='descr')
-        reg.add(
-            'cum_mean_directional_change_mean',
-            lambda ctx: ctx['src']
-            .groupby(ctx['by'], sort=False, observed=True)['cum_mean_directional_change']
-            .mean(),
-            gate='descr',
-        )
+        # --- Circular statistics (fully expression-based) -------------------
+        reg.add('instantaneous_direction_mean',
+                lambda ctx: self.CUSTOM_AGG_FUNCTIONS['circ_mean']('direction'), gate='descr')
+        reg.add('instantaneous_direction_var',
+                lambda ctx: self.CUSTOM_AGG_FUNCTIONS['circ_var']('direction'), gate='descr')
+        reg.add('cum_direction_mean',
+                lambda ctx: self.CUSTOM_AGG_FUNCTIONS['circ_mean']('cum_direction_mean'), gate='descr')
+        reg.add('cum_direction_var',
+                lambda ctx: self.CUSTOM_AGG_FUNCTIONS['circ_var']('cum_direction_mean'), gate='descr')
+        reg.add('cum_mean_directional_change_mean',
+                lambda ctx: pl.col('cum_mean_directional_change').mean(), gate='descr')
 
         return reg
 
     def _build_time_intervals_registry(self) -> MetricRegistry:
-        """Register one computer per TIMEINTERVALS output column."""
+        """One computer per TIMEINTERVALS output column."""
         reg = MetricRegistry()
 
-        # --- MSD scalar statistics ------------------------------------------
-        reg.add('MSD', lambda ctx: ctx['msd_grp'].mean(), gate='descr')
-        reg.add('MSD_sd', lambda ctx: ctx['msd_grp'].std(ddof=1), gate='descr_err')
-        reg.add('MSD_sem', lambda ctx: ctx['msd_grp'].agg(self.sem), gate='infer_err')
+        reg.add('MSD', lambda ctx: pl.col('sq_disp').mean(), gate='descr')
+        reg.add('MSD_sd', lambda ctx: pl.col('sq_disp').std(ddof=1), gate='descr_err')
+        reg.add('MSD_sem', lambda ctx: self.CUSTOM_AGG_FUNCTIONS['sem']('sq_disp'), gate='infer_err')
 
-        def _make_ci(which: int) -> Callable:
-            def _fn(ctx: dict) -> pd.Series:
-                cache = ctx['ci_cache']
-                if 'MSD' not in cache:
-                    s = ctx['msd_grp'].agg(self.ci)
-                    cache['MSD'] = pd.DataFrame(
-                        s.tolist(), index=s.index, columns=['low', 'high']
+        def _ci(low_name: str, high_name: str) -> Callable:
+            def _computer(ctx: dict) -> Callable:
+                ctx.setdefault('extra_exprs', {})['__list_sq_disp'] = pl.col('sq_disp')
+
+                def _post(out: pl.DataFrame, _ctx: dict) -> pl.DataFrame:
+                    if low_name in out.columns:
+                        return out
+                    bounds = [
+                        self.ci(np.asarray(v, dtype=float))
+                        for v in out['__list_sq_disp'].to_list()
+                    ]
+                    return out.with_columns(
+                        pl.Series(low_name, [b[0] for b in bounds], dtype=pl.Float64),
+                        pl.Series(high_name, [b[1] for b in bounds], dtype=pl.Float64),
                     )
-                return cache['MSD'].iloc[:, which]
-            return _fn
+                return _post
+            return _computer
 
         if 'ci' in self.INFER_ERR:
             low = f'MSD_{self.CI_STATISTIC}_ci{self.CONFIDENCE_LEVEL}_low'
             high = f'MSD_{self.CI_STATISTIC}_ci{self.CONFIDENCE_LEVEL}_high'
-            reg.add(low, _make_ci(0), gate='infer_err')
-            reg.add(high, _make_ci(1), gate='infer_err')
+            reg.add(low, _ci(low, high), gate='infer_err')
+            reg.add(high, _ci(low, high), gate='infer_err')
 
-        # --- Contribution counts (always produced) --------------------------
-        reg.add(
-            'tracks_contributing',
-            lambda ctx: ctx['msd_grouped']['track_uid'].nunique().astype(int),
-            gate='always',
-        )
-        reg.add(
-            'position_pairs_contributing',
-            lambda ctx: ctx['msd_grp'].size().astype(int),
-            gate='always',
-        )
+        reg.add('tracks_contributing', lambda ctx: pl.col('track_uid').n_unique().cast(pl.Int64), gate='always')
+        reg.add('position_pairs_contributing', lambda ctx: pl.len().cast(pl.Int64), gate='always')
 
-        # --- Turning-angle circular statistics ------------------------------
-        def _circ_stats(ctx: dict) -> Optional[dict]:
-            """Compute (and cache) circular mean/var of turning angles."""
-            cache = ctx['circ_cache']
-            if 'done' in cache:
-                return cache.get('data')
+        # --- Turning-angle circular statistics (computed on turn_src, joined) -
+        def _circ(kind: str) -> Callable:
+            def _computer(ctx: dict) -> Callable:
+                def _post(out: pl.DataFrame, _ctx: dict) -> pl.DataFrame:
+                    turn_src: pl.DataFrame = _ctx['turn_src']
+                    cache = _ctx['circ_cache']
+                    if 'data' not in cache:
+                        if is_empty(turn_src):
+                            cache['data'] = None
+                        else:
+                            cache['data'] = (
+                                turn_src
+                                .group_by(_ctx['by'], maintain_order=True)
+                                .agg(
+                                    ms=pl.col('dtheta').sin().mean(),
+                                    mc=pl.col('dtheta').cos().mean(),
+                                )
+                                .with_columns(
+                                    directional_change_mean=pl.arctan2(pl.col('ms'), pl.col('mc')).abs().degrees(),
+                                    directional_change_var=1.0 - (pl.col('ms').pow(2) + pl.col('mc').pow(2)).sqrt(),
+                                )
+                                .drop(['ms', 'mc'])
+                            )
+                    data = cache['data']
+                    col = f'directional_change_{kind}'
+                    if data is None or col in out.columns:
+                        return out
+                    return out.join(data.select(_ctx['by'] + [col]), on=_ctx['by'], how='left')
+                return _post
+            return _computer
 
-            turn_src = ctx['turn_src']
-            if turn_src.empty:
-                cache['done'] = True
-                cache['data'] = None
-                return None
-
-            turn_sin = turn_src.assign(
-                _s=np.sin(turn_src.dtheta.values),
-                _c=np.cos(turn_src.dtheta.values),
-            )
-            turn_circ = turn_sin.groupby(ctx['by'], sort=False, observed=True).agg(
-                ms=('_s', 'mean'),
-                mc=('_c', 'mean'),
-            )
-            circ_mean = np.arctan2(turn_circ.ms.values, turn_circ.mc.values)
-            circ_R = np.hypot(turn_circ.ms.values, turn_circ.mc.values)
-            data = {
-                'mean': pd.Series(np.rad2deg(np.abs(circ_mean)), index=turn_circ.index),
-                'var': pd.Series(1.0 - circ_R, index=turn_circ.index),
-            }
-            cache['done'] = True
-            cache['data'] = data
-            return data
-
-        def _circ_mean(ctx: dict) -> Optional[pd.Series]:
-            data = _circ_stats(ctx)
-            return data['mean'] if data is not None else None
-
-        def _circ_var(ctx: dict) -> Optional[pd.Series]:
-            data = _circ_stats(ctx)
-            return data['var'] if data is not None else None
-
-        reg.add('directional_change_mean', _circ_mean, gate='descr')
-        reg.add('directional_change_var', _circ_var, gate='descr_err')
+        reg.add('directional_change_mean', _circ('mean'), gate='descr')
+        reg.add('directional_change_var', _circ('var'), gate='descr_err')
 
         return reg
 
+    # -----------------------------------------------------------------------
+    # Shared helpers
+    # -----------------------------------------------------------------------
+    def _resolve_t_step(self, df: pl.DataFrame, context: str) -> float:
+        """Resolve the time step from data (or self.t_step if set)."""
+        if self.t_step is not None:
+            return self.t_step
 
+        t_steps = np.diff(np.sort(df['time_point'].unique().to_numpy()))
+
+        if t_steps.size == 0:
+            return 1.0
+        if np.all(t_steps == t_steps[0]):
+            return float(t_steps[0])
+
+        t_step = float(np.median(t_steps))
+        warnings.warn(
+            message=(f"Time points are not uniformly spaced -> this will most probably lead to "
+                     f"incorrect data computation. ({context})\nObserved time steps:\n{t_steps}\nUsing: {t_step}"),
+            category=TimePointWarning,
+            stacklevel=3,
+        )
+        return t_step
+
+    @staticmethod
+    def _drop_all_null_columns(df: pl.DataFrame) -> pl.DataFrame:
+        keep = [c for c in df.columns if df[c].null_count() < df.height]
+        return df.select(keep)
+
+    # -----------------------------------------------------------------------
+    # SPOTS
+    # -----------------------------------------------------------------------
     def spots(
         self,
-        df: pd.DataFrame,
+        df: pl.DataFrame,
         subset: list[str] = None,
         **kwargs
-    ) -> pd.DataFrame:
-        """ Computes per-trajectory-point statistics, both local (previous -> current position) and cumulative (start -> current position).
+    ) -> pl.DataFrame:
+        """Computes per-trajectory-point statistics, both local (previous -> current
+        position) and cumulative (start -> current position).
 
-        Parameters
-        ----------
-        df : pd.DataFrame
-            The input DataFrame must contain these columns:
-            - `track_id`
-            - `x_coordinate`
-            - `y_coordinate`
-            - `time_point`
-
-        subset : list[str], optional
-            If provided, only the listed metric columns are returned. The returned
-            DataFrame still includes the grouping/category columns as well as
-            `track_id`, `track_uid`, `time_point`, and `frame`. If None (default),
-            all spot metrics are returned.
-
-        ignore_categories : bool, optional
-            If True, the `condition` and `replicate` columns will be ignored in the computation, and all data will be treated as a single group.
-            If not specified, the default value is taken from the package settings.
-            To change the default configuration and behavior throughout all computations, use `peregrin.settings(ignore_categories=...)`
-
-        Returns
-        -------
-        pd.DataFrame
-            The computed DataFrame containing these columns:
-
-            - `track_id`
-            - `track_uid`
-            - `time_point`
-            - `frame`
-
-            - `x_coordinate`
-            - `y_coordinate`
-
-            - `distance` =
-            euclidean distance between consecutive (previous -> current) positions
-
-            - `cum_track_length` =
-            cumulative sum of `distance` along the track up to the current position
-
-            - `cum_track_displacement` =
-            euclidean distance from the starting position of the track to the current position
-
-            - `cum_straightness_ratio` =
-            cum_track_displacement / cum_track_length`
-
-            - `cum_speed_mean` =
-            `cum_track_length / frame`
-
-            - `cum_mean_straight_line_speed` =
-            calculated as `cum_track_displacement / (current track point count ⋅ t_step)`.
-
-            - `cum_forward_progression_linearity` =
-            calculated as `cum_mean_straight_line_speed` / `cum_speed_mean`
-
-            - `direction` =
-            instantaneous direction of motion in radians `np.arctan2(Δy, Δx)`. Calculated between the previous and current positions.
-
-            - `directional_change` =
-            absolute turning angle (degrees) between consecutive directions, calculated as the angular difference between the current and previous `direction` values, wrapped to the range [-180°, 180°].
-
-            - `cum_sum_directional_change` =
-            cumulative sum of `directional_change` along the track up to the current position.
-
-            - `cum_mean_directional_change` =
-            mean of all absolute `directional_change` values along the track up to the current position
-
-            - `cum_mean_directional_change_rate` =
-            mean of all absolute `directional_change` values / (current track point count * `t_step`).
-
-            - `cum_direction_mean` =
-            mean of directions of motion from the starting to the current position.
-
-            - `cum_direction_var` =
-            cumulative direction variance from the starting to the current position.
-
-            - *`other`* =
-            *any additional columns from the input DataFrame that are not part of the above list will be retained in the output if they contain any non-NA values; otherwise, they will be dropped.*
-
-            \n See documentation: links..
-
-        See also
-        --------
-        `stats.get_all()` -
-        computes and returnes all DataFrames (Spots_df, Tracks_df, Frames_df, TimeIntervals_df) from input spot data in one call.
-
-        `stats.tracks()` -
-        computes per-whole-trajectory statistics from the Spots_df.
-
-        `stats.frames()` -
-        computes per-time-point statistics from the Spots_df.
-
-        `stats.time_intervals()` -
-        computes per-time-interval statistics from the Spots_df.
-
-        Documentation
-        -------------
-
-        links..
-
+        Fully vectorized via polars window expressions (`.over('track_uid')`);
+        see the original documentation for column descriptions.
         """
 
-        df = df.copy()
-
-        if df.empty:
+        if is_empty(df):
             warnings.warn(message="Input DataFrame is empty. No computation performed.",
-                          category=DataFrameWarning,
-                          stacklevel=2)
+                          category=DataFrameWarning, stacklevel=2)
+            return pl.DataFrame(schema={c: pl.Float64 for c in self.COLUMNS['SPOTS']})
 
-            return pd.DataFrame(columns=self.COLUMNS['SPOTS'])
-
-        # grouping_cols = self._get_grouping_level(df.columns, grouping_level)
         grouping_cols = [col for col in self.DEFAULT_CATEGORIES if col in df.columns]
 
-        # Create a unique track identifier (track_uid) based on the grouping columns
-        df = self.assign_track_uid(df)
+        df = self._ensure_polars(df)
 
         # Sort so that each track's rows are contiguous and time-ordered.
-        # Including track_uid here (before time_point) is essential: sorting
-        # only by grouping_cols + time_point interleaves rows of different
-        # tracks that share the same category values.
-        df.sort_values(grouping_cols + ['track_uid', 'time_point'], inplace=True)
+        df = df.sort(grouping_cols + ['track_uid', 'time_point'])
 
-        if self.t_step is None:
-            _t = df.copy()
-            _t.sort_values('time_point', inplace=True)
-            t_steps = np.diff(_t['time_point'].unique())
+        t_step = self._resolve_t_step(df, 'spot stats + time stats')
 
-            if np.all(t_steps == t_steps[0]):
-                t_step = float(t_steps[0])
-            else:
-                t_step = float(np.median(t_steps))
-                warnings.warn(message=f"Time points are not uniformly spaced -> this will most probably lead to incorrect data computation. (spot stats + time stats)\nObserved time steps:\n{t_steps}\nUsing: {t_step}",
-                                category=TimePointWarning,
-                                stacklevel=2)
-        else:
-            t_step = self.t_step
+        uid = 'track_uid'
 
-        grp = df.groupby(level='track_uid', sort=False)
+        # frame: dense rank of time_point per track (0-based)
+        df = df.with_columns(
+            (pl.col('time_point').rank(method='dense').over(uid) - 1).cast(pl.Int64).alias('frame')
+        )
 
-        df['frame'] = grp['time_point'].rank(method='dense').astype('Int64') - 1
-
-        # Validate per TRACK: within a single track, one time_point must map
-        # to exactly one frame. (Across tracks, the same time_point may
-        # legitimately map to different frames, since frames are ranked
-        # per-track and tracks can start at different times.)
+        # Validate per TRACK: one time_point -> exactly one frame within a track.
         bad = (
-            df.groupby([df.index.get_level_values('track_uid'), 'time_point'], sort=False)['frame']
-            .nunique(dropna=True)
-            .max()
+            df.group_by([uid, 'time_point'])
+            .agg(pl.col('frame').n_unique().alias('_n'))
+            .select(pl.col('_n').max())
+            .item()
         )
         if bad and bad > 1:
             raise TimePointError(
@@ -704,98 +530,104 @@ class Calc:
                 f"Max frames per time point: {bad}."
             )
 
-        # distance between the previous and the current position
-        df['distance'] = np.hypot(
-            grp['x_coordinate'].diff(),
-            grp['y_coordinate'].diff()
-        ).fillna(np.nan)
+        # Step deltas + distance between the previous and the current position
+        df = df.with_columns(
+            (pl.col('x_coordinate') - pl.col('x_coordinate').shift(1)).over(uid).alias('_dx'),
+            (pl.col('y_coordinate') - pl.col('y_coordinate').shift(1)).over(uid).alias('_dy'),
+        ).with_columns(
+            (pl.col('_dx').pow(2) + pl.col('_dy').pow(2)).sqrt().alias('distance')
+        )
 
-        # cum_track_length
-        df['cum_track_length'] = grp['distance'].cumsum()
+        # Cumulative metrics
+        df = df.with_columns(
+            pl.col('distance').cum_sum().over(uid).alias('cum_track_length'),
+            (
+                (pl.col('x_coordinate') - pl.col('x_coordinate').first().over(uid)).pow(2)
+                + (pl.col('y_coordinate') - pl.col('y_coordinate').first().over(uid)).pow(2)
+            ).sqrt().alias('cum_track_displacement'),
+            pl.col('time_point').cum_count().over(uid).cast(pl.Float64).alias('_cumcount'),
+        ).with_columns(
+            # zero displacement (start point) -> null, matching prior behavior
+            pl.when(pl.col('cum_track_displacement') == 0)
+            .then(None).otherwise(pl.col('cum_track_displacement'))
+            .alias('cum_track_displacement'),
+        )
 
-        # cum_track_displacement -> straight-line distance (start -> current position)
-        start = grp[['x_coordinate', 'y_coordinate']].transform('first')
-        df['cum_track_displacement'] = np.hypot(
-            (df['x_coordinate'] - start['x_coordinate']),
-            (df['y_coordinate'] - start['y_coordinate'])
-        ).replace(0, np.nan)
+        elapsed = (pl.col('time_point') - pl.col('time_point').first().over(uid))
+        df = df.with_columns(
+            (
+                pl.col('cum_track_displacement')
+                / pl.when(pl.col('cum_track_length') == 0).then(None).otherwise(pl.col('cum_track_length'))
+            ).alias('cum_straightness_ratio'),
+            (
+                pl.col('cum_track_length')
+                / pl.when(elapsed == 0).then(None).otherwise(elapsed)
+            ).alias('cum_speed_mean'),
+        ).with_columns(
+            (pl.col('cum_track_displacement') / (pl.col('_cumcount') * t_step))
+            .alias('cum_mean_straight_line_speed'),
+        ).with_columns(
+            (pl.col('cum_mean_straight_line_speed') / pl.col('cum_speed_mean'))
+            .alias('cum_forward_progression_linearity'),
+        )
 
-        # Straightness index: Track displacement vs. actual trajectory length ratio
-        # Avoid division by zero by replacing zeros with NaN, then fill
-        df['cum_straightness_ratio'] = (df['cum_track_displacement'] / df['cum_track_length'].replace(0, np.nan)).fillna(np.nan)
+        # Instantaneous direction (rad) and turning angle (deg, wrapped, abs)
+        df = df.with_columns(
+            pl.arctan2(pl.col('_dy'), pl.col('_dx')).alias('direction')
+        ).with_columns(
+            (
+                ((pl.col('direction') - pl.col('direction').shift(1)).over(uid) + np.pi)
+                .mod(2 * np.pi) - np.pi
+            ).abs().degrees().alias('directional_change')
+        )
 
-        # cum_speed_mean -> mean speed from the starting to the current position
-        track_start_time = grp['time_point'].transform('first')
-        elapsed = (df['time_point'] - track_start_time).replace(0, np.nan)
-        df['cum_speed_mean'] = df['cum_track_length'] / elapsed
+        # Cumulative sum / running mean of directional change (nulls skipped)
+        df = df.with_columns(
+            pl.col('directional_change').cum_sum().over(uid).alias('cum_sum_directional_change'),
+            pl.col('directional_change').is_not_null().cum_sum().over(uid)
+            .cast(pl.Float64).alias('_valid_count'),
+        ).with_columns(
+            (
+                pl.col('cum_sum_directional_change')
+                / pl.when(pl.col('_valid_count') == 0).then(None).otherwise(pl.col('_valid_count'))
+            ).alias('cum_mean_directional_change')
+        ).with_columns(
+            # First two points of each track have no directional change
+            pl.when(pl.col('directional_change').is_null())
+            .then(None).otherwise(pl.col('cum_mean_directional_change'))
+            .alias('cum_mean_directional_change'),
+        ).with_columns(
+            (pl.col('cum_mean_directional_change') / (pl.col('_cumcount') * t_step))
+            .alias('cum_mean_directional_change_rate'),
+        )
 
-        cumulative_count = (grp.cumcount() + 1).values  # strip index → plain numpy array
-        df['cum_mean_straight_line_speed'] = df['cum_track_displacement'] / (cumulative_count * t_step)
-        df['cum_forward_progression_linearity'] = df['cum_mean_straight_line_speed'] / df['cum_speed_mean']
+        # Cumulative circular mean / variance of direction
+        df = df.with_columns(
+            pl.col('direction').sin().cum_sum().over(uid).alias('_cum_sin'),
+            pl.col('direction').cos().cum_sum().over(uid).alias('_cum_cos'),
+            (pl.col('_cumcount') - 1).alias('_n_angles'),
+        ).with_columns(
+            pl.arctan2(pl.col('_cum_sin'), pl.col('_cum_cos')).alias('cum_direction_mean'),
+            (
+                1.0 - (pl.col('_cum_sin').pow(2) + pl.col('_cum_cos').pow(2)).sqrt()
+                / pl.when(pl.col('_n_angles') == 0).then(None).otherwise(pl.col('_n_angles'))
+            ).alias('cum_direction_var'),
+        ).with_columns(
+            pl.when(pl.col('_n_angles') == 0).then(None)
+            .when(pl.col('_n_angles') == 1).then(0.0)
+            .otherwise(pl.col('cum_direction_var'))
+            .alias('cum_direction_var'),
+        )
 
-        # Instantaneous direction of motion (rad) -> difference between the previous and current position
-        dy = grp['y_coordinate'].diff()
-        dx = grp['x_coordinate'].diff()
-        df['direction'] = np.arctan2(dy, dx).fillna(np.nan)
+        # Drop helpers + all-null columns
+        df = df.drop(['_dx', '_dy', '_cumcount', '_valid_count', '_cum_sin', '_cum_cos', '_n_angles'])
+        df = self._drop_all_null_columns(df)
 
-        # Directional change (turning angle) -> angular difference between consecutive directions, wrapped to [-π, π], then absolute, converted to degrees
-        raw_dir_change = grp['direction'].diff()
-        # Wrap to [-π, π] first, then take absolute value, then convert to degrees
-        wrapped_dir_change = (raw_dir_change + np.pi) % (2 * np.pi) - np.pi
-        df['directional_change'] = np.rad2deg(wrapped_dir_change.abs()).fillna(np.nan)
-
-        # Mean directional change -> vectorized cumulative sum/mean over the same track_uid grouping.
-        # NaN entries (first two points of each track) must be excluded from the running count,
-        # matching the previous expanding().mean() behavior which skipped NaNs.
-        dc = df['directional_change']
-        df['cum_sum_directional_change'] = grp_dc_sum = df.groupby(level='track_uid', sort=False)['directional_change'].cumsum(skipna=True)
-
-        # Running count of non-NaN directional_change values within each track
-        valid = dc.notna()
-        valid_count = valid.groupby(level='track_uid', sort=False).cumsum()
-        with np.errstate(invalid='ignore', divide='ignore'):
-            df['cum_mean_directional_change'] = df['cum_sum_directional_change'] / valid_count.replace(0, np.nan)
-
-        # First two points of each track have no directional change; set them to NaN
-        df.loc[df['directional_change'].isna(), ['cum_mean_directional_change']] = np.nan
-        df['cum_mean_directional_change_rate'] = df['cum_mean_directional_change'] / (cumulative_count * t_step)
-
-        # Cumulative direction of motion (circular mean and variance) calculations
-        # Reuse already-computed dy/dx instead of recomputing arctan2.
-        _dir = np.arctan2(dy, dx)
-        _sin = np.sin(_dir)
-        _cos = np.cos(_dir)
-
-        # Cumulative sums respect track boundaries via grp; NaN at track starts contribute 0.
-        cum_sin = _sin.groupby(level='track_uid', sort=False).cumsum()
-        cum_cos = _cos.groupby(level='track_uid', sort=False).cumsum()
-
-        # Number of contributing angles (0 at first timepoint, 1 at second, ...)
-        n_angles = cumulative_count - 1
-
-        # cum_direction_mean and circular variance
-        df['cum_direction_mean'] = np.arctan2(cum_sin, cum_cos)
-
-        with np.errstate(invalid='ignore', divide='ignore'):
-            R = np.hypot(cum_sin, cum_cos) / pd.Series(n_angles, index=df.index).replace(0, np.nan)
-        df['cum_direction_var'] = 1.0 - R
-
-        df.loc[n_angles == 0, 'cum_direction_var'] = np.nan
-        df.loc[n_angles == 1, 'cum_direction_var'] = 0.0
-
-        # Drop all-NaN columns (if any are present)
-        df.dropna(how='all', axis='columns', inplace=True)
-
-        # If a subset of metrics was requested, keep only those columns
-        # (always retaining the identifier/index columns).
         if subset is not None:
             _always_keep = ['track_id', 'track_uid', 'time_point', 'frame']
             requested = set(subset)
-            keep = [
-                col for col in df.columns
-                if col in _always_keep or col in requested
-            ]
-            df = df[keep]
+            keep = [c for c in df.columns if c in _always_keep or c in requested or c in grouping_cols]
+            df = df.select(keep)
 
         if self.significant_figures:
             df = self.signify(df)
@@ -804,302 +636,105 @@ class Calc:
 
         return df
 
-
+    # -----------------------------------------------------------------------
+    # TRACKS
+    # -----------------------------------------------------------------------
     def tracks(
         self,
-        df: pd.DataFrame,
+        df: pl.DataFrame,
         subset: list[str] = None,
         *,
         to_disk: bool = ...,
         **kwargs
-    ) -> pd.DataFrame:
-        """ Computes a comprehensive DataFrame of track-level statistics for each trajectory of the input Spots_df.
+    ) -> pl.DataFrame:
+        """Computes track-level statistics for each trajectory of the input Spots_df.
 
-        Parameters
-        ----------
-        df : pd.DataFrame
-            This method expects the dataframe returned from `stats.spots()`. The input DataFrame must contain these columns:
-            - `track_id`
-            - `track_uid`
-            - `frame`
-            - `x_coordinate`
-            - `y_coordinate`
-            - `distance`
-            - `cum_track_displacement`
-            - `direction`
-
-        subset : list[str], optional
-            If provided, only the listed metric columns are computed. The returned
-            DataFrame still includes the grouping/category columns as well as
-            `track_id` and `track_uid`. If None (default), all track metrics are
-            computed.
-
-        ignore_categories : bool, optional
-            If True, the `condition` and `replicate` columns will be ignored in the computation, and all data will be treated as a single group.
-            If not specified, the default value is taken from the package settings.
-            To change the default configuration and behavior throughout all computations, use `peregrin.settings(ignore_categories=...)`
-
-        Returns
-        -------
-        pd.DataFrame
-            A DataFrame with one row per unique track, containing the following columns:
-
-            - `track_id`
-            - `track_uid`
-
-            - `y_location`-
-            The mean Y position of the track's starting position.
-
-            - `x_location`-
-            The mean X position of the track's starting position.
-
-            - `track_length`-
-            Total length of the track (sum of `distance`).
-
-            - `speed_min`, `speed_max`, `speed_mean`, `speed_sd`, `speed_median` -
-            of the `Distances` between consecutive points (step lengths).
-
-            - `max_distance_reached`-
-            Maximum Euclidean distance from the starting position reached at any point along the track.
-
-            - `track_start_frame`-
-            frame number of the first point in the track.
-
-            - `track_end_frame`-
-            frame number of the last point in the track.
-
-            - `track_displacement`-
-            Euclidean distance from the starting position to the end position of the track.
-
-            - `straightness_ratio`-
-            Track's straigtness calculated as `track_displacement` / `track_length`.
-
-            - `mean_straight_line_speed`-
-            Calculated as `track_displacement` / (`track_points` * `t_step`).
-
-            - `forward_progression_linearity`-
-            Calculated as `mean_straight_line_speed` / `speed_mean`
-
-            - `track_points`-
-            The number of points the trajectory is comprised of.
-
-            - `direction_mean`-
-            Circular mean of the `direction` values.
-
-            - `mean_directional_change`-
-            Mean of absolute directional changes per track (degrees).
-
-            - `mean_directional_change_rate`-
-            `mean_directional_change` / (`track_points` * `t_step`)
-
-            - `direction_var`-
-            Circular variance of the `direction` values.
-
-            - *`other`* -
-            any additional columns from the input DataFrame that are not part of the above list will be retained in the output if they contain any non-NA values; otherwise, they will be dropped.*
-
-            \n See documentation: links..
-
-        See also
-        --------
-        `stats.get_all()`-
-        computes all DataFrames (Spots_df, Tracks_df, Frames_df, TimeIntervals_df) from raw spot data in one call.
-
-        `stats.frames()`-
-        computes per-time-point statistics from the Spots_df.
-
-        `stats.time_intervals()`-
-        computes per-time-interval statistics from the Spots_df.
-
+        All metrics are built as polars aggregation expressions and computed in a
+        single `group_by('track_uid').agg(...)` pass. See the original
+        documentation for column descriptions.
         """
 
-        # Work on a copy to avoid mutating the caller's DataFrame
-        df = df.copy()
-
-        if df.empty:
+        if is_empty(df):
             warnings.warn(message="Input DataFrame is empty. No computation performed.",
-                          category=DataFrameWarning,
-                          stacklevel=2)
-
-            return pd.DataFrame(columns=self.COLUMNS['TRACKS'])
-
-
-        # grouping_cols = self._get_grouping_level(df.columns, grouping_level)
+                          category=DataFrameWarning, stacklevel=2)
+            return pl.DataFrame(schema={c: pl.Float64 for c in self.COLUMNS['TRACKS']})
 
         grouping_cols = [col for col in self.DEFAULT_CATEGORIES if col in df.columns]
 
         df = self.assign_track_uid(df)
+        df = df.sort(['track_uid', 'time_point'])
 
-        if self.t_step is None:
-            _t = df.copy()
-            _t.sort_values('time_point', inplace=True)
-            t_steps = np.diff(_t.time_point.unique())
+        t_step = self._resolve_t_step(df, 'track stats')
 
-            if np.all(t_steps == t_steps[0]):
-                t_step = float(t_steps[0])
-            else:
-                t_step = float(np.median(t_steps))
-                warnings.warn(message=f"Time points are not uniformly spaced -> this will most probably lead to incorrect data computation. (track stats)\nObserved time steps:\n{t_steps}\nUsing: {t_step}",
-                                category=TimePointWarning,
-                                stacklevel=2)
-        else:
-            t_step = self.t_step
+        # Stash categorical identifiers to merge them back into the result
+        stash_cols = [c for c in grouping_cols if c != 'track_uid']
+        stash = df.select(['track_uid'] + stash_cols).unique(subset=['track_uid'], keep='first')
 
-        # Stash the categorical identifiers for merging them back into the aggregated result DataFrame
-        stash = df[grouping_cols].drop_duplicates()
-
-        grp = df.groupby(level='track_uid', sort=False)
-
-        # Resolve which metric columns to compute (respecting subset).
-        # Track metrics are always enabled; gating flags do not apply here.
-        wanted = self._tracks_registry.resolve(
-            subset,
-            descr=True,
-            descr_err=True,
-            infer_err=True,
-        )
+        wanted = self._tracks_registry.resolve(subset, descr=True, descr_err=True, infer_err=True)
 
         ctx = {
-            'grp': grp,
+            'source': df,
+            'by': ['track_uid'],
             't_step': t_step,
-            'cache': {},
         }
-
         agg = self._tracks_registry.compute(wanted, ctx)
 
-        # If colors were assigned, carry them over
-        for col in df.columns:
-            if col.endswith('color'):
-                colors = grp[col].first()
-                agg = agg.merge(colors, left_index=True, right_index=True)
+        # Carry over color columns and track_id (first per track)
+        carry = [c for c in df.columns if c.endswith('color')]
+        if 'track_id' in df.columns:
+            carry = ['track_id'] + carry
+        if carry:
+            firsts = df.group_by('track_uid', maintain_order=True).agg(
+                [pl.col(c).first() for c in carry]
+            )
+            agg = agg.join(firsts, on='track_uid', how='left')
 
-        df = df.merge(agg, left_index=True, right_index=True, how='right')
-        df = df.drop(grouping_cols, axis=1, errors='ignore')
+        out = stash.join(agg, on='track_uid', how='right')
 
-        # Drop any columns that also live in `stash` to avoid _x/_y suffix collisions
-        # when merging the categorical identifiers back in.
-        overlap = [c for c in stash.columns if c in df.columns]
-        df = df.drop(columns=overlap, errors='ignore')
-
-        df = stash.merge(df, left_index=True, right_index=True, how='right')
-
-        for col in self.COLUMNS['SPOTS']:
-            if col in df.columns and col not in self.COLUMNS['TRACKS']:
-                df = df.drop(columns=[col])
-
-        df.drop_duplicates(inplace=True)
+        # Drop spot-level columns that leaked through
+        drop = [c for c in self.COLUMNS['SPOTS'] if c in out.columns and c not in self.COLUMNS['TRACKS']]
+        out = out.drop(drop).unique(maintain_order=True)
 
         if self.significant_figures:
-            df = self.signify(df)
+            out = self.signify(out)
         if self.decimal_places:
-            df = self.norm_decimals(df)
+            out = self.norm_decimals(out)
 
-        return df
+        return out
 
-
+    # -----------------------------------------------------------------------
+    # FRAMES
+    # -----------------------------------------------------------------------
     def frames(
         self,
-        df: pd.DataFrame,
+        df: pl.DataFrame,
         subset: list[str] = None,
         *,
         grouping_level: Literal['highest', 'lowest'] | str | int | list = 'highest',
         to_disk: bool = ...,
         **kwargs
-    ) -> pd.DataFrame:
+    ) -> pl.DataFrame:
+        """Computes time point statistics for each category (group).
 
+        One `group_by().agg()` pass per grouping level; all descriptive,
+        error and circular statistics are polars expressions. See the original
+        documentation for details.
         """
-        Computes time point statistics for each category (group). Specifically for example:
-
-        - per replicate - across all trajectories of the same `replicate`
-        - per condition - across all trajectories of the same `condition`
-
-        Parameters
-        ----------
-        df : pd.DataFrame
-            This method expects the dataframe acquired by `stats.spots()`. The input DataFrame must contain these columns:
-            - `time_point`
-            - `frame`
-            - `distance`
-            - `cum_track_length`
-            - `cum_track_displacement`
-            - `cum_straightness_ratio`
-            - `cum_speed_mean`
-            - `direction`
-            - `cum_direction_mean`
-
-        subset : list[str], optional
-            If provided, only the listed metric columns are computed. The returned
-            DataFrame still includes the grouping/category columns as well as
-            `time_point` and `frame`. If None (default), all metrics enabled by the
-            current statistical flags are computed.
-
-        ignore_categories : bool, optional
-            If True, the `condition` and `replicate` columns will be ignored in the computation, and all data will be treated as a single group.
-            If not specified, the default value is taken from the package settings.
-            To change the default configuration and behavior throughout all computations, use `peregrin.settings(ignore_categories=...)`
-
-        Returns
-        -------
-        pd.DataFrame
-            A DataFrame with one row per unique combination of `condition` × `replicate` × `time_point`
-            if `ignore_categories` is False, otherwise a single row for all data. It contains the following columns:
-
-            - `time_point`
-            - `frame`
-
-            \n`per_(category)_(metric)_`...
-                - ***descriptive base statistics:***  `min`, `max`, `mean`, `median`, `q25`, `q75` (iqr) if `cat_descr` is set `True` when initializing the `stats` class
-                - ***descriptive error statistics:*** `std` if `descr_descr_err` is set `True` when initializing the `stats` class
-                - ***inferative error statistics:***  `sem`, if `descr_infer_err` is set `True` when initializing the `stats` class,
-                `(CI_STATISTIC)_ci(CONFIDENCE_LEVEL)_low` and `(CI_STATISTIC)_ci(CONFIDENCE_LEVEL)_high` (confidence interval) if both `descr_infer_err` and `bootstrap_ci` are set `True`
-                - ***circular statistics:*** `mean` (circular mean) and `var` (circular variance) calculated for each of `direction` and `cum_direction`.
-
-            - for each of these metrics
-                - `cum_track_length`
-                - `cum_track_displacement`
-                - `cum_straightness_ratio`
-                - `instantaneous_speed`
-                - `cum_speed_mean`
-                - `cum_mean_straight_line_speed`
-                - `cum_forward_progression_linearity`
-                - `instantaneous_direction`
-                - `cum_direction`
-                - `cum_sum_directional_change`
-                - `cum_mean_directional_change`
-
-        See also
-        --------
-        `Stats.get_all()`-
-        computes all DataFrames (Spots_df, Tracks_df, Frames_df, TimeIntervals_df) from raw spot data in one call.
-
-        `Stats.tracks()`-
-        computes per-whole-trajectory statistics from the Spots_df.
-
-        `Stats.time_intervals()`-
-        computes per-time-interval statistics from the Spots_df.
-
-        """
-
-        # Work on a copy to avoid mutating the caller's DataFrame
-        df = df.copy()
 
         grouping_set = []
 
         if (isinstance(grouping_level, list)
             and (all(isinstance(g, list) for g in grouping_level)
                  or not any(g in df.columns for g in grouping_level))):
-
-                for g in grouping_level:
-                    grouping_cols = self._get_grouping_level(df.columns, g, exclude='track_uid')
-                    grouping_set.append(grouping_cols)
-                grouping_cols = max(grouping_set, key=len)
+            for g in grouping_level:
+                grouping_set.append(self._get_grouping_level(df.columns, g, exclude='track_uid'))
+            grouping_cols = max(grouping_set, key=len)
         else:
             grouping_cols = self._get_grouping_level(df.columns, grouping_level, exclude='track_uid')
             grouping_set = [grouping_cols]
 
         df = self.assign_track_uid(df)
 
-        # Resolve which metric columns to compute once (respecting subset & flags).
         wanted = self._frames_registry.resolve(
             subset,
             descr=self.cat_descr,
@@ -1107,289 +742,107 @@ class Calc:
             infer_err=self.cat_infer_err,
         )
 
-        # Circular columns require building a sin/cos context. Only do so if needed.
-        _circ_cols = {
-            'instantaneous_direction_mean', 'instantaneous_direction_var',
-            'cum_direction_mean', 'cum_direction_var',
-        }
-        _need_circ = bool(_circ_cols & set(wanted))
-
-        def _compute_level(source: pd.DataFrame, by_cols: list[str]) -> pd.DataFrame:
-            grp = source.groupby(by_cols, sort=False, observed=True)
-            index = grp.size().index
-
-            circ = None
-            if _need_circ:
-                dir_vals = pd.to_numeric(source['direction'], errors='coerce').to_numpy(dtype=float)
-                cum_vals = pd.to_numeric(source['cum_direction_mean'], errors='coerce').to_numpy(dtype=float)
-
-                circ_df = pd.DataFrame({
-                    '_sin_dir': np.sin(dir_vals),
-                    '_cos_dir': np.cos(dir_vals),
-                    '_sin_cum': np.sin(cum_vals),
-                    '_cos_cum': np.cos(cum_vals),
-                }, index=source.index)
-                for col in by_cols:
-                    circ_df[col] = source[col].values
-
-                circ = circ_df.groupby(by_cols, sort=False, observed=True).agg(
-                    sin_dir=('_sin_dir', 'mean'),
-                    cos_dir=('_cos_dir', 'mean'),
-                    sin_cum=('_sin_cum', 'mean'),
-                    cos_cum=('_cos_cum', 'mean'),
-                )
-
-            ctx = {
-                'grp': grp,
-                'src': source,
-                'by': by_cols,
-                'circ': circ,
-                'ci_cache': {},
-            }
-
-            out = self._frames_registry.compute(wanted, ctx)
-            out.index = index
-            return out.reset_index()
-
-        # Compute one frame-stats block per grouping set, then stack them.
         level_frames = []
         for grouping_cols in grouping_set:
             group_cols = [grouping_cols[-1]] + ['time_point', 'frame']
 
-            # Stash color columns if present, to carry them over to the output
+            # Stash color columns / parent grouping columns for re-attachment
             _color_cols = [c for c in df.columns if c.endswith('color')]
-            _color_stash = None
-            if _color_cols:
-                _stash_keys = grouping_cols
-                _color_stash = df[_stash_keys + _color_cols].drop_duplicates(subset=_stash_keys)
+            _color_stash = (
+                df.select(grouping_cols + _color_cols).unique(subset=grouping_cols, keep='first')
+                if _color_cols else None
+            )
 
-            # Stash higher-level grouping columns so each lower-level group can be
-            # attributed back to its (unambiguous) parent group(s).
             _parent_cols = grouping_cols[:-1]
             _parent_stash = None
             if _parent_cols:
                 _key = grouping_cols[-1]
                 _parent_stash = (
-                    df[[_key] + _parent_cols]
-                    .drop_duplicates(subset=[_key])
-                    .copy()
+                    df.select([_key] + _parent_cols)
+                    .unique(subset=[_key], keep='first')
+                    .with_columns(pl.col(_key).cast(pl.Utf8))
                 )
-                # Normalize key dtype to avoid silent merge failures
-                # (e.g. categorical vs object mismatches producing NaNs).
-                _parent_stash[_key] = _parent_stash[_key].astype('object')
 
-            level_df = _compute_level(df, group_cols)
+            ctx = {
+                'source': df,
+                'by': group_cols,
+                'extra_exprs': {},
+            }
+            level_df = self._frames_registry.compute(wanted, ctx)
 
-            # Re-attach higher-level grouping columns (parents of the lowest level)
             if _parent_stash is not None:
                 _key = grouping_cols[-1]
-                level_df[_key] = level_df[_key].astype('object')
-                level_df = level_df.merge(_parent_stash, on=_key, how='left')
+                level_df = level_df.with_columns(pl.col(_key).cast(pl.Utf8))
+                level_df = level_df.join(_parent_stash, on=_key, how='left')
 
-            # Tag the grouping level so stacked rows remain distinguishable
-            level_df['grouping_level'] = str(grouping_cols[0])
+            level_df = level_df.with_columns(
+                pl.lit(str(grouping_cols[0])).alias('grouping_level')
+            )
 
-            # Re-attach color columns if they were present on input
             if _color_stash is not None:
-                level_df = level_df.merge(_color_stash, on=_stash_keys, how='left')
+                level_df = level_df.join(_color_stash, on=grouping_cols, how='left')
 
             level_frames.append(level_df)
 
         if not level_frames:
-            return pd.DataFrame(columns=self.COLUMNS['TIMEINTERVALS'])
+            return pl.DataFrame(schema={c: pl.Float64 for c in self.COLUMNS['TIMEINTERVALS']})
 
-        df = pd.concat(level_frames, ignore_index=True)
+        out = pl.concat(level_frames, how='diagonal_relaxed')
 
-        # JSON-safe cleanup for Shiny/front-end serializers (no NaN/Inf in strict JSON)
-        df = df.replace([np.inf, -np.inf], np.nan)
+        # JSON-safe cleanup (no Inf in strict JSON)
+        out = out.with_columns([
+            pl.when(pl.col(c).is_infinite()).then(None).otherwise(pl.col(c)).alias(c)
+            for c, dt in out.schema.items() if dt in (pl.Float32, pl.Float64)
+        ])
 
         if self.significant_figures:
-            df = self.signify(df)
+            out = self.signify(out)
         if self.decimal_places:
-            df = self.norm_decimals(df)
+            out = self.norm_decimals(out)
 
-        return df
+        return out
 
-
+    # -----------------------------------------------------------------------
+    # TIME INTERVALS
+    # -----------------------------------------------------------------------
     def time_intervals(
         self,
-        df: pd.DataFrame,
+        df: pl.DataFrame,
         subset: list[str] = None,
         *,
         grouping_level: Literal['highest', 'lowest'] | str | int | list | None = 'highest',
         to_disk: bool = ...,
         **kwargs
-    ) -> pd.DataFrame:
-        """
-        Computes per-time-interval statistics.
-
-        For each `frame_lag` value (1, 2, …, maximum), squared displacements and turning angles are computed across trajectories
-        and then processed (e.g. averaged) for each category (group). Specifically for example:
-
-        - per replicate - across all trajectories of the same `replicate`
-        - per condition - across all trajectories of the same `condition`
-
-
-        Example
-        -------
-
-        Trajectories A, B, and C comprised of consecutive points and their positions:
-        ```
-        pa1 ─ pa2 ─ pa3 ─ pa4 ─ pa5 ─ pa6 ─ pa7
-              pb1 ─ pb2 ─ pb3 ─ pb4 ─ pb5 ─ pb6
-              pc1 ─ pc2 ─ pc3 ─ pc4 ─ pc5
-        ```
-
-        Valid position pairs for the interval (lag) of three frames:
-        ```
-        pa1 ───────────── pa4
-              pa2 ───────────── pa5
-              pb1 ───────────── pb4
-              pc1 ───────────── pc4
-                    pa3 ───────────── pa6
-                    pb2 ───────────── pb5
-                    pc2 ───────────── pc5
-                          pa4 ───────────── pa7
-                          pb3 ───────────── pb6
-        ```
-
-        MSD formula for a given time lag *k* for a given trajactory *i* with trajectory point positions *p* at a time position *t* :
-        ```
-        MSDᵢ(k) = ||pᵢ(t+k) - pᵢ(t)||²
-        ```
-        \n The per-track MSD values are then aggregated across tracks within each of unique `time_lag` × grouping. In case that `ignore_categories` is set to `True`, the aggregation will be performed across all tracks for each unique of `time_lag`.
-
-
-        Turning angle formula for a given time lag *k* for a trajectory *i* with trajectory point positions *y* and *x* at a time position *t* :
-        ```
-        Δθᵢ(k) = ||θᵢ(Δy(t+k), Δx(t+k)) - θᵢ(Δy(t), Δx(t))||
-        ```
-        \n The angular difference in the direction of motion is then wrapped to [−π, π].
-        Per-track turning angles values are then aggregated (circular mean and variance) across tracks within each of unique `time_lag`.
-
-
-
-        Parameters
-        ----------
-        df : pd.DataFrame
-            This method expects the dataframe returned from `stats.spots()`. The input DataFrame must contain these columns:
-            - `track_uid`
-            - `time_point`
-            - `x_coordinate`
-            - `y_coordinate`
-
-        subset : list[str], optional
-            If provided, only the listed metric columns are computed. The returned
-            DataFrame still includes the grouping/category columns as well as
-            `frame_lag` and `time_lag`. If None (default), all metrics enabled by
-            the current statistical flags are computed.
-
-        ignore_categories : bool, optional
-            If True, the `condition` and `replicate` columns will be ignored in the computation, and all data will be treated as a single group.
-            If not specified, the default value is taken from the package settings.
-            To change the default configuration and behavior throughout all computations, use `peregrin.settings(ignore_categories=...)`
-
-        Returns
-        -------
-        pd.DataFrame
-            *A DataFrame with one row per unique combination of category(ies) × `frame_lag`, containing the following columns:*
-
-            - **category(ies)**- categories for the given row.
-            - **`frame_lag`**- Integer lag in frames (1, 2, 3, …).
-            - **`time_lag`**- Corresponding time lag computed as `frame_lag` × time step.
-
-            \n **`per category`**
-                - **`tracks_contributing`**- the number of tracks that contributed data at a given time lag for a given category
-                - **`position_pairs_contributing`**- the number of position pairs that contributed data at a given time lag for a given category
-                - **`directional_change_mean`**- mean absolute turning angle in degrees
-                - **`directional_change_var`**- circular variance of turning angles
-                - **`MSD`**
-                - **`MSD_sd`**
-                - **`MSD_sem`** if `cat_infer_err` is set to `True`
-                - **`MSD_{CI_STATISTIC}_ci{CONFIDENCE_LEVEL}_low`** and **`MSD_{CI_STATISTIC}_ci{CONFIDENCE_LEVEL}_high`** (confidence interval) if both `cat_infer_err` and `bootstrap_ci` are set to `True`
-
-
-            \n Sets `BaseDataInventory.TimeIntervals` to the computed DataFrame.
-
-        Notes
-        -----
-        - Tracks with fewer than 2 points are excluded from computation.
-        - If fewer than 2 unique time points exist in the input, an empty DataFrame is returned.
-
-        See also
-        --------
-        `stats.get_all()`-
-        computes all DataFrames (Spots_df, Tracks_df, Frames_df, TimeIntervals_df) from raw spot data in one call.
-
-        `stats.spots()`-
-        computes per-trajectory-point statistics, both local (previous -> current position) and cumulative (start -> current position).
-
-        `stats.tracks()`-
-        computes per-whole-trajectory statistics from the Spots_df.
-
-        `stats.frames()`-
-        computes per-time-point statistics from the Spots_df.
-
+    ) -> pl.DataFrame:
+        """Computes per-time-interval statistics (MSD, turning angles, contribution
+        counts) per `frame_lag`. See the original documentation for the full
+        description; pair-building stays numpy-vectorized, all aggregation runs
+        through a single polars `group_by().agg()` per grouping level.
         """
 
-        df = df.copy()
-
-        if df.empty:
-            return pd.DataFrame(columns=self.COLUMNS['TIMEINTERVALS'])
+        if is_empty(df):
+            return pl.DataFrame(schema={c: pl.Float64 for c in self.COLUMNS['TIMEINTERVALS']})
 
         grouping_set = []
 
         if (isinstance(grouping_level, list)
             and (all(isinstance(g, list) for g in grouping_level)
                  or not any(g in df.columns for g in grouping_level))):
-
-                for g in grouping_level:
-                    grouping_cols = self._get_grouping_level(df.columns, g, exclude='track_uid')
-                    grouping_set.append(grouping_cols)
-                grouping_cols = max(grouping_set, key=len)
+            for g in grouping_level:
+                grouping_set.append(self._get_grouping_level(df.columns, g, exclude='track_uid'))
+            grouping_cols = max(grouping_set, key=len)
         else:
             grouping_cols = self._get_grouping_level(df.columns, grouping_level, exclude='track_uid')
             grouping_set = [grouping_cols]
 
-        # Stash color columns if present, to carry them over to the output
-        _color_cols = [c for c in df.columns if c.endswith('color')]
-        _color_stash = None
-        if _color_cols:
-            # Build a lookup keyed by the replicate/condition grouping columns
-            _stash_keys = grouping_cols
-            _color_stash = df[_stash_keys + _color_cols].drop_duplicates(subset=_stash_keys)
-
-        # Ensure track_uid is available as a column
-        if 'track_uid' not in df.columns:
-            if df.index.name == 'track_uid':
-                df = df.reset_index(drop=False)
-            else:
-                df = self.assign_track_uid(df).reset_index(drop=False)
+        df = self.assign_track_uid(df)
 
         # Unique time points
-        t_unique = np.sort(df['time_point'].unique())
+        if df['time_point'].n_unique() < 2:
+            return pl.DataFrame(schema={c: pl.Float64 for c in self.COLUMNS['TIMEINTERVALS']})
 
-        if t_unique.size < 2:
-            return pd.DataFrame(columns=self.COLUMNS['TIMEINTERVALS'])
+        t_step = self._resolve_t_step(df, 'time interval stats')
 
-        # Unique time steps (time interval)
-        if self.t_step is None:
-            _t = df.copy()
-            _t.sort_values('time_point', inplace=True)
-            t_steps = np.diff(_t['time_point'].unique())
-
-            if np.all(t_steps == t_steps[0]):
-                t_step = float(t_steps[0])
-            else:
-                t_step = float(np.median(t_steps))
-                warnings.warn(message=f"Time points are not uniformly spaced -> this will most probably lead to incorrect data computation. (time interval stats)\nObserved time steps:\n{t_steps}\nUsing: {t_step}",
-                                category=TimePointWarning,
-                                stacklevel=2)
-
-        else:
-            t_step = self.t_step
-
-        # Resolve which metric columns to compute once (respecting subset & flags).
         wanted = self._ti_registry.resolve(
             subset,
             descr=self.cat_descr,
@@ -1397,85 +850,52 @@ class Calc:
             infer_err=self.cat_infer_err,
         )
 
-        def _agg_msd_turn(msd_src: pd.DataFrame, turn_src: pd.DataFrame, by_cols: list[str]) -> pd.DataFrame:
-            """Aggregate pooled MSD pairs and turning-angle pairs for given grouping."""
-            msd_grouped = msd_src.groupby(by_cols, sort=False, observed=True)
-            ctx = {
-                'msd_grouped': msd_grouped,
-                'msd_grp': msd_grouped['sq_disp'],
-                'turn_src': turn_src,
-                'by': by_cols,
-                'ci_cache': {},
-                'circ_cache': {},
-            }
-            result = self._ti_registry.compute(wanted, ctx)
-            # Drop columns that produced no data (e.g. circular stats with empty turns).
-            result = result.dropna(axis=1, how='all') if not result.empty else result
-            return result
-
-        def _compute_level(source: pd.DataFrame, grouping_cols: list[str]) -> pd.DataFrame:
+        def _compute_level(source: pl.DataFrame, grouping_cols: list[str]) -> pl.DataFrame:
             """Compute time-interval stats for a single grouping level."""
 
-            # Vectorized per-track, per-lag computation
             temp = (
-                source[grouping_cols + ['track_uid', 'time_point', 'x_coordinate', 'y_coordinate']]
-                .copy()
-                .sort_values(['track_uid', 'time_point'])
-                .reset_index(drop=True)
+                source
+                .select(grouping_cols + ['track_uid', 'time_point', 'x_coordinate', 'y_coordinate'])
+                .sort(['track_uid', 'time_point'])
+                .with_columns(
+                    (pl.col('time_point').rank('dense').over('track_uid') - 1)
+                    .cast(pl.Int64).alias('_frame'),
+                    pl.len().over('track_uid').alias('_size'),
+                )
+                .filter(pl.col('_size') >= 2)
+                .with_columns(
+                    pl.arctan2(
+                        (pl.col('y_coordinate') - pl.col('y_coordinate').shift(1)).over('track_uid'),
+                        (pl.col('x_coordinate') - pl.col('x_coordinate').shift(1)).over('track_uid'),
+                    ).alias('_theta')
+                )
             )
 
-            # Integer frame index per track (0,1,2,...) based on ordered unique time points.
-            # Using dense rank makes lag pairing robust to non-uniform / missing time points:
-            # a "lag" is defined in *frames*, not in array-row offsets.
-            temp['_frame'] = (
-                temp.groupby('track_uid', sort=False)['time_point']
-                .rank(method='dense')
-                .astype('int64') - 1
-            )
-
-            # Number of frames spanned per track (max frame index), for lag validation
-            track_span = temp.groupby('track_uid', sort=False)['_frame'].transform('max')
-            temp['_n'] = track_span + 1  # frame count spanned
-
-            # Filter out tracks with <2 points early
-            track_sizes = temp.groupby('track_uid', sort=False).size()
-            valid_uids = track_sizes[track_sizes >= 2].index
-            temp = temp[temp['track_uid'].isin(valid_uids)].copy()
-
-            if temp.empty:
-                return pd.DataFrame(columns=self.COLUMNS['TIMEINTERVALS'])
-
-            # Consecutive step angles theta[i] = arctan2(dy, dx) between successive frames
-            grp_temp = temp.groupby('track_uid', sort=False)
-            temp['_dx1']   = grp_temp['x_coordinate'].diff()
-            temp['_dy1']   = grp_temp['y_coordinate'].diff()
-            temp['_theta'] = np.arctan2(temp['_dy1'].values, temp['_dx1'].values)
+            if is_empty(temp):
+                return pl.DataFrame(schema={c: pl.Float64 for c in self.COLUMNS['TIMEINTERVALS']})
 
             max_lag = int(temp['_frame'].max())
             if max_lag < 1:
-                return pd.DataFrame(columns=self.COLUMNS['TIMEINTERVALS'])
+                return pl.DataFrame(schema={c: pl.Float64 for c in self.COLUMNS['TIMEINTERVALS']})
 
-            # Build a (track_uid, frame) -> row lookup so a lag pairs points that are
-            # exactly `lag` frames apart (correct even with gaps / non-uniform spacing).
-            key = list(zip(temp['track_uid'].values, temp['_frame'].values))
-            pos_of = {k: i for i, k in enumerate(key)}
+            uid_arr   = temp['track_uid'].to_numpy()
+            frame_arr = temp['_frame'].to_numpy()
+            x_arr     = temp['x_coordinate'].to_numpy()
+            y_arr     = temp['y_coordinate'].to_numpy()
+            theta_arr = temp['_theta'].to_numpy()
+            cat_arrs  = {c: temp[c].to_numpy() for c in grouping_cols}
 
-            x_arr     = temp['x_coordinate'].values
-            y_arr     = temp['y_coordinate'].values
-            theta_arr = temp['_theta'].values
-            uid_arr   = temp['track_uid'].values
-            frame_arr = temp['_frame'].values
-            cat_arrs  = {col: temp[col].values for col in grouping_cols}
+            # (track_uid, frame) -> row lookup so a lag pairs points exactly
+            # `lag` frames apart (robust to gaps / non-uniform spacing).
+            pos_of = {k: i for i, k in enumerate(zip(uid_arr.tolist(), frame_arr.tolist()))}
 
-            msd_records = []
-            turn_records = []
+            msd_records: List[pl.DataFrame] = []
+            turn_records: List[pl.DataFrame] = []
 
             for lag in range(1, max_lag + 1):
-                # For every row, does a partner exactly `lag` frames ahead exist in the same track?
-                partner_keys = list(zip(uid_arr, frame_arr + lag))
                 partner_pos = np.fromiter(
-                    (pos_of.get(k, -1) for k in partner_keys),
-                    dtype=np.int64, count=len(partner_keys)
+                    (pos_of.get(k, -1) for k in zip(uid_arr.tolist(), (frame_arr + lag).tolist())),
+                    dtype=np.int64, count=len(uid_arr)
                 )
                 valid_mask = partner_pos >= 0
                 if not valid_mask.any():
@@ -1486,19 +906,16 @@ class Calc:
 
                 dx = x_arr[partner_idx] - x_arr[valid_idx]
                 dy = y_arr[partner_idx] - y_arr[valid_idx]
-                sq_disp = dx * dx + dy * dy
 
-                lag_df = pd.DataFrame({
+                msd_records.append(pl.DataFrame({
                     'track_uid': uid_arr[valid_idx],
-                    **{col: cat_arrs[col][valid_idx] for col in grouping_cols},
-                    'sq_disp':   sq_disp,
-                    'frame_lag': lag,
-                    'time_lag':  lag * t_step,
-                })
-                msd_records.append(lag_df)
+                    **{c: cat_arrs[c][valid_idx] for c in grouping_cols},
+                    'sq_disp':   dx * dx + dy * dy,
+                    'frame_lag': np.full(valid_idx.size, lag, dtype=np.int64),
+                    'time_lag':  np.full(valid_idx.size, lag * t_step, dtype=np.float64),
+                }))
 
-                # Turning angle: theta at partner frame minus theta at current frame.
-                # theta is defined only where a preceding step exists (frame >= 1).
+                # Turning angle: theta defined only where a preceding step exists
                 theta_now = theta_arr[valid_idx]
                 theta_par = theta_arr[partner_idx]
                 turn_valid = (frame_arr[valid_idx] >= 1) & np.isfinite(theta_now) & np.isfinite(theta_par)
@@ -1508,108 +925,134 @@ class Calc:
                     pi = partner_idx[turn_valid]
                     dtheta = theta_arr[pi] - theta_arr[ti]
                     dtheta = (dtheta + np.pi) % (2 * np.pi) - np.pi
-                    turn_records.append(pd.DataFrame({
+                    turn_records.append(pl.DataFrame({
                         'track_uid': uid_arr[ti],
-                        **{col: cat_arrs[col][ti] for col in grouping_cols},
+                        **{c: cat_arrs[c][ti] for c in grouping_cols},
                         'dtheta':    dtheta,
-                        'frame_lag': lag,
-                        'time_lag':  lag * t_step,
+                        'frame_lag': np.full(ti.size, lag, dtype=np.int64),
+                        'time_lag':  np.full(ti.size, lag * t_step, dtype=np.float64),
                     }))
 
             if not msd_records:
-                return pd.DataFrame(columns=self.COLUMNS['TIMEINTERVALS'])
+                return pl.DataFrame(schema={c: pl.Float64 for c in self.COLUMNS['TIMEINTERVALS']})
 
-            all_msd  = pd.concat(msd_records, ignore_index=True)
+            all_msd = pl.concat(msd_records, how='vertical_relaxed')
             all_turn = (
-                pd.concat(turn_records, ignore_index=True)
+                pl.concat(turn_records, how='vertical_relaxed')
                 if turn_records
-                else pd.DataFrame(columns=[*grouping_cols, 'track_uid', 'dtheta', 'frame_lag', 'time_lag'])
+                else pl.DataFrame(schema={**{c: all_msd.schema[c] for c in grouping_cols},
+                                          'track_uid': all_msd.schema['track_uid'],
+                                          'dtheta': pl.Float64,
+                                          'frame_lag': pl.Int64, 'time_lag': pl.Float64})
             )
 
             lag_group_cols = grouping_cols + ['frame_lag', 'time_lag']
-            lags = _agg_msd_turn(all_msd, all_turn, lag_group_cols)
-            lags.reset_index(inplace=True)
+            ctx = {
+                'source': all_msd,
+                'by': lag_group_cols,
+                'turn_src': all_turn,
+                'circ_cache': {},
+                'extra_exprs': {},
+            }
+            lags = self._ti_registry.compute(wanted, ctx)
 
-            return lags
+            # Drop columns that produced no data
+            return self._drop_all_null_columns(lags) if not is_empty(lags) else lags
 
-        # Compute one time-interval block per grouping set, then stack them.
         level_frames = []
         for grouping_cols in grouping_set:
 
-            # Stash color columns if present, to carry them over to the output
             _color_cols = [c for c in df.columns if c.endswith('color')]
-            _color_stash = None
-            if _color_cols:
-                _stash_keys = grouping_cols
-                _color_stash = df[_stash_keys + _color_cols].drop_duplicates(subset=_stash_keys)
+            _color_stash = (
+                df.select(grouping_cols + _color_cols).unique(subset=grouping_cols, keep='first')
+                if _color_cols else None
+            )
 
             level_df = _compute_level(df, grouping_cols)
 
-            if level_df.empty:
+            if is_empty(level_df):
                 continue
 
-            # Tag the grouping level so stacked rows remain distinguishable
-            level_df['grouping_level'] = str(grouping_cols[0])
+            level_df = level_df.with_columns(
+                pl.lit(str(grouping_cols[0])).alias('grouping_level')
+            )
 
-            # Re-attach color columns if they were present on input
             if _color_stash is not None:
-                level_df = level_df.merge(_color_stash, on=_stash_keys, how='left')
+                level_df = level_df.join(_color_stash, on=grouping_cols, how='left')
 
             level_frames.append(level_df)
 
         if not level_frames:
-            return pd.DataFrame(columns=self.COLUMNS['TIMEINTERVALS'])
+            return pl.DataFrame(schema={c: pl.Float64 for c in self.COLUMNS['TIMEINTERVALS']})
 
-        df = pd.concat(level_frames, ignore_index=True)
+        out = pl.concat(level_frames, how='diagonal_relaxed')
 
-        # JSON-safe cleanup for Shiny/front-end serializers (no NaN/Inf in strict JSON)
-        df = df.replace([np.inf, -np.inf], np.nan)
-
-        # Re-attach color columns if they were present on input
-        if _color_stash is not None:
-            df = df.merge(_color_stash, on=_stash_keys, how='left')
+        # JSON-safe cleanup
+        out = out.with_columns([
+            pl.when(pl.col(c).is_infinite()).then(None).otherwise(pl.col(c)).alias(c)
+            for c, dt in out.schema.items() if dt in (pl.Float32, pl.Float64)
+        ])
 
         if self.significant_figures:
-            df = self.signify(df)
+            out = self.signify(out)
         if self.decimal_places:
-            df = self.norm_decimals(df)
+            out = self.norm_decimals(out)
 
-        return df
+        return out
 
 
+    # -----------------------------------------------------------------------
+    # Shared helpers
+    # -----------------------------------------------------------------------
+    @staticmethod
+    def _ensure_polars(df) -> pl.DataFrame:
+        """Accept pandas DataFrames / Input wrappers transparently."""
+        if isinstance(df, pl.DataFrame):
+            return df
+        if hasattr(df, 'df') and isinstance(getattr(df, 'df'), pl.DataFrame):
+            return df.df  # loader's Input wrapper
+        try:
+            import pandas as pd
+            if isinstance(df, pd.DataFrame):
+                return pl.from_pandas(df)
+        except ImportError:
+            pass
+        raise TypeError(f"Expected a polars DataFrame, got {type(df).__name__}.")
 
-    def assign_track_uid(
-        self,
-        df: pd.DataFrame
-    ) -> pd.DataFrame:
-        """ Creates a unique track identifier `track_uid` by combining the category
+    # -----------------------------------------------------------------------
+    # Utilities
+    # -----------------------------------------------------------------------
+    def assign_track_uid(self, df: pl.DataFrame) -> pl.DataFrame:
+        """Creates a unique track identifier `track_uid` by combining the category
         columns present in the DataFrame with `track_id`, so each physical track
-        gets its own uid. """
+        gets its own uid."""
 
-        if 'track_uid' not in df.columns and df.index.name != 'track_uid':
-            grouping_cols = [c for c in self.DEFAULT_CATEGORIES
-                             if c in df.columns and c != 'track_uid']
+        if 'track_uid' in df.columns:
+            return df
 
-            # track_id MUST be part of the uid key, otherwise all tracks that
-            # share the same category values collapse into a single uid.
-            if 'track_id' in df.columns:
-                grouping_cols = grouping_cols + ['track_id']
+        grouping_cols = [c for c in self.DEFAULT_CATEGORIES
+                         if c in df.columns and c != 'track_uid']
 
-            if not grouping_cols:
-                raise ColumnsNotFoundError(
-                    "Cannot create track_uid: no category columns or 'track_id' found."
-                )
+        if 'track_id' in df.columns:
+            grouping_cols = grouping_cols + ['track_id']
 
-            df['track_uid'] = df.groupby(grouping_cols, sort=False).ngroup()
+        if not grouping_cols:
+            raise ColumnsNotFoundError(
+                "Cannot create track_uid: no category columns or 'track_id' found."
+            )
 
-        if df.index.name != 'track_uid':
-            df.set_index(['track_uid'], drop=True, append=False, inplace=True, verify_integrity=False)
-        return df
+        keys = (
+            df.select(grouping_cols)
+            .unique(maintain_order=True)
+            .with_row_index('track_uid')
+            .with_columns(pl.col('track_uid').cast(pl.Int64))
+        )
+        return df.join(keys, on=grouping_cols, how='left')
 
 
     def _get_grouping_level(
         self,
-        df_cols: pd.Index,
+        df_cols,
         grouping_level: Literal['highest', 'lowest'] | str | int | list | None = 'highest',
         *,
         multiple: bool = False,
@@ -1635,331 +1078,246 @@ class Calc:
         if isinstance(grouping_level, int):
             if grouping_level < 0 or grouping_level >= len(grouping_cols):
                 raise IndexError(f"Grouping level index {grouping_level} is out of bounds for DataFrame columns: {grouping_cols}")
-
             grouping_cols = grouping_cols[:grouping_level + 1]
         elif grouping_level == 'highest':
-            # Aggregate at the top of the hierarchy (broadest group).
             grouping_cols = [grouping_cols[-1]]
         elif grouping_level == 'lowest':
-            # Aggregate at the bottom of the hierarchy (finest group),
-            # retaining all parent levels for attribution.
             pass
         elif isinstance(grouping_level, str):
             idx = grouping_cols.index(grouping_level)
             grouping_cols = grouping_cols[:idx + 1]
-        else:
+        elif not isinstance(grouping_level, list):
             raise InvalidParameterValueError(f"Invalid grouping_level parameter: {grouping_level}. Must be a list of column names, an integer index, 'highest', 'lowest', or None.")
-
 
         for col in include:
             if col not in grouping_cols:
                 grouping_cols.append(col)
             else:
                 warnings.warn(message=f"Some columns in 'include' are already present in the default grouping columns: {grouping_cols}. They will be included only once.",
-                            category=ConflictWarning,
-                            stacklevel=2)
+                              category=ConflictWarning, stacklevel=2)
 
         if not is_empty(exclude):
             grouping_cols = [col for col in grouping_cols if col not in exclude]
-
             if len(grouping_cols) == 0:
                 grouping_cols = ['track_uid']
 
         return grouping_cols
 
 
-    def format_digits(self, df: pd.DataFrame, *, sig_figs: int = None, decimals: int = None) -> pd.DataFrame:
-        """ Formats numeric values in the DataFrame according to specified significant figures and decimal places. """
-
+    # -----------------------------------------------------------------------
+    # Formatting helpers
+    # -----------------------------------------------------------------------
+    def format_digits(self, df: pl.DataFrame, *, sig_figs: int = None, decimals: int = None) -> pl.DataFrame:
+        """Formats numeric values according to significant figures / decimals."""
         if sig_figs:
             df = self.signify(df, sig_figs=sig_figs)
-
         if decimals:
             df = self.norm_decimals(df, decimals=decimals)
-
         return df
 
 
-    def signify(self, df: pd.DataFrame, *, sig_figs: int = None) -> pd.DataFrame:
-        """ Round numeric values in a DataFrame to a specified number of significant figures. """
-
-        if df.empty:
-            return df.copy()
+    def signify(self, df: pl.DataFrame, *, sig_figs: int = None) -> pl.DataFrame:
+        """Round numeric values to a number of significant figures."""
+        if is_empty(df):
+            return df
 
         if sig_figs is None:
             sig_figs = self.significant_figures
 
         valuer = Values()
+        num_cols = [c for c, dt in df.schema.items() if dt.is_numeric()]
+        return df.with_columns([
+            pl.col(c).map_elements(
+                lambda x: valuer.RoundSigFigs(x, sigfigs=sig_figs),
+                return_dtype=pl.Float64,
+            ).alias(c)
+            for c in num_cols
+        ])
 
-        df_rounded = df.copy()
-        for col in df_rounded.select_dtypes(include=[np.number]).columns:
-            df_rounded[col] = df_rounded[col].apply(lambda x: valuer.RoundSigFigs(x, sigfigs=sig_figs))
 
-        return df_rounded
-
-
-    def norm_decimals(self, df: pd.DataFrame, decimals: int = None) -> pd.DataFrame:
-        """ Normalize decimal places across numeric columns in a DataFrame by rounding to a specified number of decimal places. """
-
-        if df.empty:
-            return df.copy()
+    def norm_decimals(self, df: pl.DataFrame, decimals: int = None) -> pl.DataFrame:
+        """Normalize decimal places across numeric columns."""
+        if is_empty(df):
+            return df
 
         if decimals is None:
             decimals = self.decimal_places
 
-        # Ensure all values have the same number of decimals: (round, fill)
-        for col in df.select_dtypes(include=[np.number]).columns:
-            df[col] = df[col].apply(lambda x: round(x, decimals) if pd.notnull(x) else x)
-
-        return df
+        float_cols = [c for c, dt in df.schema.items() if dt in (pl.Float32, pl.Float64)]
+        return df.with_columns([pl.col(c).round(decimals).alias(c) for c in float_cols])
 
 
-    def _general_agg_stats(self, df: pd.DataFrame, exclude: list[str], *, group_by: list[str] = ['track_uid']) -> pd.DataFrame:
-        """ Compute general aggregate statistics (min, max, mean, sd, sem, median) for numeric columns in the DataFrame, grouped by specified columns. Exclude specified columns from aggregation. """
+    def _general_agg_stats(self, df: pl.DataFrame, exclude: list[str], *, group_by: list[str] = ['track_uid']) -> pl.DataFrame:
+        """Compute general aggregate statistics (min, max, mean, sd, sem, median)
+        for numeric columns, grouped by `group_by`, excluding given columns."""
 
-        if exclude is None:
-            Reporter(Level.warning, "No columns specified for exclusion in Stats._general_agg_stats(); all numeric columns will be aggregated.", ntcq=self.ntcq)
-
-        exclude = [col for col in exclude if col != 'track_uid']
-
-        # Keep only numeric columns and exclude core columns
-        additional = df.copy()
+        exclude = [col for col in (exclude or []) if col != 'track_uid']
 
         try:
-            additional = additional.drop(columns=exclude, errors='ignore')
+            num_cols = [
+                c for c, dt in df.schema.items()
+                if dt.is_numeric() and c not in exclude and c not in group_by and c != 'track_uid'
+            ]
 
-            if not additional.shape[1]:
-                return pd.DataFrame(index=additional.index)
+            if not num_cols:
+                return df.select(group_by).unique(maintain_order=True)
 
-            additional = additional.select_dtypes(include=[np.number])
+            exprs = []
+            for col in num_cols:
+                exprs += [
+                    pl.col(col).min().alias(f"{col} min"),
+                    pl.col(col).max().alias(f"{col} max"),
+                    pl.col(col).mean().alias(f"{col} mean"),
+                    pl.col(col).std(ddof=1).alias(f"{col} sd"),
+                    (pl.col(col).std(ddof=1) / pl.col(col).count().cast(pl.Float64).sqrt()).alias(f"{col} sem"),
+                    pl.col(col).median().alias(f"{col} median"),
+                ]
 
-            if additional.empty or additional.shape[1] == 0:
-                return pd.DataFrame(index=df.index if group_by == ['track_uid'] else df.groupby(level=group_by, sort=False).ngroup().index)
-
-            # Stash leftover columns (exclude 'track_uid' if it's among them)
-            other_cols = [c for c in additional.columns.tolist() if c != 'track_uid']
-
-            if not other_cols:
-                return pd.DataFrame(index=additional.index)
-
-            # Group by track_uid
-            grp = additional.groupby(level=group_by, sort=False)
-
-            # For each bonus column, compute basic statistics, rename columns, and merge back
-            for col in other_cols:
-                agg = grp[col].agg(['min','max','mean','std','sem','median'])
-
-                agg.columns = [f"{col} min", f"{col} max", f"{col} mean", f"{col} sd", f"{col} sem", f"{col} median"]
-
-                additional = additional.merge(agg, left_index=True, right_index=True)
-
-            # Drop original columns
-            additional.drop(columns=other_cols, inplace=True)
-
-            # drop multiplicates if present
-            additional = additional.drop_duplicates()
-
-            return additional
+            return df.group_by(group_by, maintain_order=True).agg(exprs)
 
         except Exception as e:
             warnings.warn(message=f"Stats._general_agg_stats() encountered an error: {e}. Returning empty DataFrame. Traceback:\n{traceback.format_exc()}",
-                          category=FailedWarning,
-                          stacklevel=2)
-
-            return pd.DataFrame(index=df.index)
+                          category=FailedWarning, stacklevel=2)
+            return pl.DataFrame()
 
 
-    def _describe_infer(self, df: pd.DataFrame, group_cols: list[str], *, stats: dict[str, str] | list[str] = None, **kwargs) -> pd.Series:
+    def _describe_infer(self, df: pl.DataFrame, group_cols: list[str], *, stats: dict[str, str] | list[str] = None, **kwargs) -> pl.DataFrame:
         if not stats:
             return df
 
-        # only numeric columns, excluding id/category-like columns
-        value_cols = [c for c in df.columns
-                      if c not in group_cols
-                      and pd.api.types.is_numeric_dtype(df[c])
-                      and not any(s in c for s in kwargs.get('exclude', self._EXCLUDE_SUFFIXES))]
+        exclude = kwargs.get('exclude', self._EXCLUDE_SUFFIXES)
+        value_cols = [
+            c for c, dt in df.schema.items()
+            if c not in group_cols and dt.is_numeric()
+            and not any(s in c for s in exclude)
+        ]
 
         resolving = self.resolve(stats)
         resolving_circular = self.resolve(kwargs.get('circular_stats', {'mean': 'circ_mean', 'var': 'circ_var'}))
 
-        # named aggregation so output columns are already flat
-        named_agg = {}
+        exprs = []
+        ci_cols = []
         for col in value_cols:
+            circular = (any(t in col for t in ['direction', 'Directional', 'directional', 'Turn', 'turn'])
+                        and not col.endswith('var'))
+            resolver = resolving_circular if circular else resolving
 
-            if any(t in col for t in ['direction', 'direction', 'Directional', 'directional', 'Turn', 'turn']) and not col.endswith('var'):
-                for stat_name, func in resolving_circular.items():
-                    named_agg[f"per_{group_cols[-1].lower()}_{col}_{stat_name}"] = (col, func)
-            else:
-                for stat_name, func in resolving.items():
-                    if stat_name != 'ci':
-                        named_agg[f"per_{group_cols[-1].lower()}_{col}_{stat_name}"] = (col, func)
-                    else:
-                        named_agg[f"per_{group_cols[-1].lower()}_{col}_{self.CI_STATISTIC}_ci{self.CONFIDENCE_LEVEL}"] = (col, func)
+            for stat_name, builder in resolver.items():
+                if stat_name == 'ci':
+                    name = f"per_{group_cols[-1].lower()}_{col}_{self.CI_STATISTIC}_ci{self.CONFIDENCE_LEVEL}"
+                    exprs.append(pl.col(col).alias(f"__list_{name}"))
+                    ci_cols.append((name, col))
+                else:
+                    exprs.append(builder(col).alias(f"per_{group_cols[-1].lower()}_{col}_{stat_name}"))
 
-        grp_stats = (
-            df.groupby(group_cols, observed=True, sort=False)
-            .agg(**named_agg)
-            .reset_index())
+        grp_stats = df.group_by(group_cols, maintain_order=True).agg(exprs)
 
-        return df.merge(grp_stats, on=group_cols, how='left')
+        for name, _ in ci_cols:
+            bounds = [self.ci(np.asarray(v, dtype=float)) for v in grp_stats[f"__list_{name}"].to_list()]
+            grp_stats = grp_stats.drop(f"__list_{name}").with_columns(
+                pl.Series(f"{name}_low", [b[0] for b in bounds], dtype=pl.Float64),
+                pl.Series(f"{name}_high", [b[1] for b in bounds], dtype=pl.Float64),
+            )
+
+        return df.join(grp_stats, on=group_cols, how='left')
 
 
-    def resolve(self, agg_spec: dict[str, str] | list[str]) -> dict[str, str | callable]:
-        """ Resolves a list or dictionary of aggregation specs into a mapping of output labels to aggregation functions. """
+    def resolve(self, agg_spec: dict[str, str] | list[str]) -> dict[str, Callable[[str], pl.Expr]]:
+        """Resolves a list/dict of aggregation specs into a mapping of output
+        labels to polars aggregation-expression builders."""
+
+        def _builder(func_name: str) -> Callable[[str], pl.Expr]:
+            if func_name in self._POLARS_BUILTINS:
+                return lambda c, f=func_name: getattr(pl.col(c), f)()
+            if func_name in self.CUSTOM_AGG_FUNCTIONS:
+                return self.CUSTOM_AGG_FUNCTIONS[func_name]
+            if func_name == 'ci':
+                return 'ci'  # sentinel handled by callers
+            raise ValueError(
+                f"Unknown aggregation '{func_name}'. "
+                f"Available: {sorted(self._POLARS_BUILTINS | set(self.CUSTOM_AGG_FUNCTIONS) | {'ci'})}"
+            )
 
         resolved = {}
         if isinstance(agg_spec, list):
             for func_name in agg_spec:
-                if func_name in self._PANDAS_BUILTINS:
-                    resolved[func_name] = func_name
-                elif func_name in self.CUSTOM_AGG_FUNCTIONS:
-                    resolved[func_name] = self.CUSTOM_AGG_FUNCTIONS[func_name]
-                else:
-                    raise ValueError(
-                        f"Unknown aggregation '{func_name}'. "
-                        f"Available: {sorted(self._PANDAS_BUILTINS | set(self.CUSTOM_AGG_FUNCTIONS))}"
-                    )
-
+                resolved[func_name] = _builder(func_name)
         elif isinstance(agg_spec, dict):
             for label, func_name in agg_spec.items():
-                if func_name in self._PANDAS_BUILTINS:
-                    resolved[label] = func_name
-                elif func_name in self.CUSTOM_AGG_FUNCTIONS:
-                    resolved[label] = self.CUSTOM_AGG_FUNCTIONS[func_name]
-                else:
-                    raise ValueError(
-                        f"Unknown aggregation '{func_name}'. "
-                        f"Available: {sorted(self._PANDAS_BUILTINS | set(self.CUSTOM_AGG_FUNCTIONS))}"
-                    )
+                resolved[label] = _builder(func_name)
         return resolved
 
 
     def _insert_at_position(self, d: dict, key: Any, value: Any = None, *, where: int | str = 0) -> dict:
-        """ Insert a (key: value) pair into a dictionary at a specific position.
-
-        Parameters
-        ----------
-        d : dict
-            *The original dictionary.*
-
-        insert : tuple
-            *The key-value pair to insert.*
-
-        where : int | str, optional (default=0)
-            *The position at which to insert the new key-value pair. If an integer, it is treated as an index. If a string, it is treated as a key name.*
-        """
-
+        """Insert a (key: value) pair into a dictionary at a specific position."""
         items = list(d.items())
 
         if isinstance(where, int):
             index = where
-
         elif isinstance(where, str):
             keys = [k for k, _ in items]
             if where not in keys:
                 raise ValueError(f"Key '{where}' not found in dictionary.")
             index = keys.index(where) + 1
-
         else:
             raise ValueError("Parameter 'where' must be an integer index or a string key.")
 
         items.insert(index, (key, value))
-
         return dict(items)
 
 
+    # -----------------------------------------------------------------------
+    # Scalar / numpy statistics (unchanged semantics)
+    # -----------------------------------------------------------------------
     def _wrap_pi(self, a: np.ndarray) -> np.ndarray:
-        """ Wrap angles in radians to the range [-π, π]. """
+        """Wrap angles in radians to the range [-π, π]."""
         return (a + np.pi) % (2*np.pi) - np.pi
 
-
-    def _circ_mean(self, a: np.ndarray) -> float:
-        """ Circular mean of angles in radians. """
+    def _circ_mean(self, a) -> float:
+        """Circular mean of angles in radians."""
         a = np.asarray(a, dtype=float)
         if a.size == 0:
             return np.nan
-
         s = np.nanmean(np.sin(a))
         c = np.nanmean(np.cos(a))
         if np.isnan(s) or np.isnan(c):
             return np.nan
-
         return float(np.arctan2(s, c))
 
-
-    def _circ_var(self, a: np.ndarray) -> float:
-        """ Circular variance defined as 1 - R, where R is the mean resultant length of the angles. """
+    def _circ_var(self, a) -> float:
+        """Circular variance defined as 1 - R."""
         a = np.asarray(a, dtype=float)
         if a.size == 0:
             return np.nan
-
         s = np.nanmean(np.sin(a))
         c = np.nanmean(np.cos(a))
         if np.isnan(s) or np.isnan(c):
             return np.nan
+        return float(1.0 - np.hypot(s, c))
 
-        R = np.hypot(s, c)
-        return float(1.0 - R)
-
-
-    def _q25(self, a: np.ndarray) -> float:
-        """ Lower bound of the interquartile range = Q1. """
+    def _q25(self, a) -> float:
         a = np.asarray(a, dtype=float)
-        a = a[np.isfinite(a)]  # drop NaN/Inf
-        if a.size == 0:
-            return np.nan
-        return float(np.percentile(a, 25))
+        a = a[np.isfinite(a)]
+        return float(np.percentile(a, 25)) if a.size else np.nan
 
-
-    def _q75(self, a: np.ndarray) -> float:
-        """ Upper bound of the interquartile range = Q3. """
+    def _q75(self, a) -> float:
         a = np.asarray(a, dtype=float)
-        a = a[np.isfinite(a)]  # drop NaN/Inf
-        if a.size == 0:
-            return np.nan
-        return float(np.percentile(a, 75))
+        a = a[np.isfinite(a)]
+        return float(np.percentile(a, 75)) if a.size else np.nan
 
 
     def ci(self, a, *, n_resamples: int | None = None, confidence_level: float | None = None, **kwargs) -> tuple[float, float]:
-        """ Confidence interval via bootstrap.
-
-        Parameters
-        ----------
-        a : array-like
-            *1D array of values to compute the confidence interval for.*
-
-        n_resamples : int, (default self.BOOTSTRAP_RESAMPLES = 1000)
-            *Number of bootstrap resamples to perform. Can be set through Stats.BOOTSTRAP_RESAMPLES*
-
-        confidence_level : float, (default self.CONFIDENCE_LEVEL = 95)
-            *Confidence level for the interval (%). Can be set through Stats.CONFIDENCE_LEVEL*
-
-        statistic : callable, (default `np.mean`)
-            *Function for which the confidence interval is computed (e.g. `np.mean`, `np.median`).*
-
-        method : str, (default 'BCa')
-            *Confidence interval computation method. Default is 'BCa' (bias-corrected and accelerated).
-            If 'BCa' fails, the method falls back to 'percentile'. Used method is stored in and can be acquired through `Stats._ci_method_used`.*
-
-        Returns
-        -------
-        tuple[float, float]
-            *A tuple containing the lower and upper bounds of the confidence interval. If computation fails, returns ``(np.nan, np.nan)``.*
-        """
+        """Confidence interval via bootstrap. See original documentation."""
 
         method = kwargs.get('method', 'BCa')
-        seed = 42 # Fixed seed for reproducibility
+        seed = 42  # Fixed seed for reproducibility
 
-        # Ensure input is a numpy array of floats for the bootstrap compatibility
         a = np.asarray(a, dtype=float)
-
-        # Drop NaN values, for bootstrap cannot handle them
         a = a[~np.isnan(a)]
 
         if a.size < 2:
             return (np.nan, np.nan)
 
-        # Convert percentage (e.g. 95) to fraction (0.95) for scipy
         cl = self.CONFIDENCE_LEVEL if confidence_level is None else confidence_level
         if cl > 1:
             cl = cl / 100.0
@@ -1977,7 +1335,6 @@ class Calc:
             return (float(result.confidence_interval.low), float(result.confidence_interval.high))
 
         except Exception:
-            # Fallback to the percentile method if previous the method fails
             try:
                 result = stats.bootstrap(
                     (a,),
@@ -1992,48 +1349,30 @@ class Calc:
 
             except Exception as e:
                 warnings.warn(message=f"Bootstrap confidence interval computation failed for both '{method}' and fallback 'percentile' methods: {e}. Returning (np.nan, np.nan). Traceback:\n{traceback.format_exc()}",
-                              category=FailedWarning,
-                              stacklevel=2)
+                              category=FailedWarning, stacklevel=2)
                 return (np.nan, np.nan)
 
 
-    def sem(self, x: np.ndarray | pd.Series) -> float:
-        """ Standard error of the mean. """
-        if isinstance(x, np.ndarray):
-            # x = x[~np.isnan(x)]
-            n = len(x)
-            if n < 2:
-                return np.nan
-            return np.std(x, ddof=1) / np.sqrt(n)
-        else:
-            n = x.count()
+    def sem(self, x) -> float:
+        """Standard error of the mean."""
+        if isinstance(x, pl.Series):
+            n = x.len() - x.null_count()
             if n < 2:
                 return np.nan
             return x.std(ddof=1) / np.sqrt(n)
-
+        x = np.asarray(x, dtype=float)
+        n = len(x)
+        if n < 2:
+            return np.nan
+        return np.std(x, ddof=1) / np.sqrt(n)
 
 
     def stat_units(self, col: str = None, *, time_unit: str = None, **kwargs) -> dict[str, str]:
-        """ Returns a dictionary mapping metric names to their corresponding units
+        """Returns a dictionary mapping metric names to their corresponding units."""
 
-        Parameters
-        ----------
-        col : str, optional
-            *If provided, returns the unit for the specified column. If not provided, returns a dictionary of all column-unit mappings.*
-        time_unit : str, optional
-            *If provided, overrides the default time unit for all time-related metrics in the returned mapping.*
-        **kwargs : dict
-            *Additional keyword arguments*
-            - `time_data` (bool): If `True`, strips certain metrics of their time component as the time series chart itself is expected to include a time axis.*
-        """
-
-        if time_unit is not None:
-            t_unit = time_unit
-        else:
-            t_unit = self.t_unit
+        t_unit = time_unit if time_unit is not None else self.t_unit
 
         units = {
-
             # Spotstats metrics
             'x_coordinate': 'µm',
             'y_coordinate': 'µm',
@@ -2077,7 +1416,6 @@ class Calc:
 
         if kwargs.get('time_data', False):
             units.update({
-                # Framestats metrics
                 'time_point': f'{t_unit}',
                 'frame': '',
                 'cum_track_length': 'µm',
@@ -2091,61 +1429,62 @@ class Calc:
                 'instantaneous_direction_mean': 'rad',
                 'cum_direction_mean': 'rad',
             })
+
         if col is not None:
             return units.get(col, None)
-
         return units
 
 
-
-
-
-
-
 class Summarize:
-    """ Contains static methods utilized in the Peregrin Shiny App """
+    """Contains static methods utilized in the Peregrin Shiny App"""
 
     @staticmethod
-    def dataframe_summary(df: pd.DataFrame) -> dict:
+    def dataframe_summary(df: pl.DataFrame) -> dict:
+        missing = sum(df[c].null_count() for c in df.columns)
         return {
-            "rows": len(df),
-            "columns": df.shape[1],
-            "missing_cells": int(df.isna().sum().sum()),
-            "memory_mb": round(df.memory_usage(deep=True).sum() / 1e6, 2),
+            "rows": df.height,
+            "columns": df.width,
+            "missing_cells": int(missing),
+            "memory_mb": round(df.estimated_size() / 1e6, 2),
         }
 
     @staticmethod
-    def column_summary(series: pd.Series) -> dict:
-        # Robust handling of pandas nullable dtypes (pd.NA) and mixed types
-        if pd.api.types.is_numeric_dtype(series):
-            s = pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    def column_summary(series: pl.Series) -> dict:
+        if series.dtype.is_numeric():
+            s = series.cast(pl.Float64, strict=False)
+            s = s.set(s.is_infinite(), None)
 
-            # If there is at least one real numeric value, treat as numeric summary
-            if s.notna().any():
-                mode = s.mode(dropna=True)
+            if s.len() - s.null_count() > 0:
+                mode = s.drop_nulls().mode()
                 return {
                     "type": "type_one",
-                    "missing": int(series.isna().sum()),
-                    "distinct": int(series.nunique(dropna=True)),
-                    "min": s.min(skipna=True),
-                    "max": s.max(skipna=True),
-                    "mean": s.mean(skipna=True),
-                    "median": s.median(skipna=True),
-                    "mode": float(mode.iloc[0]) if not mode.empty else None,
-                    "sd": s.std(ddof=1, skipna=True),
-                    "variance": s.var(skipna=True),
+                    "missing": int(series.null_count()),
+                    "distinct": int(series.n_unique() - (1 if series.null_count() else 0)),
+                    "min": s.min(),
+                    "max": s.max(),
+                    "mean": s.mean(),
+                    "median": s.median(),
+                    "mode": float(mode[0]) if mode.len() else None,
+                    "sd": s.std(ddof=1),
+                    "variance": s.var(),
                 }
 
-        value_counts = series.value_counts(dropna=True, normalize=True).head(3)
+        vc = (
+            series.drop_nulls()
+            .value_counts(sort=True)
+            .head(3)
+        )
+        total = series.len() - series.null_count()
+        highest = [
+            (row[0], round(row[1] / total * 100, 1)) for row in vc.iter_rows()
+        ] if total else []
+
         return {
             "type": "type_zero",
-            "missing": int(series.isna().sum()),
-            "distinct": int(series.nunique(dropna=True)),
-            "highest": [(idx, round(val * 100, 1)) for idx, val in value_counts.items()],
+            "missing": int(series.null_count()),
+            "distinct": int(series.n_unique() - (1 if series.null_count() else 0)),
+            "highest": highest,
         }
-
-
-
 
 
 
@@ -2162,10 +1501,6 @@ class Stats(Calc):
     >>> ti_df = stats.compute_time_intervals() # per-time-interval statistics
     >>> stats.plot_tracks()                    # reconstruct trajectories
     >>> stats.plot_msd(band='sem')             # MSD plot
-
-    Calling the instance with a DataFrame runs :meth:`Calc.spots` and stores the
-    result on the instance. Subsequent ``compute_*`` / ``plot_*`` methods operate
-    on that stored Spots_df unless another DataFrame is passed explicitly.
     """
 
     def __init__(
@@ -2185,41 +1520,26 @@ class Stats(Calc):
             **kwargs,
         )
 
-        # Stored results.
-        self.spots_df: Optional[pd.DataFrame] = None
-        self.tracks_df: Optional[pd.DataFrame] = None
-        self.frames_df: Optional[pd.DataFrame] = None
-        self.time_intervals_df: Optional[pd.DataFrame] = None
+        self.spots_df: Optional[pl.DataFrame] = None
+        self.tracks_df: Optional[pl.DataFrame] = None
+        self.frames_df: Optional[pl.DataFrame] = None
+        self.time_intervals_df: Optional[pl.DataFrame] = None
 
         self._categories: Optional[dict] = None
 
     def __repr__(self) -> str:
-        n = None if self.spots_df is None else len(self.spots_df)
+        n = None if self.spots_df is None else self.spots_df.height
         return f"<Stats object: spots_rows={n}>"
 
-    # -----------------------------------------------------------------------
-    # Callable entry point: compute & store Spots_df
-    # -----------------------------------------------------------------------
-    def __call__(
-        self,
-        df: pd.DataFrame,
-        **kwargs,
-    ) -> "Stats":
+    def __call__(self, df: pl.DataFrame, **kwargs) -> "Stats":
         """Compute per-spot statistics from raw spot data and store them.
+        Returns ``self`` so the call can be chained/re-bound."""
 
-        Returns ``self`` so the call can be chained/re-bound:
-
-        >>> stats = Stats()
-        >>> stats = stats(loaded_df)
-        """
+        # Accept the Input wrapper from the loader transparently
+        if hasattr(df, 'df') and not isinstance(df, pl.DataFrame):
+            df = df.df
 
         self.spots_df = self.spots(df, **kwargs)
-
-        if self.spots_df is not None and 'track_uid' not in self.spots_df.columns:
-            # Calc.spots() leaves track_uid as the index; promote it so the
-            # reconstructor sees contiguous, correctly-labelled tracks.
-            if self.spots_df.index.name == 'track_uid' or 'track_uid' in (self.spots_df.index.names or []):
-                self.spots_df = self.spots_df.reset_index()
 
         # Invalidate downstream caches on new input.
         self.tracks_df = None
@@ -2228,11 +1548,13 @@ class Stats(Calc):
 
         return self
 
+    def _resolve_spots(self, df: Optional[pl.DataFrame]) -> pl.DataFrame:
+        source = df if df is not None else self.spots_df
+        if source is None:
+            raise ValueError("No Spots_df available. Call the Stats instance with a DataFrame first.")
+        return source
 
-    # -----------------------------------------------------------------------
-    # Compute wrappers (store results on the instance)
-    # -----------------------------------------------------------------------
-    def compute_spots(self, df: Optional[pd.DataFrame] = None, subset: Optional[list[str]] = None, **kwargs) -> pd.DataFrame:
+    def compute_spots(self, df: Optional[pl.DataFrame] = None, subset: Optional[list[str]] = None, **kwargs) -> pl.DataFrame:
         """Compute (and store) per-spot statistics."""
         source = df if df is not None else self.spots_df
         if source is None:
@@ -2240,114 +1562,50 @@ class Stats(Calc):
         self.spots_df = self.spots(source, subset=subset, **kwargs)
         return self.spots_df
 
-    def compute_tracks(
-        self,
-        df: Optional[pd.DataFrame] = None,
-        subset: Optional[list[str]] = None,
-        **kwargs,
-    ) -> pd.DataFrame:
+    def compute_tracks(self, df: Optional[pl.DataFrame] = None, subset: Optional[list[str]] = None, **kwargs) -> pl.DataFrame:
         """Compute (and store) per-track statistics from the stored Spots_df."""
         source = self._resolve_spots(df)
         self.tracks_df = self.tracks(source, subset=subset, **kwargs)
         return self.tracks_df
 
-    def compute_frames(
-        self,
-        df: Optional[pd.DataFrame] = None,
-        subset: Optional[list[str]] = None,
-        *,
-        grouping_level: Any = 'highest',
-        **kwargs,
-    ) -> pd.DataFrame:
+    def compute_frames(self, df: Optional[pl.DataFrame] = None, subset: Optional[list[str]] = None, *, grouping_level: Any = 'highest', **kwargs) -> pl.DataFrame:
         """Compute (and store) per-time-point statistics from the stored Spots_df."""
         source = self._resolve_spots(df)
-        self.frames_df = self.frames(
-            source, subset=subset, grouping_level=grouping_level, **kwargs
-        )
+        self.frames_df = self.frames(source, subset=subset, grouping_level=grouping_level, **kwargs)
         return self.frames_df
 
-    def compute_time_intervals(
-        self,
-        df: Optional[pd.DataFrame] = None,
-        subset: Optional[list[str]] = None,
-        *,
-        grouping_level: Any = 'highest',
-        **kwargs,
-    ) -> pd.DataFrame:
+    def compute_time_intervals(self, df: Optional[pl.DataFrame] = None, subset: Optional[list[str]] = None, *, grouping_level: Any = 'highest', **kwargs) -> pl.DataFrame:
         """Compute (and store) per-time-interval statistics from the stored Spots_df."""
         source = self._resolve_spots(df)
-        self.time_intervals_df = self.time_intervals(
-            source, subset=subset, grouping_level=grouping_level, **kwargs
-        )
+        self.time_intervals_df = self.time_intervals(source, subset=subset, grouping_level=grouping_level, **kwargs)
         return self.time_intervals_df
 
-    def compute_all(
-        self,
-        df: Optional[pd.DataFrame] = None,
-        **kwargs,
-    ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    def compute_all(self, df: Optional[pl.DataFrame] = None, **kwargs):
         """Compute and store all four statistics DataFrames."""
         source = self._resolve_spots(df)
         self.spots_df = source
         self.compute_tracks()
         self.compute_frames(**kwargs)
         self.compute_time_intervals(**kwargs)
-        return (
-            self.spots_df,
-            self.tracks_df,
-            self.frames_df,
-            self.time_intervals_df,
-        )
-    
+        return (self.spots_df, self.tracks_df, self.frames_df, self.time_intervals_df)
 
     # -----------------------------------------------------------------------
     # Plotting wrappers (lazy imports avoid circular deps)
     # -----------------------------------------------------------------------
-
-    def plot_tracks(
-        self,
-        **kwargs,
-    ):
+    def plot_tracks(self, **kwargs):
         """Reconstruct and plot trajectories from the stored Spots_df."""
         from ..plot.tracks.reconstruct import reconstruct
+        return reconstruct(self.spots_df, **kwargs)
 
-        return reconstruct(
-            self.spots_df,
-            **kwargs,
-        )
-
-    def plot_msd(
-        self,
-        band: Optional[str] = None,
-        *,
-        grouping_level: Any = 'highest',
-        **kwargs,
-    ):
+    def plot_msd(self, band: Optional[str] = None, *, grouping_level: Any = 'highest', **kwargs):
         """Plot MSD from the stored Spots_df."""
         from ..plot.time.lags import msd
-        
-        return msd(
-            self.spots_df,
-            band=band,
-            categories=self._categories,
-            grouping_level=grouping_level,
-            **kwargs,
-        )
+        return msd(self.spots_df, band=band, categories=self._categories, grouping_level=grouping_level, **kwargs)
 
-    def plot_turn_angles(
-        self,
-        *,
-        grouping_level: Any = 'highest',
-        **kwargs,
-    ):
+    def plot_turn_angles(self, *, grouping_level: Any = 'highest', **kwargs):
         """Plot the turning-angle heatmap from the stored Spots_df."""
-
         from ..plot.time.lags import turn_angles
-        return turn_angles(
-            self.spots_df,
-            grouping_level=grouping_level,
-            **kwargs,
-        )
+        return turn_angles(self.spots_df, grouping_level=grouping_level, **kwargs)
 
 
 # input_metadata = InputMetadata()
