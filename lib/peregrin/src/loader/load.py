@@ -1,9 +1,7 @@
 import re
-from sys import path
-import traceback
 
 import xml.etree.ElementTree as ET
-import pandas as pd
+import polars as pl
 import numpy as np
 import os.path as op
 from typing import Dict, List, Optional, Tuple
@@ -21,14 +19,32 @@ from ..compute.stats import calc
 
 
 
-class Input(pd.DataFrame):
-    """A pandas DataFrame that carries a `.metadata` (InputMetadata) attribute."""
+class Input:
+    """A thin wrapper around a polars DataFrame that carries a `.metadata`
+    (InputMetadata) attribute. Polars DataFrames cannot be subclassed the way
+    pandas DataFrames can, so attribute access is delegated to the wrapped
+    DataFrame instead."""
 
-    _metadata = ['metadata']  # propagate through pandas operations
+    def __init__(self, df: pl.DataFrame, metadata: "InputMetadata" = None):
+        self._df = df
+        self.metadata = metadata
 
     @property
-    def _constructor(self):
-        return Input
+    def df(self) -> pl.DataFrame:
+        return self._df
+
+    def __getattr__(self, name):
+        # delegate everything else to the underlying polars DataFrame
+        return getattr(self._df, name)
+
+    def __getitem__(self, key):
+        return self._df[key]
+
+    def __len__(self):
+        return len(self._df)
+
+    def __repr__(self):
+        return repr(self._df)
 
 
 class InputMetadata:
@@ -193,111 +209,13 @@ class DataLoader:
         *,
         retain: Optional[list[str]] = None,
         **kwargs
-    ) -> pd.DataFrame:
+    ) -> pl.DataFrame:
 
         """
         Load tracking data from any number of files into a single DataFrame, 
-        while assigning condition and replicate labels. This method is used
-        to prepare data for further handling in the computations, using the 
-        `peregrin` library.
-        
-        Parameters
-        ----------
-        files : list[PathLike[str]] | dict
-            Either a list of file paths or a dictionary with keys as category indicies and values either as dicts (subcategories) or lists of file paths.
-            Data can be categorized up to 5 levels deep having the following structure:
-
-        ```
-        { set: { subset: { group: { subgroup: { subsubgroup: file }}}}}
-
-        Input example 1 (3-level categorization using lists of file paths):
-        [ [ ['path/to/file01.csv', 'path/to/file02.csv'], 
-            ['path/to/file03.csv', 'path/to/file04.csv']], 
-          [ ['path/to/file05.csv', 'path/to/file06.csv'], 
-            ['path/to/file07.csv', 'path/to/file08.csv']]]
-
-        Input example 2 (3-level categorization using dictionaries):
-        {'condition1': {'bio_replicate1': ['path/to/tech_replicate_A-10-10-10.csv', 'path/to/tech_replicate_B-10-10-10.csv'],
-                        'bio_replicate2': ['path/to/tech_replicate_A-11-10-10.csv', 'path/to/tech_replicate_B-11-10-10.csv']},
-         'condition2': {'bio_replicate1': ['path/to/tech_replicate_A-18-10-10.csv', 'path/to/tech_replicate_B-18-10-10.csv'],
-                        'bio_replicate2': ['path/to/tech_replicate_A-20-10-10.csv', 'path/to/tech_replicate_B-20-10-10.csv']}}
-
-        Input example 3 (4-level categorization using dictionaries):
-        {'A': {'A1': {'A1a': {'A1an': ['path/to/file01.csv', 'path/to/file02.csv'],
-                              'A1am': ['path/to/file03.csv', 'path/to/file04.csv']},
-                      'A1b': {'A1bn': ['path/to/file05.csv', 'path/to/file06.csv'],
-                              'A1bm': ['path/to/file07.csv', 'path/to/file08.csv']}},
-               'A2': {'A2a': {'A2an': ['path/to/file09.csv', 'path/to/file10.csv'],
-                              'A2am': ['path/to/file11.csv', 'path/to/file12.csv']},
-                      'A2b': {'A2bn': ['path/to/file13.csv', 'path/to/file14.csv'],
-                              'A2bm': ['path/to/file15.csv', 'path/to/file16.csv']}}},
-         'B': {'B1': {'B1a': {'B1an': ['path/to/file17.csv', 'path/to/file18.csv'],
-                              'B1am': ['path/to/file19.csv', 'path/to/file20.csv']},
-                      'B1b': {'B1bn': ['path/to/file21.csv', 'path/to/file22.csv'],
-                              'B1bm': ['path/to/file23.csv', 'path/to/file24.csv']}},
-               'B2': {'B2a': {'B2an': ['path/to/file25.csv', 'path/to/file26.csv'],
-                              'B2am': ['path/to/file27.csv', 'path/to/file28.csv']},
-                      'B2b': {'B2bn': ['path/to/file29.csv', 'path/to/file30.csv'],
-                              'B2bm': ['path/to/file31.csv', 'path/to/file32.csv']}}}}
-        
-        ```
-         See more detailed documentation of this method here: https://branislavmodriansky.github.io/peregrin/lib/overview.html
-
-        colnames : dict
-            A dictionary specifying the column names for track identifiers, time points, and x/y coordinates. 
-            With the default {'id': None, 't': None, 'x': None, 'y': None}, the method will NOT attempt to 
-            automatically detect these columns.
-        
-        retain : list[str], optional, default None
-            A list of column names from the original input data to be retained. If None, only the essential columns 
-            (track_id, time_point, x_coordinate, y_coordinate) are extracted, while all other columns are discarded.
-
-        convert_time_to : str, optional, default None
-            If provided, time will be converted from the input time units to the specified target unit.
-            If the metadata do not contain time unit information and the time unit is not passed to the function by `time_unit="<value>"`, the method will be skipped.
-            Supported units include: 'ms', 's', 'min', 'h', 'day'.
-
-        convert_spatial_to : str, optional, default None
-            If provided, spatial coordinates will be converted from the input unit `spatial_unit` to the specified target unit. 
-            If the metadata does not contain spatial unit information and the spatial unit is not passed to the function by `spatial_unit="<value>"`, the method will be skipped.
-            If the input units cannot be converted from nor to 'px', the conversion will be skipped.
-            Supported units include: 'nm', 'μm', 'mm', 'cm', 'm'.
-
-        ignore_matadata : bool, optional, default False
-            If True, the method will ignore any metadata found in the input files. This is useful when the user wants to manually specify metadata or when the input files contain inconsistent or incorrect metadata.
-
-        mirror_y : bool, optional, default False
-            If True, the method will mirror the y-coordinates across their midpoint - useful for correcting mirrored y-coordinates in exported data.
-        
-        mirror_x : bool, optional, default False
-            If True, the method will mirror the x-coordinates across their midpoint - useful for correcting mirrored x-coordinates in exported data.
-
-        merge : Literal['all', 'sets', 'subsets', 'groups', 'subgroups', None], default 'all'
-            Specifies how to merge the loaded data:
-
-        split_filename : bool, optional, default False
-            If True, the method will split file names during subsubgroup labeling using the `split_filename_position` and `split_filename_delimiter` parameters.
-
-        split_filename_position : Literal['first', 'last'] | int, optional, default 'last'
-            Determines how to split file names during subsubgroup labeling when `split_filename` is True.
-            Either one of 'first' or 'last' to split at the first or last occurrence of the `split_character`, or an integer to split at a specific index.
-
-        split_filename_delimiter : str, optional, default '-'
-            The character used to split file names for automatic label extraction when `split_filename` is True.
-        ```
-        'all' - merge all data into a single DataFrame (default)
-        'sets' - merge data within each set, but keep sets separate
-        'subsets' - merge data within each subset, but keep subsets separate
-        'groups' - merge data within each group, but keep groups separate
-        'subgroups' - merge data within each subgroup, but keep subgroups separate
-        None - do not merge; return data as a dictionary of dictionaries with DataFrames
-        ```
-
-        Returns
-        -------
-        pd.DataFrame
-            A single DataFrame containing all loaded data, with condition and replicate labels assigned to each row.
-        
+        while assigning condition and replicate labels. (See original docstring
+        for the full description; behaviour is unchanged but the returned
+        object is now polars-based.)
         """
 
         self.retain = retain
@@ -340,8 +258,10 @@ class DataLoader:
                 self.metadata.update(self._filter_metadata(metadata))
             df = self._extract(df)
 
-            for cat, label in zip(used_categories, labels):
-                df[cat] = label
+            df = df.with_columns([
+                pl.lit(label).alias(cat)
+                for cat, label in zip(used_categories, labels)
+            ])
 
             records.append(df)
 
@@ -352,37 +272,19 @@ class DataLoader:
 
     def _attach_metadata(self, result):
         """Attach the per-load Metadata object to the merged result."""
-        if isinstance(result, pd.DataFrame):
-            result = Input(result)
-            result.metadata = self.metadata
+        if isinstance(result, pl.DataFrame):
+            result = Input(result, self.metadata)
         elif isinstance(result, dict):
             self._attach_metadata_dict(result)
         return result
 
     def _attach_metadata_dict(self, node):
         for key, val in node.items():
-            if isinstance(val, pd.DataFrame):
-                val = Input(val)
-                val.metadata = self.metadata
-                node[key] = val
+            if isinstance(val, pl.DataFrame):
+                node[key] = Input(val, self.metadata)
             elif isinstance(val, dict):
                 self._attach_metadata_dict(val)
 
-
-    def merge_leaf_lists(tree, depth):
-        current = [tree]
-
-        # Go to the parents of the leaf lists
-        for _ in range(depth - 2):
-            current = [item for lst in current for item in lst]
-
-        # Merge each leaf list
-        for i, leaf in enumerate(current):
-            current[i] = [pd.concat(leaf, ignore_index=True)]
-
-        return tree  
-
-    
 
     def _merge(self, records: list, used_categories: list):
         """
@@ -396,10 +298,10 @@ class DataLoader:
         None         -> dict keyed down to subsubgroup (unconcatenated leaves)
         """
         if not records:
-            return pd.DataFrame()
+            return pl.DataFrame()
 
         if self.merge == 'all':
-            return pd.concat(records, ignore_index=True)
+            return pl.concat(records, how='diagonal_relaxed')
 
         merge_levels = {
             'sets': 1,
@@ -415,16 +317,12 @@ class DataLoader:
                 "Choose from 'all', 'sets', 'subsets', 'groups', 'subgroups', None."
             )
 
-        # How many of the available (bottom-up) categories to key on.
         full_order = ['set', 'subset', 'group', 'subgroup', 'subsubgroup']
-        # index of the deepest keying category within full_order
-        
-        # only keep categories that actually exist in the data
         key_cats = [c for c in full_order[:target] if c in used_categories]
 
         result = {}
         for df in records:
-            keys = [str(df[c].iloc[0]) for c in key_cats]
+            keys = [str(df[c][0]) for c in key_cats]
 
             node = result
             for k in keys[:-1]:
@@ -436,7 +334,6 @@ class DataLoader:
             else:
                 node.setdefault(last, []).append(df)
 
-        # Concatenate leaf lists (unless merge is None)
         if self.merge is not None:
             self._concat_leaves(result)
 
@@ -446,7 +343,7 @@ class DataLoader:
         """Recursively concatenate lists of DataFrames stored in a nested dict."""
         for key, val in node.items():
             if isinstance(val, list):
-                node[key] = pd.concat(val, ignore_index=True)
+                node[key] = pl.concat(val, how='diagonal_relaxed')
             elif isinstance(val, dict):
                 self._concat_leaves(val)
 
@@ -458,7 +355,6 @@ class DataLoader:
         the file level is labelled with the file's basename.
         """
         if depth == 1:
-            # This list holds file paths
             for path in tree:
                 yield labels + (self._subsubgroup_label(path),), path
         else:
@@ -472,7 +368,6 @@ class DataLoader:
         the file level is labelled with the file's basename.
         """
         if depth == 1:
-            # This dict maps filename -> filepath, OR is a list of paths
             if isinstance(tree, dict):
                 for _, path in tree.items():
                     yield labels + (self._subsubgroup_label(path),), path
@@ -487,26 +382,17 @@ class DataLoader:
     def _max_list_depth(self, obj):
         if not isinstance(obj, list) or not obj:
             return 0
-
         return 1 + self._max_list_depth(obj[0])
 
     def _max_dict_depth(self, d):
         if not isinstance(d, dict) or not d:
             return 0
-
         return 1 + max(self._max_dict_depth(v) for v in d.values())
 
 
     def _subsubgroup_label(self, path: str) -> str:
         """
         Derive the subsubgroup (file-level) label from a file path.
-
-        With `split_filename=False` (default) the full basename is used.
-        With `split_filename=True` the stem is split on `split_character`
-        according to `split_how`:
-            'first' -> keep the part before the first occurrence
-            'last'  -> keep the part before the last occurrence
-            int i   -> keep the i-th part (0-based) of the split
         """
         name = op.basename(path)
         stem, _ = op.splitext(name)
@@ -530,55 +416,37 @@ class DataLoader:
             return stem.rsplit(sep, 1)[-1] if sep in stem else stem
 
         return stem
-    
 
-    def _load_from_list(self, file_tree_list: list, depth: int) -> pd.DataFrame:
 
-        current = [file_tree_list]
+    def _extract(self, df: pl.DataFrame) -> pl.DataFrame:
 
-        for _ in range(depth - 1):
-            current = [item for lst in current for item in lst]
+        essential = [self.id_col, self.t_col, self.x_col, self.y_col]
 
-        return [f for group in current for f in group]
-    
-    def _load_from_dict(self, file_tree_dict: dict, depth: int) -> pd.DataFrame:
-        current = [file_tree_dict]
-
-        for _ in range(depth - 1):
-            current = [item for d in current for item in d.values()]
-
-        return [f for group in current for f in group]
-            
-
-    def _extract(
-        self,
-        df: pd.DataFrame
-    ) -> pd.DataFrame:
-
-        if not all(col in df.columns for col in [self.id_col, self.t_col, self.x_col, self.y_col]):
-            missing = [col for col in [self.id_col, self.t_col, self.x_col, self.y_col] if col not in df.columns]
+        if not all(col in df.columns for col in essential):
+            missing = [col for col in essential if col not in df.columns]
             raise ColumnsNotFoundError(f"missing columns: {missing}")
 
         if self.retain is None:
-            df = df[[self.id_col, self.t_col, self.x_col, self.y_col]].apply(pd.to_numeric, errors='coerce')
+            df = df.select([
+                pl.col(c).cast(pl.Float64, strict=False) for c in essential
+            ])
         else:
-            df = df[[self.id_col, self.t_col, self.x_col, self.y_col] + self.retain].copy()
-            for c in [self.id_col, self.t_col, self.x_col, self.y_col]:
-                df[c] = pd.to_numeric(df[c], errors='coerce')
-            self._py_numeric_df(df)
+            df = df.select(essential + list(self.retain)).with_columns([
+                pl.col(c).cast(pl.Float64, strict=False) for c in essential
+            ])
+            df = self._py_numeric_df(df)
 
-        df = df.dropna(subset=[self.id_col, self.t_col, self.x_col, self.y_col]).reset_index(drop=True)
+        df = df.drop_nulls(subset=essential)
         
         if self.mirror_y:
             y_mid = (df[self.y_col].min() + df[self.y_col].max()) / 2
-            df[self.y_col] = 2 * y_mid - df[self.y_col]
+            df = df.with_columns((2 * y_mid - pl.col(self.y_col)).alias(self.y_col))
         if self.mirror_x:
             x_mid = (df[self.x_col].min() + df[self.x_col].max()) / 2
-            df[self.x_col] = 2 * x_mid - df[self.x_col]
+            df = df.with_columns((2 * x_mid - pl.col(self.x_col)).alias(self.x_col))
             
         df = self._standname(df, self.id_col, self.t_col, self.x_col, self.y_col)
 
-        # run time conversion for any requested target
         if self.kwargs.get('convert_spatial_to', None) not in (None, ""):
             df = self._convert_spatial(df)
         if self.kwargs.get('convert_time_to', None) not in (None, ""):
@@ -587,7 +455,7 @@ class DataLoader:
         return df
 
 
-    def _read_file(self, filepath: str) -> pd.DataFrame:
+    def _read_file(self, filepath: str) -> Tuple[pl.DataFrame, dict]:
             
         _, ext = op.splitext(filepath.lower())
 
@@ -623,16 +491,19 @@ class DataLoader:
                 metadata[feat.attrib['feature']] = dim_to_unit.get(feat.attrib.get('dimension'))
 
         # spots
-        df = pd.DataFrame([
+        rows = [
             spot.attrib
             for frame in model.find('AllSpots')
             for spot in frame
+        ]
+        df = pl.DataFrame(rows)
+        df = df.with_columns(pl.col('ID').cast(pl.Int64))
+        num_cols = [c for c in df.columns if c not in ('name', 'ID')]
+        df = df.with_columns([
+            pl.col(c).cast(pl.Float64, strict=False) for c in num_cols
         ])
-        df['ID'] = df['ID'].astype(np.int64)
-        num_cols = [c for c in df.columns if c != 'name']
-        df[num_cols] = df[num_cols].apply(pd.to_numeric, errors='coerce')
 
-        # tag each spot with its TRACK_ID via the tracks (single pass, vectorized map)
+        # tag each spot with its TRACK_ID via the tracks
         src_ids, trk_ids = [], []
         for track in model.find('AllTracks'):
             tid = int(track.attrib['TRACK_ID'])
@@ -641,16 +512,17 @@ class DataLoader:
                 src_ids += [a['SPOT_SOURCE_ID'], a['SPOT_TARGET_ID']]
                 trk_ids += [tid, tid]
 
-        mapping = pd.Series(
-            np.asarray(trk_ids, dtype=np.int64),
-            index=np.asarray(src_ids, dtype=np.int64),
+        mapping = (
+            pl.DataFrame({
+                'ID': np.asarray(src_ids, dtype=np.int64),
+                'TRACK_ID': np.asarray(trk_ids, dtype=np.int64),
+            })
+            .unique(subset='ID', keep='first')
         )
-        mapping = mapping[~mapping.index.duplicated()]
-        df['TRACK_ID'] = mapping.reindex(df['ID'].values).values
+        df = df.join(mapping, on='ID', how='left')
 
         # move TRACK_ID to the first column
-        df.insert(0, 'TRACK_ID', df.pop('TRACK_ID'))
-
+        df = df.select(['TRACK_ID'] + [c for c in df.columns if c != 'TRACK_ID'])
 
         # merge image calibration into the same metadata dict
         metadata.update(root.find('Settings/ImageData').attrib)
@@ -666,7 +538,7 @@ class DataLoader:
         return df, metadata
             
 
-    def _read_table(self, filepath, ext, *, metadata_row_index=2, skiprows=4, encodings=("utf-8", "cp1252", "latin1", "iso8859_15"), **kwargs) -> Tuple[pd.DataFrame, dict]:
+    def _read_table(self, filepath, ext, *, metadata_row_index=2, skiprows=4, encodings=("utf-8", "cp1252", "latin1", "iso8859_15"), **kwargs) -> Tuple[pl.DataFrame, dict]:
         try:
             if ext in ('.xls', '.xlsx'):
                 column_names, units_row, df = self._read_excel_parts(
@@ -678,17 +550,25 @@ class DataLoader:
             # CSV path: try multiple encodings
             for enc in encodings:
                 try:
-                    column_names = pd.read_csv(filepath, nrows=0, encoding=enc).columns.tolist()
+                    header = pl.read_csv(filepath, n_rows=0, encoding=enc)
+                    column_names = header.columns
 
                     metadata_row = None
                     if metadata_row_index is not None:
-                        metadata_row = pd.read_csv(
-                            filepath, skiprows=metadata_row_index, nrows=1, encoding=enc
-                        ).iloc[0].tolist()
+                        meta_df = pl.read_csv(
+                            filepath, skip_rows=metadata_row_index, n_rows=1,
+                            encoding=enc, has_header=True
+                        )
+                        metadata_row = list(meta_df.row(0)) if meta_df.height else None
 
-                    df = pd.read_csv(
-                        filepath, names=column_names, skiprows=skiprows,
-                        encoding=enc, low_memory=False
+                    df = pl.read_csv(
+                        filepath,
+                        skip_rows=skiprows,
+                        has_header=False,
+                        new_columns=column_names,
+                        encoding=enc,
+                        infer_schema_length=10000,
+                        ignore_errors=True,
                     )
 
                     metadata = {str(filepath.split(op.sep)[-1]): self._build_metadata(df, column_names, metadata_row)}
@@ -706,21 +586,27 @@ class DataLoader:
             raise FileFormatError(f"{str(e)} -> Failed to read file: {filepath}.")
 
 
-    def _read_excel_parts(self, filepath, metadata_row_index, skiprows) -> Tuple[List[str], Optional[List[str]], pd.DataFrame]:
+    def _read_excel_parts(self, filepath, metadata_row_index, skiprows) -> Tuple[List[str], Optional[List[str]], pl.DataFrame]:
         """Read header, units row, and data body from an Excel file."""
-        column_names = pd.read_excel(filepath, nrows=0).columns.tolist()
+        header = pl.read_excel(filepath, read_options={"n_rows": 0})
+        column_names = header.columns
 
         metadata_row = None
         if metadata_row_index is not None:
-            metadata_row = pd.read_excel(
-                filepath, skiprows=metadata_row_index, nrows=1, header=None
-            ).iloc[0].tolist()
+            meta_df = pl.read_excel(
+                filepath,
+                read_options={"skip_rows": metadata_row_index, "n_rows": 1, "has_header": False},
+            )
+            metadata_row = list(meta_df.row(0)) if meta_df.height else None
 
-        df = pd.read_excel(filepath, names=column_names, skiprows=skiprows, header=None)
+        df = pl.read_excel(
+            filepath,
+            read_options={"skip_rows": skiprows, "has_header": False, "new_columns": column_names},
+        )
         return column_names, metadata_row, df
 
 
-    def _build_metadata(self, df, column_names, metadata_row) -> Dict[str, Optional[str]]:
+    def _build_metadata(self, df: pl.DataFrame, column_names, metadata_row) -> Dict[str, Optional[str]]:
         """Build a {column: unit} mapping from a raw metadata row."""
         metadata = {}
         if metadata_row is None:
@@ -738,7 +624,7 @@ class DataLoader:
         metadata['spatialunits'] = metadata.get(self.x_col, '') if self.kwargs.get('spatial_unit', None) is None else self.kwargs.get('spatial_unit')
         metadata['timeunits'] = metadata.get(self.t_col, '') if self.kwargs.get('time_unit', None) is None else self.kwargs.get('time_unit')
         metadata['timeinterval'] = self._calculate_time_interval(df)
-        metadata['nframes'] = df[self.t_col].nunique()
+        metadata['nframes'] = df[self.t_col].n_unique()
 
         self.timeunit = metadata['timeunits']
         self.spatialunit = metadata['spatialunits']
@@ -747,21 +633,25 @@ class DataLoader:
         return metadata
 
 
-    def _calculate_time_interval(self, df: pd.DataFrame) -> Optional[float]:
-        df.sort_values(self.t_col, inplace=True)
-        timeintervals = np.diff(df[self.t_col].unique())
+    def _calculate_time_interval(self, df: pl.DataFrame) -> Optional[float]:
+        t = (
+            df[self.t_col]
+            .cast(pl.Float64, strict=False)
+            .drop_nulls()
+            .unique()
+            .sort()
+            .to_numpy()
+        )
+        timeintervals = np.diff(t)
 
         if timeintervals.size == 0:
             return float('nan')
         else:
-            # Base step = smallest positive interval (one frame).
             positive = timeintervals[timeintervals > 0]
             base = float(positive.min()) if positive.size else float(timeintervals.min())
 
             if base > 0:
                 ratios = timeintervals / base
-                # Uniform if every gap is an (near-)integer multiple of the base step
-                # -> tolerates dropped frames (e.g. a single 120 among 60s).
                 is_regular = np.all(np.isclose(ratios, np.round(ratios), atol=1e-6))
             else:
                 is_regular = False
@@ -779,8 +669,8 @@ class DataLoader:
         """
         Returns a list of column names from the DataFrame.
         """
-        df, _ = self._read_file(path)  # or pd.read_excel(path), depending on file type
-        return df.columns.tolist()
+        df, _ = self._read_file(path)
+        return df.columns
     
 
     def match_columns(self, columns: List[str], lookfor: List[str]) -> str:
@@ -792,23 +682,19 @@ class DataLoader:
         If no match is found, returns None.
         """
 
-        # Normalize columns for matching
         normalized_columns = [
             (col, str(col).replace('', ' ').strip().lower() if col is not None else '') for col in columns
         ]
-        # Try exact matches first
         for col, norm_col in normalized_columns:
             for look in lookfor:
                 if norm_col == look.lower():
                     return col
                 
-        # Then try startswith
         for col, norm_col in normalized_columns:
             for look in lookfor:
                 if norm_col.startswith(look.lower()):
                     return col
                 
-        # Then try substring
         for col, norm_col in normalized_columns:
             for look in lookfor:
                 if look.lower() in norm_col:
@@ -816,12 +702,14 @@ class DataLoader:
         return None
     
 
-    def _guard_replicates(self, rep_lbl, file_info, data, _rep_guard_list) -> pd.DataFrame:
+    def _guard_replicates(self, rep_lbl, file_info, data: pl.DataFrame, _rep_guard_list) -> pl.DataFrame:
 
         if rep_lbl in _rep_guard_list:
 
             count = _rep_guard_list.count(rep_lbl)
-            data['track_id'] = data['track_id'].apply(lambda x: f"{count}_{x}")
+            data = data.with_columns(
+                (pl.lit(f"{count}_") + pl.col('track_id').cast(pl.Utf8)).alias('track_id')
+            )
 
             warn(message=f"Multiple ({count+1}) replicate labels: '{rep_lbl}' \n-> adding prefix: {count} to replicate label: {rep_lbl}\nFile info: {file_info}",
                           category=LabelWarning,
@@ -832,12 +720,18 @@ class DataLoader:
         return data
     
     
-    def _py_numeric_df(self, df: pd.DataFrame) -> None:
+    def _py_numeric_df(self, df: pl.DataFrame) -> pl.DataFrame:
+        """Attempt to cast every column to Float64, keeping the original
+        column when the cast would lose data (non-numeric columns)."""
+        exprs = []
         for col in df.columns:
-            try: 
-                df[col] = pd.to_numeric(df[col], errors='raise')
-            except Exception as e: 
-                continue  # quietly move on if conversion fails
+            casted = df[col].cast(pl.Float64, strict=False)
+            # only convert if no new nulls were introduced
+            if casted.null_count() == df[col].null_count():
+                exprs.append(casted.alias(col))
+        if exprs:
+            df = df.with_columns(exprs)
+        return df
 
 
     def _clean_name(self, name: str) -> str:
@@ -847,11 +741,11 @@ class DataLoader:
         return name
     
 
-    def _standname(self, df, id_col: str, t_col: str, x_col: str, y_col: str) -> pd.DataFrame:
-        return df.rename(columns={id_col: 'track_id', t_col: 'time_point', x_col: 'x_coordinate', y_col: 'y_coordinate'})
+    def _standname(self, df: pl.DataFrame, id_col: str, t_col: str, x_col: str, y_col: str) -> pl.DataFrame:
+        return df.rename({id_col: 'track_id', t_col: 'time_point', x_col: 'x_coordinate', y_col: 'y_coordinate'})
 
 
-    def _convert_spatial(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _convert_spatial(self, df: pl.DataFrame) -> pl.DataFrame:
         if self.spatialunit in (None, ""):
             warn('No spatial units found in input files.\n Please specify the spatial units using `spatial_unit="<unit>"`.', InputWarning, stacklevel=2)
             return df
@@ -871,7 +765,6 @@ class DataLoader:
             )
             return df
 
-        # Normalize to canonical unit keys used by the lookup tables.
         from_unit = self.metadata._get_alias(from_unit)
         to_unit = self.metadata._get_alias(to_unit)
 
@@ -880,15 +773,17 @@ class DataLoader:
 
         factor = calc.UNIT_TO_MICRONS[from_unit] / calc.UNIT_TO_MICRONS[to_unit]
 
-        df["x_coordinate"] = df["x_coordinate"] * factor
-        df["y_coordinate"] = df["y_coordinate"] * factor
+        df = df.with_columns([
+            (pl.col("x_coordinate") * factor).alias("x_coordinate"),
+            (pl.col("y_coordinate") * factor).alias("y_coordinate"),
+        ])
 
         self.metadata['spatialunits'] = to_unit
 
         return df
     
 
-    def _convert_time(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _convert_time(self, df: pl.DataFrame) -> pl.DataFrame:
 
         if self.timeunit in (None, ""):
             warn('No time units found in input files.\n Please specify the time units using `time_unit="<unit>"`.', InputWarning, stacklevel=2)
@@ -909,7 +804,6 @@ class DataLoader:
             )
             return df
 
-        # Normalize to canonical unit keys used by the lookup tables.
         from_unit = self.metadata._get_alias(from_unit)
         to_unit = self.metadata._get_alias(to_unit)
 
@@ -918,7 +812,7 @@ class DataLoader:
 
         factor = calc.UNIT_TO_SECONDS[from_unit] / calc.UNIT_TO_SECONDS[to_unit]
 
-        df["time_point"] = df["time_point"] * factor
+        df = df.with_columns((pl.col("time_point") * factor).alias("time_point"))
 
         self.metadata['timeinterval'] = self.timeinterval * factor
         self.metadata['timeunits'] = to_unit

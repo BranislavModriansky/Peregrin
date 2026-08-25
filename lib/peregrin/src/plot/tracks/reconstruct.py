@@ -20,7 +20,6 @@ from ..._pckg_exceptions._pckg_warnings import *
 from ...categorizer import categorize
 from ..painter import paint
 from ...various import Values, get_aliases, is_empty, clock
-# from ...compute.stats import stats
 
 
 class AnimateTracks:
