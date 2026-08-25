@@ -1,3 +1,4 @@
+from __future__ import annotations
 import re
 
 import xml.etree.ElementTree as ET
@@ -20,10 +21,7 @@ from ..compute.stats import calc
 
 
 class Input:
-    """A thin wrapper around a polars DataFrame that carries a `.metadata`
-    (InputMetadata) attribute. Polars DataFrames cannot be subclassed the way
-    pandas DataFrames can, so attribute access is delegated to the wrapped
-    DataFrame instead."""
+    """A thin wrapper around a polars DataFrame that carries a `.metadata` (InputMetadata) attribute."""
 
     def __init__(self, df: pl.DataFrame, metadata: "InputMetadata" = None):
         self._df = df

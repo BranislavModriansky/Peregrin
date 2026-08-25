@@ -503,6 +503,7 @@ class Calc:
         grouping_cols = [col for col in self.DEFAULT_CATEGORIES if col in df.columns]
 
         df = self._ensure_polars(df)
+        df = self.assign_track_uid(df)
 
         # Sort so that each track's rows are contiguous and time-ordered.
         df = df.sort(grouping_cols + ['track_uid', 'time_point'])
