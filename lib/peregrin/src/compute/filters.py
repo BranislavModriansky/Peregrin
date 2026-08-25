@@ -3,7 +3,7 @@ import itertools
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import numpy as np
-import pandas as pd
+import polars as pl
 
 from matplotlib.path import Path as MplPath
 from matplotlib.widgets import PolygonSelector, SpanSelector, Cursor
@@ -11,7 +11,8 @@ from mpl_toolkits.axes_grid1 import make_axes_locatable
 from scipy.stats import gaussian_kde
 
 
-class InvalidParameterValueError(ValueError): ...
+from .._pckg_exceptions._pckg_errors import *
+from .._pckg_exceptions._pckg_warnings import *
 
 
 # ============================================================================
@@ -29,9 +30,9 @@ class _BaseSelector:
     BG = "#e3e4e7"
     GREY_OUT = "darkgrey"
 
-    def __init__(self, df: pd.DataFrame, limits=None, **kwargs):
+    def __init__(self, df: pl.DataFrame, limits=None, **kwargs):
         self.id = next(self._ids)
-        self.df = df
+        self.df = self._ensure_polars(df)
         self.kwargs = kwargs
         self.cmap = plt.get_cmap(kwargs.get("cmap", "magma"))
         self.selection = {"mask": None, "df": None}
@@ -40,10 +41,23 @@ class _BaseSelector:
         if limits is not None:
             self._check_limits(limits)
 
+    @staticmethod
+    def _ensure_polars(df) -> pl.DataFrame:
+        """Accept polars DataFrames, loader Input wrappers, or pandas frames."""
+        if isinstance(df, pl.DataFrame):
+            return df
+        if hasattr(df, "df") and isinstance(getattr(df, "df"), pl.DataFrame):
+            return df.df
+        try:
+            import pandas as pd
+            if isinstance(df, pd.DataFrame):
+                return pl.from_pandas(df)
+        except ImportError:
+            pass
+        raise TypeError(f"Expected a polars DataFrame, got {type(df).__name__}.")
+
     def _check_limits(self, limits):
-        if len(limits) == 2:
-            if not isinstance(limits[0], (int, float)) or not isinstance(limits[1], (int, float)):
-                raise InvalidParameterValueError(f"limits must be a pair of numeric values; got {limits!r}")
+        if len(limits) == 2 and all(isinstance(v, (int, float)) for v in limits):
             self.selection.update({"min": limits[0], "max": limits[1]})
             if self.selection["min"] > self.selection["max"]:
                 self.selection["min"], self.selection["max"] = self.selection["max"], self.selection["min"]
@@ -76,26 +90,31 @@ class _BaseSelector:
         kw.update(overrides)
         return kw
 
-    def _sample(self, df: pd.DataFrame, n: int = 10000, frac: float = None, **kw) -> pd.DataFrame:
-        _random_state = kw.get("random_state", 42)
+    def _sample(self, df: pl.DataFrame, n: int = 10000, frac: float = None, **kw) -> pl.DataFrame:
+        _seed = kw.get("random_state", 42)
         if frac is not None:
             if not isinstance(frac, float) or not (0 < frac <= 1):
                 raise InvalidParameterValueError(f"sample_fraction must be a float between 0 and 1; got {frac!r}")
-            return df.sample(frac=frac, random_state=_random_state).reset_index(drop=True)
-        elif len(df) > n:
-            return df.sample(n=n, random_state=_random_state).reset_index(drop=True)
+            return df.sample(fraction=frac, seed=_seed)
+        elif df.height > n:
+            return df.sample(n=n, seed=_seed)
         else:
             return df
 
-    def _filter_verts(self, df: pd.DataFrame = None) -> pd.DataFrame:
+    @staticmethod
+    def _col_f64(df: pl.DataFrame, col: str) -> np.ndarray:
+        """Column as float64 numpy array (nulls -> NaN)."""
+        return df[col].cast(pl.Float64, strict=False).to_numpy()
+
+    def _filter_verts(self, df: pl.DataFrame = None) -> pl.DataFrame:
         """Apply the selected polygon gate to the *full* dataframe."""
         verts = self.selection.get("verts")
-        source = self.df if df is None else df
+        source = self.df if df is None else self._ensure_polars(df)
         if verts is None:
-            return source.reset_index(drop=True)
+            return source
 
-        xv = source[self._x].to_numpy(float)
-        yv = source[self._y].to_numpy(float)
+        xv = self._col_f64(source, self._x)
+        yv = self._col_f64(source, self._y)
 
         finite = np.isfinite(xv) & np.isfinite(yv)
         if self._log_x:
@@ -103,20 +122,19 @@ class _BaseSelector:
         if self._log_y:
             finite &= yv > 0
 
-        inside = np.zeros(len(source), dtype=bool)
+        inside = np.zeros(source.height, dtype=bool)
         inside[finite] = MplPath(verts).contains_points(
             np.column_stack([xv[finite], yv[finite]])
         )
-        return source.loc[inside].reset_index(drop=True)
+        return source.filter(pl.Series(inside))
 
-    def _filter_minmax(self, df: pd.DataFrame = None) -> pd.DataFrame:
+    def _filter_minmax(self, df: pl.DataFrame = None) -> pl.DataFrame:
         """Apply the selected min/max range to the *full* dataframe."""
-        source = self.df if df is None else df
+        source = self.df if df is None else self._ensure_polars(df)
         min_val, max_val = self.selection.get("min"), self.selection.get("max")
         if min_val is None or max_val is None:
-            return source.reset_index(drop=True)
-        mask = (source[self._metric] >= min_val) & (source[self._metric] <= max_val)
-        return source.loc[mask].reset_index(drop=True)
+            return source
+        return source.filter(pl.col(self._metric).is_between(min_val, max_val))
 
     # ---- public API --------------------------------------------------------
     @property
@@ -158,11 +176,11 @@ class GateSelector(_BaseSelector):
 
         df = self._sample(self.df, **kw)
 
-        xdata, ydata = df[x].to_numpy(float), df[y].to_numpy(float)
+        xdata, ydata = self._col_f64(df, x), self._col_f64(df, y)
         finite = np.isfinite(xdata) & np.isfinite(ydata)
         if log_x: finite &= xdata > 0
         if log_y: finite &= ydata > 0
-        df = df.loc[finite].reset_index(drop=True)
+        df = df.filter(pl.Series(finite))
         xs, ys = xdata[finite], ydata[finite]
 
         xk = np.log(xs) if log_x else xs
@@ -227,7 +245,7 @@ class GateSelector(_BaseSelector):
             # store verts; visualized df reflects the sampled subset, but
             # `apply()` re-runs the gate on the full dataframe
             self.selection.update(mask=inside, verts=data_verts,
-                                  df=df.loc[inside].reset_index(drop=True))
+                                  df=df.filter(pl.Series(inside)))
 
         fig._poly_selector = PolygonSelector(
             ax_sel, on_select, useblit=True,
@@ -248,13 +266,13 @@ class GateSelector(_BaseSelector):
             colors[~inside] = mcolors.to_rgba(self.GREY_OUT)
             pts.set_facecolors(colors)
             self.selection.update(mask=inside, verts=data_verts,
-                                  df=df.loc[inside].reset_index(drop=True))
+                                  df=df.filter(pl.Series(inside)))
             fig.canvas.draw_idle()
 
         plt.show()
         return self
 
-    def apply(self, df: pd.DataFrame = None) -> pd.DataFrame:
+    def apply(self, df: pl.DataFrame = None) -> pl.DataFrame:
         """Apply the selected gate to the *full* dataframe (not just the sampled subset)."""
         return self._filter_verts(df=df)
 
@@ -271,7 +289,7 @@ class ThresholdSelector(_BaseSelector):
         df = self.df
         self._metric = metric
 
-        raw = df[metric].to_numpy(float)
+        raw = self._col_f64(df, metric)
         finite = np.isfinite(raw)
         if log:
             finite &= raw > 0
@@ -335,7 +353,7 @@ class ThresholdSelector(_BaseSelector):
 
             mask = (raw >= xmin) & (raw <= xmax)
             self.selection.update(min=xmin, max=xmax, mask=mask,
-                                  df=df.loc[mask].reset_index(drop=True))
+                                  df=df.filter(pl.Series(mask)))
 
             y_top = ax.get_ylim()[1]
             for lbl, v in [(min_lbl, xmin), (max_lbl, xmax)]:
@@ -358,7 +376,7 @@ class ThresholdSelector(_BaseSelector):
         plt.show()
         return self
 
-    def apply(self, df: pd.DataFrame = None) -> pd.DataFrame:
+    def apply(self, df: pl.DataFrame = None) -> pl.DataFrame:
         """Apply the selected min/max range to the *full* dataframe (not just the sampled subset)."""
         return self._filter_minmax(df=df)
 
@@ -375,7 +393,7 @@ class JitterSelector(_BaseSelector):
         df = self.df
         self._metric = metric
 
-        raw = df[metric].to_numpy(float)
+        raw = self._col_f64(df, metric)
         finite = np.isfinite(raw)
         if log: finite &= raw > 0
         data = raw[finite]
@@ -462,7 +480,7 @@ class JitterSelector(_BaseSelector):
 
             mask = (raw >= ymin) & (raw <= ymax)
             self.selection.update(min=ymin, max=ymax, mask=mask,
-                                  df=df.loc[mask].reset_index(drop=True))
+                                  df=df.filter(pl.Series(mask)))
 
             y0, y1 = ax.get_ylim()
             off_min = ymin * 0.02 if log else 0.01 * (y1 - y0)
@@ -488,7 +506,7 @@ class JitterSelector(_BaseSelector):
         plt.show()
         return self
 
-    def apply(self, df: pd.DataFrame = None) -> pd.DataFrame:
+    def apply(self, df: pl.DataFrame = None) -> pl.DataFrame:
         """Apply the selected min/max range to the *full* dataframe (not just the sampled subset)."""
         return self._filter_minmax(df=df)
 
@@ -507,9 +525,9 @@ class DataFilter:
         j = f.jitter(df, "Speed mean", log=True)
     """
 
-    def __init__(self, df: pd.DataFrame = pd.DataFrame(), seed: int = 42, **default_kwargs):
+    def __init__(self, df: pl.DataFrame = None, seed: int = 42, **default_kwargs):
         np.random.seed(seed)
-        self.df = df
+        self.df = df if df is not None else pl.DataFrame()
         self.default_kwargs = default_kwargs
         self.selectors: dict[int, _BaseSelector] = {}
 
@@ -518,7 +536,7 @@ class DataFilter:
         return sel
 
     # ---- factory methods ---------------------------------------------------
-    def gate(self, df: pd.DataFrame, x: str, y: str, *, limits: list = None, **kw) -> GateSelector:
+    def gate(self, df: pl.DataFrame, x: str, y: str, *, limits: list = None, **kw) -> GateSelector:
         """
         Create a 2D polygon gate selector for the given x/y columns of `df`.
 
@@ -533,7 +551,7 @@ class DataFilter:
         sel = GateSelector(df, limits, **{**self.default_kwargs, **kw})
         return self._register(sel.show(x, y, **kw))
 
-    def threshold(self, df: pd.DataFrame, metric: str, *, limits: list = None, **kw) -> ThresholdSelector:
+    def threshold(self, df: pl.DataFrame, metric: str, *, limits: list = None, **kw) -> ThresholdSelector:
         """
         Create a 1D histogram threshold selector for the given metric column of `df`.
 
@@ -543,7 +561,7 @@ class DataFilter:
         sel = ThresholdSelector(df, limits, **{**self.default_kwargs, **kw})
         return self._register(sel.show(metric, **kw))
 
-    def jitter(self, df: pd.DataFrame, metric: str, *, limits: list = None, **kw) -> JitterSelector:
+    def jitter(self, df: pl.DataFrame, metric: str, *, limits: list = None, **kw) -> JitterSelector:
         """
         Create a 1D jitter strip selector for the given metric column of `df`.
 

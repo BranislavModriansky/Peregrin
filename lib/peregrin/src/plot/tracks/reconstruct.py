@@ -1,15 +1,11 @@
-from inspect import Arguments
-from re import match
 from typing import Any, Optional
 
-import pandas as pd
-from pandas.api.types import is_numeric_dtype, is_categorical_dtype
 import numpy as np
+import polars as pl
 import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
 from matplotlib.ticker import MultipleLocator, FormatStrFormatter
 from matplotlib.animation import FuncAnimation
-from matplotlib.widgets import Button, Slider
 
 import warnings
 
@@ -17,7 +13,6 @@ from ...settings import params
 from ..._pckg_exceptions._pckg_errors import *
 from ..._pckg_exceptions._pckg_warnings import *
 
-from ...categorizer import categorize
 from ..painter import paint
 from ...various import Values, get_aliases, is_empty, clock
 
@@ -302,6 +297,8 @@ class ReconstructTracks:
         'grid_lw': ['grid_linewidth', 'grid_line_width', 'grid_lw'],
     }
 
+    CATEGORY_COLS = ('set', 'subset', 'group', 'subgroup', 'subsubgroup')
+
     def __init__(self, builder=None, figure=None):
         self._builder = builder
         self.figure = figure
@@ -363,23 +360,25 @@ class ReconstructTracks:
 
     def reconstruct(
         self,
-        spot_data: pd.DataFrame,
-        track_data: pd.DataFrame = None,
+        spot_data: pl.DataFrame,
+        track_data: pl.DataFrame = None,
         *,
         align_at_start: bool = False,
         categories: Optional[dict[str, list[Any]]] = None,
         **kwargs
     ) -> "ReconstructTracks":
 
-        self.spot_data = spot_data.copy() if spot_data is not None else pd.DataFrame()
+        self.spot_data = self._ensure_polars(spot_data) if spot_data is not None else pl.DataFrame()
         self.align_at_start = align_at_start
         self.kwargs = get_aliases(kwargs, self.ALIASES)
-        self.track_data = track_data.copy() if track_data is not None else None
+        self.track_data = self._ensure_polars(track_data) if track_data is not None else None
         self.categories = categories
 
-        smoothing = self.kwargs.get('smoothing_index')
-
         self._arrange_data()
+
+        smoothing = self.kwargs.get('smoothing_index')
+        if smoothing is not None:
+            self._smooth(smoothing)
 
         # Colors are cheap and often the only thing that changes; recompute every call.
         self._assign_color()
@@ -389,144 +388,70 @@ class ReconstructTracks:
         self.figure = self.polar() if self.align_at_start else self.cartesian()
         return self
 
+    # ---- data arrangement (polars) --------------------------------------------
+    @staticmethod
+    def _ensure_polars(df) -> pl.DataFrame:
+        """Accept polars DataFrames, loader Input wrappers, or pandas frames."""
+        if isinstance(df, pl.DataFrame):
+            return df
+        if hasattr(df, 'df') and isinstance(getattr(df, 'df'), pl.DataFrame):
+            return df.df
+        try:
+            import pandas as pd
+            if isinstance(df, pd.DataFrame):
+                return pl.from_pandas(df)
+        except ImportError:
+            pass
+        raise TypeError(f"Expected a polars DataFrame, got {type(df).__name__}.")
 
-
-
-    def cartesian(self) -> plt.Figure:
-        fig, ax = plt.subplots(figsize=(13, 10))
-        self._build_tracks(ax)
-
-        x = self._x
-        self.x_gap = (x.max() - x.min()) * 0.025
-        if x.size:
-            ax.set_xlim(x.min() - self.x_gap, x.max() + self.x_gap)
-            ax.set_ylim(self._y.min() - self.x_gap, self._y.max() + self.x_gap)
-
-        ax.set_aspect('equal', adjustable='box')
-        text_color = self.kwargs.get('text_color', 'black')
-        ax.set_xlabel('x_coordinate [µm]', color=text_color)
-        ax.set_ylabel('y_coordinate [µm]', color=text_color)
-        ax.set_title(self.kwargs.get('title', ''), fontsize=12, color=text_color)
-
-        # self._background_color()
-        # ax.set_facecolor(self.face_color)
-        self._cartesian_ticks(ax)
-        self._cartesian_spines(ax)
-
-        if self.kwargs.get('grid', True):
-            self._style_grid(ax, **self.kwargs)
-        else:
-            ax.grid(False)
-
-        if self.kwargs.get('show_heads', True):
-            self._head_markers(ax, polar=False)
-        if self.kwargs.get('hide_backdrop', False):
-            fig.set_facecolor('none')
-
-        return plt.gcf()
-
-
-    def polar(self) -> plt.Figure:
-        fig, ax = plt.subplots(figsize=(12.5, 9.5),
-                               subplot_kw={'projection': 'polar'})
-        self._get_radius()
-
-        text_color = self.kwargs.get('text_color', 'black')
-        ax.set_title(self.kwargs.get('title', ''), fontsize=12, color=text_color)
-        ax.set_ylim(0, self.y_max)
-        ax.spines['polar'].set_visible(False)
-
-        self._build_tracks(ax, polar=True)
-
-        # self._background_color()
-        # ax.set_facecolor(self.face_color)
-        if self.kwargs.get('grid', True):
-            self._style_grid(ax, **self.kwargs)
-        else:
-            ax.grid(False)
-
-        if isinstance(self.kwargs.get('annotate_r_axis', 'detailed'), str):
-            self._annotate_r_axis(ax)
-        else:
-            ax.set_yticklabels([])
-        if isinstance(self.kwargs.get('annotate_theta_axis', 'angular'), str):
-            self._annotate_theta_axis(ax)
-        else:
-            ax.set_xticklabels([])
-
-        if self.kwargs.get('show_heads', True):
-            self._head_markers(ax, polar=True)
-        if self.kwargs.get('hide_backdrop', False):
-            fig.set_facecolor('none')
-
-        return plt.gcf()
-    
-    def _cartesian_spines(self, ax):
-        for spine in ax.spines.values():
-            spine.set_color(self.kwargs.get('frame_color', 'black'))
-
-    def _cartesian_ticks(self, ax):
-        ax.xaxis.set_major_locator(MultipleLocator(200))
-        ax.yaxis.set_major_locator(MultipleLocator(200))
-        ax.xaxis.set_minor_locator(MultipleLocator(50))
-        ax.yaxis.set_minor_locator(MultipleLocator(50))
-        ax.xaxis.set_major_formatter(FormatStrFormatter('%.0f'))
-        ax.yaxis.set_major_formatter(FormatStrFormatter('%.0f'))
-        ax.tick_params(axis='both', which='major', labelsize=8, colors=self.kwargs.get('annotation_color', 'black'))
-
+    def _categorize(self, df: pl.DataFrame) -> pl.DataFrame:
+        """Native polars category filtering (replaces the pandas categorizer)."""
+        for cat, values in self.categories.items():
+            if cat not in df.columns:
+                raise ColumnsNotFoundError(f"Column '{cat}' not found in DataFrame.")
+            df = df.filter(pl.col(cat).is_in(values))
+        return df
 
     def _arrange_data(self):
         if self.categories is not None:
-            self.spot_data = categorize(self.spot_data, self.categories, **self.kwargs)
+            self.spot_data = self._categorize(self.spot_data)
 
-        # Promote an index-based track_uid to a real column, or derive one
-        # from track_id (+ category columns) for raw input data. Never use
-        # the plain row index: that makes every row its own "track".
+        # Derive a real track_uid column from track_id (+ category columns) if
+        # missing. Never use row position: that makes every row its own "track".
         if 'track_uid' not in self.spot_data.columns:
-            if self.spot_data.index.name == 'track_uid' or 'track_uid' in (self.spot_data.index.names or []):
-                self.spot_data = self.spot_data.reset_index()
-            elif 'track_id' in self.spot_data.columns:
-                cat_cols = [c for c in ('set', 'subset', 'group', 'subgroup', 'subsubgroup')
-                            if c in self.spot_data.columns]
-                self.spot_data['track_uid'] = (
-                    self.spot_data.groupby(cat_cols + ['track_id'], sort=False).ngroup()
+            if 'track_id' in self.spot_data.columns:
+                cat_cols = [c for c in self.CATEGORY_COLS if c in self.spot_data.columns]
+                key_cols = cat_cols + ['track_id']
+                keys = (
+                    self.spot_data.select(key_cols)
+                    .unique(maintain_order=True)
+                    .with_row_index('track_uid')
+                    .with_columns(pl.col('track_uid').cast(pl.Int64))
                 )
+                self.spot_data = self.spot_data.join(keys, on=key_cols, how='left')
             else:
                 raise ColumnsNotFoundError(
                     "Cannot determine track identity: no 'track_uid' or 'track_id' found."
                 )
 
-        self.spot_data = (
-            self.spot_data
-            .reset_index(drop=True)
-            .sort_values(by=['track_uid', 'time_point'], kind='mergesort')
-        )
+        # Stable sort keeps each track's rows contiguous and time-ordered.
+        self.spot_data = self.spot_data.sort(['track_uid', 'time_point'])
 
         if not is_empty(self.track_data):
             if self.categories is not None:
                 try:
-                    self.track_data = categorize(self.track_data, self.categories, **self.kwargs)
+                    self.track_data = self._categorize(self.track_data)
                 except Exception as e:
                     print(f"Error categorizing track_data: {e}")
-            self.track_data = self.track_data.sort_values(['track_uid'], kind='stable')
+            if 'track_uid' in self.track_data.columns:
+                self.track_data = self.track_data.sort('track_uid')
 
-        # Only set the MultiIndex when we actually need category-based grouping
-        # (smoothing path). For ignore mode we work purely on track_uid via
-        # cached numpy arrays, so skip the expensive set_index.
-        if self.categories is not None:
-            if list(self.spot_data.index.names) != self.KEY_COLS:
-                self.spot_data = self.spot_data.set_index(self.KEY_COLS)
-            if (not is_empty(self.track_data)
-                    and list(self.track_data.index.names) != self.KEY_COLS):
-                self.track_data = self.track_data.set_index(self.KEY_COLS)
+        self._cache_arrays()
 
-        self._cache_arrays(self.categories is None)
-
-
-    def _cache_arrays(self, ignore: bool = False):
+    def _cache_arrays(self):
         """Materialize plotting arrays and track run-boundaries once, after sorting."""
-        self._x = self.spot_data['x_coordinate'].to_numpy(dtype=float, copy=False)
-        self._y = self.spot_data['y_coordinate'].to_numpy(dtype=float, copy=False)
+        self._x = self.spot_data['x_coordinate'].cast(pl.Float64).to_numpy()
+        self._y = self.spot_data['y_coordinate'].cast(pl.Float64).to_numpy()
 
         n = self._x.size
         if n == 0:
@@ -555,7 +480,6 @@ class ReconstructTracks:
         # Number of within-track segments per track (L - 1), for animation reveal.
         self._within_track_seg_lengths = np.maximum(self._run_lengths - 1, 0)
 
-
     def _get_radius(self):
         """Global maximum radius, computed from cached numpy arrays (no groupby)."""
         if self._x.size == 0:
@@ -582,8 +506,10 @@ class ReconstructTracks:
         self._x = self._smooth_runs(self._x, window)
         self._y = self._smooth_runs(self._y, window)
         # Write back so downstream (DataFrame-based) consumers stay consistent.
-        self.spot_data['x_coordinate'] = self._x
-        self.spot_data['y_coordinate'] = self._y
+        self.spot_data = self.spot_data.with_columns(
+            pl.Series('x_coordinate', self._x),
+            pl.Series('y_coordinate', self._y),
+        )
 
     def _smooth_runs(self, values: np.ndarray, window: int) -> np.ndarray:
         """Rolling-mean smooth each track run, then linearly pin its endpoints."""
@@ -605,39 +531,117 @@ class ReconstructTracks:
             out[s:e + 1] = smoothed + correction
         return out
 
-
     def _assign_color(self):
 
         color = self.kwargs.get('color', 'black')
+        color_by = self.kwargs.get('color_by')
 
-        # 'random' / 'random greys' produce ONE color per trajectory. We ask
-        # the painter for exactly n_tracks colors and expand them to per-spot
-        # via run-length repeat so whole tracks share a color.
-        if color in ('random', 'random greys'):
+        # 'random' / 'random greys' produce ONE color per trajectory: ask the
+        # painter for exactly n_tracks colors and expand via run-length repeat.
+        if color in ('random', 'random greys') and color_by is None:
             n_tracks = self._track_starts.size
             per_track = paint(
-                # Give the painter a frame whose unique-index count == n_tracks
-                # so it generates one color per track.
-                pd.DataFrame(index=np.arange(n_tracks)),
-                color=color,
+                pl.DataFrame(), color=color, n=max(n_tracks, 1),
             )
             per_track = np.asarray(per_track)
             self._colors = np.repeat(per_track, self._run_lengths, axis=0)
             self._single_color = None
             return
 
-        c = paint(self.spot_data, **self.kwargs)
+        # Painter is polars-native now; hand it only the column it needs.
+        paint_input = self.spot_data
+        if color_by is not None:
+            col = color_by[0] if isinstance(color_by, tuple) else color_by
+            paint_input = self.spot_data.select([col])
+        c = paint(paint_input, **self.kwargs)
 
         if isinstance(c, str):
             self._single_color = c
             self._colors = None
-            return
         else:
-            # Map one color per track onto every spot via run-length repeat.
-            self._colors = c
+            self._colors = np.asarray(c)
             self._single_color = None
 
+    # ---- static figures --------------------------------------------------------
+    def cartesian(self) -> plt.Figure:
+        fig, ax = plt.subplots(figsize=(13, 10))
+        self._build_tracks(ax)
 
+        x = self._x
+        self.x_gap = (x.max() - x.min()) * 0.025 if x.size else 0.0
+        if x.size:
+            ax.set_xlim(x.min() - self.x_gap, x.max() + self.x_gap)
+            ax.set_ylim(self._y.min() - self.x_gap, self._y.max() + self.x_gap)
+
+        ax.set_aspect('equal', adjustable='box')
+        text_color = self.kwargs.get('text_color', 'black')
+        ax.set_xlabel('x_coordinate [µm]', color=text_color)
+        ax.set_ylabel('y_coordinate [µm]', color=text_color)
+        ax.set_title(self.kwargs.get('title', ''), fontsize=12, color=text_color)
+
+        self._cartesian_ticks(ax)
+        self._cartesian_spines(ax)
+
+        if self.kwargs.get('grid', True):
+            self._style_grid(ax, **self.kwargs)
+        else:
+            ax.grid(False)
+
+        if self.kwargs.get('show_heads', True):
+            self._head_markers(ax, polar=False)
+        if self.kwargs.get('hide_backdrop', False):
+            fig.set_facecolor('none')
+
+        return plt.gcf()
+
+    def polar(self) -> plt.Figure:
+        fig, ax = plt.subplots(figsize=(12.5, 9.5),
+                               subplot_kw={'projection': 'polar'})
+        self._get_radius()
+
+        text_color = self.kwargs.get('text_color', 'black')
+        ax.set_title(self.kwargs.get('title', ''), fontsize=12, color=text_color)
+        ax.set_ylim(0, self.y_max)
+        ax.spines['polar'].set_visible(False)
+
+        self._build_tracks(ax, polar=True)
+
+        if self.kwargs.get('grid', True):
+            self._style_grid(ax, **self.kwargs)
+        else:
+            ax.grid(False)
+
+        if isinstance(self.kwargs.get('annotate_r_axis', 'detailed'), str):
+            self._annotate_r_axis(ax)
+        else:
+            ax.set_yticklabels([])
+        if isinstance(self.kwargs.get('annotate_theta_axis', 'angular'), str):
+            self._annotate_theta_axis(ax)
+        else:
+            ax.set_xticklabels([])
+
+        if self.kwargs.get('show_heads', True):
+            self._head_markers(ax, polar=True)
+        if self.kwargs.get('hide_backdrop', False):
+            fig.set_facecolor('none')
+
+        return plt.gcf()
+
+    def _cartesian_spines(self, ax):
+        for spine in ax.spines.values():
+            spine.set_color(self.kwargs.get('frame_color', 'black'))
+
+    def _cartesian_ticks(self, ax):
+        ax.xaxis.set_major_locator(MultipleLocator(200))
+        ax.yaxis.set_major_locator(MultipleLocator(200))
+        ax.xaxis.set_minor_locator(MultipleLocator(50))
+        ax.yaxis.set_minor_locator(MultipleLocator(50))
+        ax.xaxis.set_major_formatter(FormatStrFormatter('%.0f'))
+        ax.yaxis.set_major_formatter(FormatStrFormatter('%.0f'))
+        ax.tick_params(axis='both', which='major', labelsize=8,
+                       colors=self.kwargs.get('annotation_color', 'black'))
+
+    # ---- geometry / drawing ------------------------------------------------------
     def _plot_coords(self, *, polar: bool = False):
         """Return per-spot plotting coordinates (polar-transformed if requested)."""
         x, y = self._x, self._y
@@ -682,7 +686,6 @@ class ReconstructTracks:
                 linewidths=self.kwargs.get('lw', 1),
             )
         )
-
 
     def _segment_colors_for_mask(self, mask: np.ndarray):
         """Colors for the within-track segments selected by `mask` (animation)."""
@@ -794,12 +797,11 @@ class ReconstructTracks:
         colors = np.asarray(self._colors)[ends]
         return colors[has_pt]
 
-
+    # ---- styling -------------------------------------------------------------
     def _background(self, ax: plt.Axes, fig: plt.Figure):
         """Set the background color of the figure and axes."""
         ax.set_facecolor(self.kwargs.get('face_color', 'white'))
         fig.set_facecolor(self.kwargs.get('face_color', 'white'))
-
 
     def _style_grid(self, ax: plt.Axes, **kwargs):
 
@@ -810,18 +812,18 @@ class ReconstructTracks:
         # Cartesian grid
         if not self.align_at_start:
             ax.grid(
-                True, 
-                which='both', 
-                axis='both', 
+                True,
+                which='both',
+                axis='both',
                 color=grid_color,
-                linestyle=grid_ls, 
+                linestyle=grid_ls,
                 linewidth=grid_lw,
             )
-        
+
         # Polar grid
         else:
             ax.grid(
-                True, 
+                True,
                 lw=grid_lw,
                 color=grid_color
             )
@@ -838,7 +840,7 @@ class ReconstructTracks:
             for attr in list(grid_attributes.keys()):
                 if self.kwargs.get(attr) is not None:
                     grid_attributes[attr] = self.kwargs.get(attr)
-                else: 
+                else:
                     grid_attributes[attr] = self.kwargs.get(attr, grid_attributes[attr])
 
             for i, line in enumerate(ax.get_xgridlines()):
@@ -852,7 +854,6 @@ class ReconstructTracks:
             for line in ax.get_ygridlines():
                 line.set_linestyle(grid_attributes['grid_ls_radial'])
                 line.set_color(grid_attributes['grid_color_radial'])
-
 
     def _annotate_r_axis(self, ax: plt.Axes):
         text_color = self.kwargs.get('text_color', 'dimgrey')
@@ -868,9 +869,8 @@ class ReconstructTracks:
         match self.kwargs.get('annotate_r_axis', 'minimal'):
             case 'minimal':
                 ax.set_yticklabels([])
-                # ax.scatter(np.deg2rad(20), self.y_max, color=text_color,
-                #            marker='.', s=5, clip_on=False)
-                ax.text(np.deg2rad(25), self.y_max + 75, self.y_max_lbl, horizontalalignment='center', verticalalignment='center',
+                ax.text(np.deg2rad(25), self.y_max + 75, self.y_max_lbl,
+                        horizontalalignment='center', verticalalignment='center',
                         va='center', fontsize=10, color=text_color, clip_on=False)
             case 'detailed':
                 ax.set_yticks(ax.get_yticks())
@@ -892,13 +892,6 @@ class ReconstructTracks:
             case _:
                 ax.set_xticklabels([])
 
-    # @staticmethod
-    # def frame_interval_ms(fps: float = 10) -> float:
-    #     """Return the interval between frames in milliseconds."""
-    #     if fps <= 0:
-    #         raise ValueError("Frame rate must be positive.")
-    #     return 1000.0 / fps
-
     def _new_axes(self, *, polar: bool = False):
         """Create a fresh figure/axes matching the static plot's framing.
 
@@ -906,7 +899,6 @@ class ReconstructTracks:
         reconstruction so the animation inherits its look without needing
         grid/axis arguments passed to :meth:`animate`.
         """
-        # self._background_color()
         if polar:
             fig, ax = plt.subplots(figsize=(12.5, 9.5),
                                    subplot_kw={'projection': 'polar'})
@@ -947,7 +939,6 @@ class ReconstructTracks:
             if self.kwargs.get('hide_backdrop', False):
                 fig.set_facecolor('none')
 
-        # ax.set_facecolor(self.face_color)
         return fig, ax
 
 
