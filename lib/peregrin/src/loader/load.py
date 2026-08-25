@@ -56,6 +56,7 @@ class InputMetadata:
             "time_units": str, 
             "time_interval": float,
             "n_frames": int,
+            "columns": list[str],
         }
 
     and a dictionary (2) mapping metadata to files:
@@ -66,6 +67,7 @@ class InputMetadata:
                 "time_units": str, 
                 "time_interval": float,
                 "n_frames": int,
+                "columns": list[str],
             },
             "file2.csv": ...,
         } 
@@ -297,12 +299,12 @@ class DataLoader:
         """
         Merge extracted per-file DataFrames according to `self.merge`.
 
-        'all'        -> single concatenated DataFrame
-        'sets'       -> dict keyed by set
-        'subsets'    -> dict keyed by set/subset
-        'groups'     -> dict keyed down to group
-        'subgroups'  -> dict keyed down to subgroup
-        None         -> dict keyed down to subsubgroup (unconcatenated leaves)
+        - 'all'        -> single concatenated DataFrame
+        - 'sets'       -> dict keyed by set
+        - 'subsets'    -> dict keyed by set/subset
+        - 'groups'     -> dict keyed down to group
+        - 'subgroups'  -> dict keyed down to subgroup
+        - None         -> dict keyed down to subsubgroup (unconcatenated leaves)
         """
         if not records:
             return pl.DataFrame()

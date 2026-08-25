@@ -360,18 +360,16 @@ class ReconstructTracks:
 
     def reconstruct(
         self,
-        spot_data: pl.DataFrame,
-        track_data: pl.DataFrame = None,
+        spots: pl.DataFrame,
         *,
         align_at_start: bool = False,
         categories: Optional[dict[str, list[Any]]] = None,
         **kwargs
     ) -> "ReconstructTracks":
 
-        self.spot_data = self._ensure_polars(spot_data) if spot_data is not None else pl.DataFrame()
+        self.spot_data = self._ensure_polars(spots) if spots is not None else pl.DataFrame()
         self.align_at_start = align_at_start
         self.kwargs = get_aliases(kwargs, self.ALIASES)
-        self.track_data = self._ensure_polars(track_data) if track_data is not None else None
         self.categories = categories
 
         self._arrange_data()
@@ -436,15 +434,6 @@ class ReconstructTracks:
 
         # Stable sort keeps each track's rows contiguous and time-ordered.
         self.spot_data = self.spot_data.sort(['track_uid', 'time_point'])
-
-        if not is_empty(self.track_data):
-            if self.categories is not None:
-                try:
-                    self.track_data = self._categorize(self.track_data)
-                except Exception as e:
-                    print(f"Error categorizing track_data: {e}")
-            if 'track_uid' in self.track_data.columns:
-                self.track_data = self.track_data.sort('track_uid')
 
         self._cache_arrays()
 
