@@ -7,7 +7,7 @@ class FileTree:
 
     tree_sets = {}
 
-    ALLOWED_EXTENSIONS = ('.csv', '.xlsx', '.xls')
+    ALLOWED_EXTENSIONS = ('.csv', '.xlsx', '.xls', '.xml')
 
     def __init__(self):
         self.tree = {}
@@ -49,6 +49,18 @@ class FileTree:
 
 
     def make_tree(self, root_path):
+        """
+        Builds the file tree starting from the given root path (main directory).
+
+        Returns:
+            FileTree: An instance of the FileTree with the constructed tree.
+
+        Result methods:
+        ----
+        >>> result.show()  # Displays the tree structure
+        >>> result.get('dict')  # Returns the tree as a dictionary
+        """
+
         self.root_name = os.path.basename(os.path.abspath(root_path))
         self.tree = self._build(root_path)
         self._guard()
@@ -56,6 +68,14 @@ class FileTree:
     
 
     def show(self, tree=None, root_name=None, prefix=''):
+        """
+        Displays the file tree structure in a readable scheme format.
+
+        Parameters:
+            tree (dict, optional): The tree structure to display. Defaults to None (uses self.tree).
+            root_name (str, optional): The name of the root directory. Defaults to None (uses self.root_name).
+            prefix (str, optional): The prefix for formatting the output. Defaults to ''.
+        """
 
         if tree is None:
             tree = self.tree
@@ -77,6 +97,15 @@ class FileTree:
                 self.show(subtree, root_name=name, prefix=prefix + extension)
 
     def get(self, type: str = 'dict'):
+        """
+        Returns the file tree in the specified format ('dict' or 'list') 
+        for further processing - loading data from the given directory.
+
+        Parameters:
+            type (str): The desired format of the tree. 
+                        'dict' returns a nested dictionary structure.
+                        'list' returns a list representation of the tree.
+        """
         current = self.tree
         if type == 'dict':
             return current

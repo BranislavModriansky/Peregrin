@@ -222,9 +222,117 @@ class DataLoader:
 
         """
         Load tracking data from any number of files into a single DataFrame, 
-        while assigning condition and replicate labels. (See original docstring
-        for the full description; behaviour is unchanged but the returned
-        object is now polars-based.)
+        while assigning condition and replicate labels. This method is used
+        to prepare data for further handling in the computations, using the 
+        `peregrin` library.
+        
+        Parameters
+        ----------
+        files : list[PathLike[str]] | dict
+            Either a list of file paths or a dictionary with keys as category indicies and values either as dicts (subcategories) or lists of file paths.
+            Data can be categorized up to 5 levels deep having the following structure:
+
+        ```
+        { set: { subset: { group: { subgroup: { subsubgroup: file }}}}}
+
+        Input example 1 (3-level categorization using lists of file paths):
+        [ [ ['path/to/file01.csv', 'path/to/file02.csv'], 
+            ['path/to/file03.csv', 'path/to/file04.csv']], 
+          [ ['path/to/file05.csv', 'path/to/file06.csv'], 
+            ['path/to/file07.csv', 'path/to/file08.csv']]]
+
+        Input example 2 (3-level categorization using dictionaries):
+        {   'condition1': {
+                'bio_replicate1': [ 
+                    'path/to/tech_replicate_A-10-10-10.csv', 
+                    'path/to/tech_replicate_B-10-10-10.csv' ], 
+                'bio_replicate2': [
+                    'path/to/tech_replicate_A-11-10-10.csv', 
+                    'path/to/tech_replicate_B-11-10-10.csv' ] },
+            'condition2': {
+                'bio_replicate1': [
+                    'path/to/tech_replicate_A-18-10-10.csv', 
+                    'path/to/tech_replicate_B-18-10-10.csv' ],
+                'bio_replicate2': [
+                    'path/to/tech_replicate_A-20-10-10.csv', 
+                    'path/to/tech_replicate_B-20-10-10.csv' ] }     }
+
+        Input example 3 (4-level categorization using dictionaries):
+        {'A': {'A1': {'A1a': {'A1an': ['path/to/file01.csv', 'path/to/file02.csv'],
+                              'A1am': ['path/to/file03.csv', 'path/to/file04.csv']},
+                      'A1b': {'A1bn': ['path/to/file05.csv', 'path/to/file06.csv'],
+                              'A1bm': ['path/to/file07.csv', 'path/to/file08.csv']}},
+               'A2': {'A2a': {'A2an': ['path/to/file09.csv', 'path/to/file10.csv'],
+                              'A2am': ['path/to/file11.csv', 'path/to/file12.csv']},
+                      'A2b': {'A2bn': ['path/to/file13.csv', 'path/to/file14.csv'],
+                              'A2bm': ['path/to/file15.csv', 'path/to/file16.csv']}}},
+         'B': {'B1': {'B1a': {'B1an': ['path/to/file17.csv', 'path/to/file18.csv'],
+                              'B1am': ['path/to/file19.csv', 'path/to/file20.csv']},
+                      'B1b': {'B1bn': ['path/to/file21.csv', 'path/to/file22.csv'],
+                              'B1bm': ['path/to/file23.csv', 'path/to/file24.csv']}},
+               'B2': {'B2a': {'B2an': ['path/to/file25.csv', 'path/to/file26.csv'],
+                              'B2am': ['path/to/file27.csv', 'path/to/file28.csv']},
+                      'B2b': {'B2bn': ['path/to/file29.csv', 'path/to/file30.csv'],
+                              'B2bm': ['path/to/file31.csv', 'path/to/file32.csv']}}}}
+        
+        ```
+         See more detailed documentation of this method here: https://branislavmodriansky.github.io/peregrin/lib/overview.html
+
+        colnames : dict
+            A dictionary specifying the column names for track identifiers, time points, and x/y coordinates. 
+            With the default {'id': None, 't': None, 'x': None, 'y': None}, the method will NOT attempt to 
+            automatically detect these columns.
+        
+        retain : list[str], optional, default None
+            A list of column names from the original input data to be retained. If None, only the essential columns 
+            (track_id, time_point, x_coordinate, y_coordinate) are extracted, while all other columns are discarded.
+
+        convert_time_to : str, optional, default None
+            If provided, time will be converted from the input time units to the specified target unit.
+            If the metadata do not contain time unit information and the time unit is not passed to the function by `time_unit="<value>"`, the method will be skipped.
+            Supported units include: 'ms', 's', 'min', 'h', 'day'.
+
+        convert_spatial_to : str, optional, default None
+            If provided, spatial coordinates will be converted from the input unit `spatial_unit` to the specified target unit. 
+            If the metadata does not contain spatial unit information and the spatial unit is not passed to the function by `spatial_unit="<value>"`, the method will be skipped.
+            If the input units cannot be converted from nor to 'px', the conversion will be skipped.
+            Supported units include: 'nm', 'μm', 'mm', 'cm', 'm'.
+
+        ignore_matadata : bool, optional, default False
+            If True, the method will ignore any metadata found in the input files. This is useful when the user wants to manually specify metadata or when the input files contain inconsistent or incorrect metadata.
+
+        invert_y : bool, optional, default False
+            If True, the method will mirror the y-coordinates across their midpoint - useful for correcting mirrored y-coordinates in exported data.
+        
+        invert_x : bool, optional, default False
+            If True, the method will mirror the x-coordinates across their midpoint - useful for correcting mirrored x-coordinates in exported data.
+
+        merge : Literal['all', 'sets', 'subsets', 'groups', 'subgroups', None], default 'all'
+            Specifies how to merge the loaded data:
+
+        split_filename : bool, optional, default False
+            If True, the method will split file names during subsubgroup labeling using the `split_filename_position` and `split_filename_delimiter` parameters.
+
+        split_filename_position : Literal['first', 'last'] | int, optional, default 'last'
+            Determines how to split file names during subsubgroup labeling when `split_filename` is True.
+            Either one of 'first' or 'last' to split at the first or last occurrence of the `split_character`, or an integer to split at a specific index.
+
+        split_filename_delimiter : str, optional, default '-'
+            The character used to split file names for automatic label extraction when `split_filename` is True.
+        ```
+        'all' - merge all data into a single DataFrame (default)
+        'sets' - merge data within each set, but keep sets separate
+        'subsets' - merge data within each subset, but keep subsets separate
+        'groups' - merge data within each group, but keep groups separate
+        'subgroups' - merge data within each subgroup, but keep subgroups separate
+        None - do not merge; return data as a dictionary of dictionaries with DataFrames
+        ```
+
+        Returns
+        -------
+        pd.DataFrame
+            A single DataFrame containing all loaded data, with condition and replicate labels assigned to each row.
+        
         """
 
         self.retain = retain_cols
@@ -239,8 +347,8 @@ class DataLoader:
         self.y_col  = colnames['y']
 
         # Time / transform options (wired as kwargs)
-        self.mirror_y = kwargs.get('mirror_y', False)
-        self.mirror_x = kwargs.get('mirror_x', False)
+        self.invert_y = kwargs.get('invert_y', False)
+        self.invert_x = kwargs.get('invert_x', False)
         self.merge = kwargs.get('merge', 'all')
 
         # Wrap single file into a list for uniform handling
@@ -447,10 +555,10 @@ class DataLoader:
 
         df = df.drop_nulls(subset=essential)
         
-        if self.mirror_y:
+        if self.invert_y:
             y_mid = (df[self.y_col].min() + df[self.y_col].max()) / 2
             df = df.with_columns((2 * y_mid - pl.col(self.y_col)).alias(self.y_col))
-        if self.mirror_x:
+        if self.invert_x:
             x_mid = (df[self.x_col].min() + df[self.x_col].max()) / 2
             df = df.with_columns((2 * x_mid - pl.col(self.x_col)).alias(self.x_col))
             
