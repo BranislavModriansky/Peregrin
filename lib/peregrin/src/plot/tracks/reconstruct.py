@@ -1,11 +1,15 @@
 from typing import Any, Optional
 
+import json
+from pathlib import Path
+
 import numpy as np
 import polars as pl
 import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
 from matplotlib.ticker import MultipleLocator, FormatStrFormatter
 from matplotlib.animation import FuncAnimation
+from matplotlib.colors import to_hex
 
 import warnings
 
@@ -15,6 +19,18 @@ from ..._pckg_exceptions._pckg_warnings import *
 
 from ..painter import paint
 from ...various import Values, get_aliases, is_empty, clock
+from .._tooltip_toolkit import tooltip_assets
+
+
+# _TOOLKIT_DIR = Path(__file__).parent.parent / '_tooltip_toolkit'
+
+
+# @lru_cache(maxsize=1)
+# def _load_assets() -> tuple[str, str]:
+#     """Read the tooltip CSS + JS from the toolkit folder (CSS inlined into JS)."""
+#     css = (_TOOLKIT_DIR / '_tooltip_styling.css').read_text(encoding='utf-8')
+#     js = (_TOOLKIT_DIR / '_tooltip.js').read_text(encoding='utf-8')
+#     return css, js
 
 
 class AnimateTracks:
@@ -364,6 +380,7 @@ class ReconstructTracks:
         *,
         align_at_start: bool = False,
         categories: Optional[dict[str, list[Any]]] = None,
+        format: str = 'png',
         **kwargs
     ) -> "ReconstructTracks":
 
@@ -371,6 +388,7 @@ class ReconstructTracks:
         self.align_at_start = align_at_start
         self.kwargs = get_aliases(kwargs, self.ALIASES)
         self.categories = categories
+        self._format = str(format).lower() if format is not None else 'png'
 
         self._arrange_data()
 
@@ -378,12 +396,18 @@ class ReconstructTracks:
         if smoothing is not None:
             self._smooth(smoothing)
 
-        # Colors are cheap and often the only thing that changes; recompute every call.
         self._assign_color()
 
-        # Build the static figure and keep it, but return the container so
-        # callers can chain .animate() / .show() / .save().
         self.figure = self.polar() if self.align_at_start else self.cartesian()
+
+        if self._format == 'html':
+            # Prevent notebook backends (especially widget) from auto-rendering
+            # the Matplotlib figure instead of the HTML tooltip canvas.
+            try:
+                plt.close(self.figure)
+            except Exception:
+                pass
+            return InteractiveTracks(self)
         return self
 
     # ---- data arrangement (polars) --------------------------------------------
@@ -525,8 +549,17 @@ class ReconstructTracks:
         color = self.kwargs.get('color', 'black')
         color_by = self.kwargs.get('color_by')
 
-        # 'random' / 'random greys' produce ONE color per trajectory: ask the
-        # painter for exactly n_tracks colors and expand via run-length repeat.
+        # Capture how colors were generated so the tooltip exposes matching options.
+        if color in ('random', 'random greys') and color_by is None:
+            self._color_mode = 'per_track'
+            self._color_source = color
+        elif color_by is not None:
+            self._color_mode = 'lut'
+            self._color_source = color_by[0] if isinstance(color_by, tuple) else color_by
+        else:
+            self._color_mode = 'uniform'
+            self._color_source = color
+
         if color in ('random', 'random greys') and color_by is None:
             n_tracks = self._track_starts.size
             per_track = paint(
@@ -773,11 +806,7 @@ class ReconstructTracks:
             )
 
     def _head_colors(self, has_pt: np.ndarray):
-        """Per-track head colors, aligned to the tracks kept by `has_pt`.
-
-        Returns either a scalar color (uniform) or an array in the same track
-        order used to build `head_xy`.
-        """
+        """Per-track head colors, aligned to the tracks kept by `has_pt`."""
         if self._single_color is not None:
             return self._single_color
         ends = getattr(self, '_track_ends', None)
@@ -785,6 +814,177 @@ class ReconstructTracks:
             return 'black'
         colors = np.asarray(self._colors)[ends]
         return colors[has_pt]
+
+    # ---- interactive HTML export -------------------------------------------
+    @staticmethod
+    def _html_color(color: Any) -> str:
+        """Convert a Matplotlib-compatible color to an HTML color."""
+        try:
+            return to_hex(color, keep_alpha=True)
+        except (TypeError, ValueError):
+            return '#000000ff'
+
+    def _export_state(self) -> dict[str, Any]:
+        """Create JSON-serializable state for the canvas renderer."""
+        polar = bool(self.align_at_start)
+        plot_x, plot_y = self._plot_coords(polar=polar)
+
+        tracks: list[list[list[float]]] = []
+        heads: list[list[float]] = []
+
+        for start, length in zip(self._track_starts, self._run_lengths):
+            start = int(start)
+            length = int(length)
+            end = start + length
+
+            tracks.append([
+                np.asarray(plot_x[start:end], dtype=float).tolist(),
+                np.asarray(plot_y[start:end], dtype=float).tolist(),
+            ])
+
+            if length:
+                heads.append([
+                    float(plot_x[end - 1]),
+                    float(plot_y[end - 1]),
+                ])
+
+        track_count = len(tracks)
+
+        if self._single_color is not None:
+            track_colors = [
+                self._html_color(self._single_color)
+                for _ in range(track_count)
+            ]
+        elif self._colors is not None and self._track_ends.size:
+            colors = np.asarray(self._colors)
+            track_colors = [
+                self._html_color(colors[int(end)])
+                for end in self._track_ends
+            ]
+        else:
+            track_colors = ['#000000ff'] * track_count
+
+        color_mode = getattr(self, '_color_mode', 'uniform')
+        color_source = getattr(self, '_color_source', 'black')
+
+        if color_mode == 'per_track':
+            color_schema = {
+                'mode': 'per_track',
+                'source': str(color_source),
+                'palettes': ['random', 'random greys'],
+            }
+        elif color_mode == 'lut':
+            color_schema = {
+                'mode': 'lut',
+                'source': str(color_source),
+                'luts': [
+                    'viridis',
+                    'plasma',
+                    'inferno',
+                    'magma',
+                    'cividis',
+                    'turbo',
+                    'coolwarm',
+                    'jet',
+                ],
+            }
+        else:
+            color_schema = {
+                'mode': 'uniform',
+                'value': (
+                    track_colors[0]
+                    if track_colors
+                    else self._html_color(color_source)
+                ),
+            }
+
+        axes_state = None
+        if not polar and self.figure is not None and self.figure.axes:
+            ax = self.figure.axes[0]
+            xlo, xhi = [float(v) for v in ax.get_xlim()]
+            ylo, yhi = [float(v) for v in ax.get_ylim()]
+
+            def _ticks(values, lo, hi):
+                arr = np.asarray(values, dtype=float)
+                if arr.size == 0:
+                    return []
+                arr = arr[np.isfinite(arr)]
+                tol = max(1e-9, abs(hi - lo) * 1e-9)
+                lo2, hi2 = (lo - tol, hi + tol) if lo <= hi else (hi - tol, lo + tol)
+                arr = arr[(arr >= lo2) & (arr <= hi2)]
+                return [float(v) for v in arr.tolist()]
+
+            axes_state = {
+                'xlim': [xlo, xhi],
+                'ylim': [ylo, yhi],
+                'xticksMajor': _ticks(ax.xaxis.get_majorticklocs(), xlo, xhi),
+                'xticksMinor': _ticks(ax.xaxis.get_minorticklocs(), xlo, xhi),
+                'yticksMajor': _ticks(ax.yaxis.get_majorticklocs(), ylo, yhi),
+                'yticksMinor': _ticks(ax.yaxis.get_minorticklocs(), ylo, yhi),
+                'xlabel': str(ax.get_xlabel() or ''),
+                'ylabel': str(ax.get_ylabel() or ''),
+                'title': str(ax.get_title() or ''),
+                'tickDecimals': 0,
+            }
+
+        return {
+            'polar': polar,
+            'tracks': tracks,
+            'heads': heads,
+            'trackColors': track_colors,
+            'style': {
+                'lw': float(self.kwargs.get('lw', 1.0)),
+                'headShape': str(self.kwargs.get('head_shape', 'o')),
+                'headSize': float(self.kwargs.get('head_size', 10.0)),
+                'showHeads': bool(self.kwargs.get('show_heads', True)),
+                'faceColor': self._html_color(
+                    self.kwargs.get('face_color', 'white')
+                ),
+                'gridColor': self._html_color(
+                    self.kwargs.get('grid_color', 'gainsboro')
+                ),
+                'gridLw': float(self.kwargs.get('grid_lw', 0.75)),
+                'showGrid': bool(self.kwargs.get('grid', True)),
+                'title': str(self.kwargs.get('title', '')),
+                'textColor': self._html_color(self.kwargs.get('text_color', 'black')),
+                'annotationColor': self._html_color(self.kwargs.get('annotation_color', 'black')),
+                'frameColor': self._html_color(self.kwargs.get('frame_color', 'black')),
+            },
+            'axes': axes_state,
+            'schema': {
+                'color': color_schema,
+                'tracks': {
+                    'lw': {
+                        'type': 'range',
+                        'min': 0.25,
+                        'max': 6.0,
+                        'step': 0.25,
+                    },
+                    'headShape': {
+                        'type': 'select',
+                        'options': ['o', 's', '^', 'v', 'D', 'x', '*'],
+                    },
+                    'headSize': {
+                        'type': 'range',
+                        'min': 2.0,
+                        'max': 60.0,
+                        'step': 1.0,
+                    },
+                },
+                'background': {
+                    'faceColor': {'type': 'color'},
+                },
+                'grid': {
+                    'gridColor': {'type': 'color'},
+                    'gridLw': {
+                        'type': 'range',
+                        'min': 0.0,
+                        'max': 4.0,
+                        'step': 0.25,
+                    },
+                },
+            },
+        }
 
     # ---- styling -------------------------------------------------------------
     def _background(self, ax: plt.Axes, fig: plt.Figure):
@@ -929,6 +1129,42 @@ class ReconstructTracks:
                 fig.set_facecolor('none')
 
         return fig, ax
+
+class InteractiveTracks:
+    """
+    Interactive HTML wrapper. The JS (loaded from _tooltip_toolkit/_tooltip.js)
+    builds its own canvas + tooltip DOM and injects the CSS, so only the JSON
+    state and CSS are substituted server-side — no fragile HTML templating.
+    """
+
+    def __init__(self, builder: "ReconstructTracks"):
+        self._builder = builder
+        self._state = builder._export_state()
+
+    @property
+    def fig(self):
+        return self._builder.figure
+
+    def animate(self, **kwargs):
+        return self._builder.animate(**kwargs)
+
+    def to_html(self) -> str:
+        js, css = tooltip_assets['js'], tooltip_assets['css']
+        # IMPORTANT: inject CSS as a JSON string literal, not raw multiline text
+        # (prevents JS syntax errors).
+        js = js.replace('"__PEREGRIN_CSS__"', json.dumps(css))
+        payload = json.dumps(self._state)
+        return (
+            f'<script>window.PEREGRIN_STATE = {payload};</script>\n'
+            f'<script>{js}</script>'
+        )
+
+    def _repr_html_(self):
+        return self.to_html()
+
+    def save(self, path, **kwargs):
+        Path(path).write_text(self.to_html(), encoding='utf-8')
+        return path
 
 
 reconstruct = ReconstructTracks().reconstruct
